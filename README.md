@@ -40,6 +40,31 @@ Not in scope yet:
 - flights, hotels, transfers implementation
 - payment gateway integration
 
+## Deployment Policy (Koyeb Is Source Of Truth)
+
+This project is now deployment-first.
+
+- production runtime: Koyeb
+- canonical branch: `main`
+- canonical repo: [backendformobileapp](https://github.com/dlerazeezcore/backendformobileapp)
+- current live base URL: [https://mean-lettie-corevia-0bd7cc91.koyeb.app](https://mean-lettie-corevia-0bd7cc91.koyeb.app)
+
+Rules we follow:
+
+- no backend change is considered done until it is committed and pushed
+- no local-only behavior should be treated as final
+- after each push, verify the live Koyeb service endpoints
+- if schema changes are included, run Alembic migration on Supabase before final verification
+
+Release checklist for every backend change:
+
+1. implement code changes
+2. run quick local checks (syntax/smoke)
+3. commit to `main` and push to GitHub
+4. wait for Koyeb redeploy
+5. verify live endpoints on Koyeb (not only local)
+6. verify DB migrations on Supabase when needed
+
 ## Repository Layout
 
 Main runtime files:
@@ -377,6 +402,14 @@ Check current migration state:
 source .venv/bin/activate
 export DATABASE_URL='your_database_url'
 alembic current
+```
+
+Run migrations against Supabase (production):
+
+```bash
+source .venv/bin/activate
+export DATABASE_URL='postgresql://USER:ENCODED_PASSWORD@HOST:5432/postgres'
+alembic upgrade head
 ```
 
 ## Auth And Users Decision
@@ -796,10 +829,20 @@ Typical process host command:
 uvicorn app:app --host 0.0.0.0 --port $PORT
 ```
 
+Live verification examples:
+
+```bash
+curl https://mean-lettie-corevia-0bd7cc91.koyeb.app/health
+```
+
+```bash
+curl -X POST https://mean-lettie-corevia-0bd7cc91.koyeb.app/api/v1/auth/admin/login \
+  -H 'content-type: application/json' \
+  -d '{"phone":"+9647507343635","password":"StrongPass123"}'
+```
+
 ## Repo Notes
 
-This folder has been initialized as a local git repository.
+GitHub repository:
 
-If you later publish it to GitHub, the suggested repository name is:
-
-`backendformobileapp`
+- [https://github.com/dlerazeezcore/backendformobileapp](https://github.com/dlerazeezcore/backendformobileapp)
