@@ -199,6 +199,7 @@ Connection:
 
 - source and target currency rates
 - used to convert provider cost into app sale currency
+- when a new active rate is added for the same currency pair, older active rows are automatically deactivated and closed
 
 `pricing_rules`
 

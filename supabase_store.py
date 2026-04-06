@@ -1148,8 +1148,35 @@ class SupabaseStore:
         return row
 
     def save_exchange_rate(self, payload: dict[str, Any]) -> ExchangeRate:
+        if payload.get("effective_at") is None:
+            payload["effective_at"] = utcnow()
         row = ExchangeRate(**payload)
         self.session.add(row)
+        self.session.flush()
+
+        # Keep one active timeline per currency pair by deactivating older active rows.
+        if row.active:
+            def _as_utc(value: datetime) -> datetime:
+                if value.tzinfo is None:
+                    return value.replace(tzinfo=timezone.utc)
+                return value.astimezone(timezone.utc)
+
+            row_effective_at_utc = _as_utc(row.effective_at)
+            previously_active = self.session.scalars(
+                select(ExchangeRate).where(
+                    ExchangeRate.base_currency == row.base_currency,
+                    ExchangeRate.quote_currency == row.quote_currency,
+                    ExchangeRate.active.is_(True),
+                    ExchangeRate.id != row.id,
+                )
+            ).all()
+            for previous in previously_active:
+                previous_effective_at_utc = _as_utc(previous.effective_at)
+                if previous_effective_at_utc <= row_effective_at_utc:
+                    previous.active = False
+                    if previous.expires_at is None or _as_utc(previous.expires_at) > row_effective_at_utc:
+                        previous.expires_at = row.effective_at
+
         self.session.commit()
         self.session.refresh(row)
         return row
