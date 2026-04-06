@@ -7,7 +7,13 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from admin import register_admin_routes
-from config import Settings, get_settings
+from config import (
+    DEFAULT_ESIM_ACCESS_BASE_URL,
+    DEFAULT_ESIM_ACCESS_RATE_LIMIT_PER_SECOND,
+    DEFAULT_ESIM_ACCESS_TIMEOUT_SECONDS,
+    Settings,
+    get_settings,
+)
 from dependencies import get_db, get_provider
 from esim_access_api import (
     ESimAccessAPI,
@@ -27,9 +33,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.esim_access_api = ESimAccessAPI(
             access_code=cfg.esim_access_access_code,
             secret_key=cfg.esim_access_secret_key,
-            base_url=cfg.esim_access_base_url,
-            timeout=cfg.esim_access_timeout_seconds,
-            rate_limit_per_second=cfg.esim_access_rate_limit_per_second,
+            base_url=DEFAULT_ESIM_ACCESS_BASE_URL,
+            timeout=DEFAULT_ESIM_ACCESS_TIMEOUT_SECONDS,
+            rate_limit_per_second=DEFAULT_ESIM_ACCESS_RATE_LIMIT_PER_SECOND,
         )
         yield
         await app.state.esim_access_api.close()
