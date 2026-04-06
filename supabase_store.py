@@ -9,8 +9,11 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, rela
 
 from phone_utils import normalize_phone, phone_lookup_candidates
 
+APP_TIMEZONE = timezone(timedelta(hours=3), name="GMT+3")
+
+
 def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(APP_TIMEZONE)
 
 
 def parse_provider_datetime(value: str | None) -> datetime | None:
@@ -37,8 +40,8 @@ def parse_provider_datetime(value: str | None) -> datetime | None:
         else:
             return None
     if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(APP_TIMEZONE)
 
 
 def parse_provider_int(value: Any) -> int | None:
@@ -388,6 +391,49 @@ def extract_selected_fields(payload: dict[str, Any], field_paths: list[str]) -> 
 class SupabaseStore:
     def __init__(self, session: Session) -> None:
         self.session = session
+
+    @staticmethod
+    def _to_app_timezone(value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=APP_TIMEZONE)
+        return value.astimezone(APP_TIMEZONE)
+
+    def _deactivate_previous_flagged_rows(
+        self,
+        *,
+        model: Any,
+        row: Any,
+        flag_field: str,
+        key_fields: list[str],
+        new_start_field: str | None = None,
+        previous_end_field: str | None = None,
+    ) -> None:
+        # Centralized policy: for admin configuration tables, one active/enabled row
+        # should represent the current value for the same business key.
+        if not bool(getattr(row, flag_field)):
+            return
+        filters = [getattr(model, key) == getattr(row, key) for key in key_fields]
+        filters.extend(
+            [
+                getattr(model, flag_field).is_(True),
+                getattr(model, "id") != row.id,
+            ]
+        )
+        previous_rows = self.session.scalars(select(model).where(*filters)).all()
+        new_start_at = (
+            self._to_app_timezone(getattr(row, new_start_field))
+            if new_start_field is not None
+            else None
+        )
+        for previous in previous_rows:
+            setattr(previous, flag_field, False)
+            if previous_end_field is None or new_start_field is None or new_start_at is None:
+                continue
+            previous_end_at = self._to_app_timezone(getattr(previous, previous_end_field))
+            if previous_end_at is None or previous_end_at > new_start_at:
+                setattr(previous, previous_end_field, getattr(row, new_start_field))
 
     def ensure_user(
         self,
@@ -1127,22 +1173,74 @@ class SupabaseStore:
         return event
 
     def save_pricing_rule(self, payload: dict[str, Any]) -> PricingRule:
+        payload = dict(payload)
+        if payload.get("active", True) and payload.get("starts_at") is None:
+            payload["starts_at"] = utcnow()
         row = PricingRule(**payload)
         self.session.add(row)
+        self.session.flush()
+        self._deactivate_previous_flagged_rows(
+            model=PricingRule,
+            row=row,
+            flag_field="active",
+            key_fields=[
+                "service_type",
+                "rule_scope",
+                "country_code",
+                "package_code",
+                "provider_code",
+                "applies_to",
+                "currency_code",
+            ],
+            new_start_field="starts_at",
+            previous_end_field="ends_at",
+        )
         self.session.commit()
         self.session.refresh(row)
         return row
 
     def save_discount_rule(self, payload: dict[str, Any]) -> DiscountRule:
+        payload = dict(payload)
+        if payload.get("active", True) and payload.get("starts_at") is None:
+            payload["starts_at"] = utcnow()
         row = DiscountRule(**payload)
         self.session.add(row)
+        self.session.flush()
+        self._deactivate_previous_flagged_rows(
+            model=DiscountRule,
+            row=row,
+            flag_field="active",
+            key_fields=[
+                "service_type",
+                "rule_scope",
+                "country_code",
+                "package_code",
+                "provider_code",
+                "applies_to",
+                "currency_code",
+            ],
+            new_start_field="starts_at",
+            previous_end_field="ends_at",
+        )
         self.session.commit()
         self.session.refresh(row)
         return row
 
     def save_featured_location(self, payload: dict[str, Any]) -> FeaturedLocation:
+        payload = dict(payload)
+        if payload.get("enabled", True) and payload.get("starts_at") is None:
+            payload["starts_at"] = utcnow()
         row = FeaturedLocation(**payload)
         self.session.add(row)
+        self.session.flush()
+        self._deactivate_previous_flagged_rows(
+            model=FeaturedLocation,
+            row=row,
+            flag_field="enabled",
+            key_fields=["service_type", "location_type", "code"],
+            new_start_field="starts_at",
+            previous_end_field="ends_at",
+        )
         self.session.commit()
         self.session.refresh(row)
         return row
@@ -1153,30 +1251,14 @@ class SupabaseStore:
         row = ExchangeRate(**payload)
         self.session.add(row)
         self.session.flush()
-
-        # Keep one active timeline per currency pair by deactivating older active rows.
-        if row.active:
-            def _as_utc(value: datetime) -> datetime:
-                if value.tzinfo is None:
-                    return value.replace(tzinfo=timezone.utc)
-                return value.astimezone(timezone.utc)
-
-            row_effective_at_utc = _as_utc(row.effective_at)
-            previously_active = self.session.scalars(
-                select(ExchangeRate).where(
-                    ExchangeRate.base_currency == row.base_currency,
-                    ExchangeRate.quote_currency == row.quote_currency,
-                    ExchangeRate.active.is_(True),
-                    ExchangeRate.id != row.id,
-                )
-            ).all()
-            for previous in previously_active:
-                previous_effective_at_utc = _as_utc(previous.effective_at)
-                if previous_effective_at_utc <= row_effective_at_utc:
-                    previous.active = False
-                    if previous.expires_at is None or _as_utc(previous.expires_at) > row_effective_at_utc:
-                        previous.expires_at = row.effective_at
-
+        self._deactivate_previous_flagged_rows(
+            model=ExchangeRate,
+            row=row,
+            flag_field="active",
+            key_fields=["base_currency", "quote_currency"],
+            new_start_field="effective_at",
+            previous_end_field="expires_at",
+        )
         self.session.commit()
         self.session.refresh(row)
         return row

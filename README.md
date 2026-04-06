@@ -219,6 +219,20 @@ Connection:
 - same long-term rule design as pricing rules
 - also supports `applies_to`
 
+### Activation And Time Policy
+
+To keep admin configuration data consistent, the backend applies a shared write policy:
+
+- when a new row is created as `active=true` or `enabled=true`, older active/enabled rows for the same business key are automatically set to `false`
+- old rows are also closed by setting their end time (`ends_at` / `expires_at`) to the new row start time
+- this policy is currently applied to:
+  - `exchange_rates`
+  - `pricing_rules`
+  - `discount_rules`
+  - `featured_locations`
+
+Application timestamps are stored in GMT+3 (Baghdad local time) for backend-generated times.
+
 `featured_locations`
 
 - admin-managed popular/featured countries or locations for homepage use
