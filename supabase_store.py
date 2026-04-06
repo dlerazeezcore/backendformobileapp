@@ -7,6 +7,7 @@ from typing import Any
 from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, Uuid, create_engine, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
+from phone_utils import normalize_phone, phone_lookup_candidates
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -402,11 +403,12 @@ class SupabaseStore:
         deleted_at: datetime | None = None,
         last_login_at: datetime | None = None,
     ) -> AppUser:
-        user = self.session.scalar(select(AppUser).where(AppUser.phone == phone))
+        normalized_phone = normalize_phone(phone)
+        user = self.session.scalar(select(AppUser).where(AppUser.phone.in_(phone_lookup_candidates(phone))))
         if user is None:
-            user = AppUser(phone=phone, name=name)
+            user = AppUser(phone=normalized_phone, name=name)
             self.session.add(user)
-        user.phone = phone
+        user.phone = normalized_phone
         user.name = name
         user.email = email
         if password_hash is not None:
@@ -440,11 +442,12 @@ class SupabaseStore:
         last_login_at: datetime | None = None,
         custom_fields: dict[str, Any] | None = None,
     ) -> AdminUser:
-        admin_user = self.session.scalar(select(AdminUser).where(AdminUser.phone == phone))
+        normalized_phone = normalize_phone(phone)
+        admin_user = self.session.scalar(select(AdminUser).where(AdminUser.phone.in_(phone_lookup_candidates(phone))))
         if admin_user is None:
-            admin_user = AdminUser(phone=phone, name=name)
+            admin_user = AdminUser(phone=normalized_phone, name=name)
             self.session.add(admin_user)
-        admin_user.phone = phone
+        admin_user.phone = normalized_phone
         admin_user.name = name
         admin_user.email = email
         if password_hash is not None:

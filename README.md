@@ -505,6 +505,12 @@ These are the routes frontend should mainly use.
 - `POST /api/v1/auth/user/login`
 - `GET /api/v1/auth/me`
 
+Compatibility behavior:
+
+- `POST /api/v1/auth/user/login` accepts both app users and admin users
+- if admin credentials are used on `/api/v1/auth/user/login`, backend returns an admin token (`subjectType = "admin"`)
+- `POST /api/v1/auth/admin/login` is still available for admin-only login flows
+
 ## Frontend Integration Guide
 
 Frontend should prefer the managed routes, not the raw passthrough routes.
@@ -604,6 +610,22 @@ Example response:
 `GET /api/v1/auth/me`
 
 Pass the token in `Authorization: Bearer <accessToken>`.
+
+Frontend session expectations after successful login:
+
+- `authToken`: must be present and non-empty
+- `userId`: must be present and match `/api/v1/auth/me` response
+- `isAdmin`: set from `/api/v1/auth/me` when `subjectType == "admin"`
+
+### Admin login troubleshooting checklist
+
+If admin cannot access admin pages, run this exact sequence:
+
+1. reset the admin password from backend with a valid non-empty password (min 8 chars)
+2. ensure admin phone is normalized in one format (recommended `+964...`) and login uses the same value
+3. confirm `POST /api/v1/auth/user/login` returns `200` (not `401`) for that account
+4. after login, confirm frontend session stores `authToken`, `userId`, and `isAdmin = true`
+5. if login is `200` but admin page still blocks, verify backend admin mapping for that same account in `admin_users` with role/permissions
 
 Important:
 

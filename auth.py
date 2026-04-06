@@ -14,6 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from config import get_settings
+from phone_utils import phone_lookup_candidates
 from supabase_store import AdminUser, AppUser, utcnow
 
 
@@ -145,42 +146,59 @@ def _is_row_active(row: AppUser | AdminUser) -> bool:
     return row.status == "active" and row.deleted_at is None and row.blocked_at is None
 
 
+def _lookup_admin_by_phone(db: Session, phone: str) -> AdminUser | None:
+    candidates = phone_lookup_candidates(phone)
+    if not candidates:
+        return None
+    return db.scalar(select(AdminUser).where(AdminUser.phone.in_(candidates)))
+
+
+def _lookup_user_by_phone(db: Session, phone: str) -> AppUser | None:
+    candidates = phone_lookup_candidates(phone)
+    if not candidates:
+        return None
+    return db.scalar(select(AppUser).where(AppUser.phone.in_(candidates)))
+
+
+def _issue_token(row: AppUser | AdminUser, *, subject_type: str) -> dict[str, Any]:
+    settings = get_settings()
+    token = create_access_token(
+        subject_id=row.id,
+        phone=row.phone,
+        subject_type=subject_type,
+        secret_key=settings.auth_secret_key,
+        ttl_seconds=settings.auth_token_ttl_seconds,
+    )
+    response = TokenResponse(accessToken=token, expiresIn=settings.auth_token_ttl_seconds)
+    return response.model_dump(by_alias=True, exclude_none=True)
+
+
 def register_auth_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
     @app.post("/api/v1/auth/admin/login")
     async def admin_login(payload: LoginPayload, db: Session = Depends(get_db)) -> dict[str, Any]:
-        settings = get_settings()
-        row = db.scalar(select(AdminUser).where(AdminUser.phone == payload.phone))
+        row = _lookup_admin_by_phone(db, payload.phone)
         if row is None or not _is_row_active(row) or not verify_password(payload.password, row.password_hash):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid phone or password")
         row.last_login_at = utcnow()
         db.commit()
-        token = create_access_token(
-            subject_id=row.id,
-            phone=row.phone,
-            subject_type="admin",
-            secret_key=settings.auth_secret_key,
-            ttl_seconds=settings.auth_token_ttl_seconds,
-        )
-        response = TokenResponse(accessToken=token, expiresIn=settings.auth_token_ttl_seconds)
-        return response.model_dump(by_alias=True, exclude_none=True)
+        return _issue_token(row, subject_type="admin")
 
     @app.post("/api/v1/auth/user/login")
     async def user_login(payload: LoginPayload, db: Session = Depends(get_db)) -> dict[str, Any]:
-        settings = get_settings()
-        row = db.scalar(select(AppUser).where(AppUser.phone == payload.phone))
-        if row is None or not _is_row_active(row) or not verify_password(payload.password, row.password_hash):
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid phone or password")
-        row.last_login_at = utcnow()
-        db.commit()
-        token = create_access_token(
-            subject_id=row.id,
-            phone=row.phone,
-            subject_type="user",
-            secret_key=settings.auth_secret_key,
-            ttl_seconds=settings.auth_token_ttl_seconds,
-        )
-        response = TokenResponse(accessToken=token, expiresIn=settings.auth_token_ttl_seconds)
-        return response.model_dump(by_alias=True, exclude_none=True)
+        user_row = _lookup_user_by_phone(db, payload.phone)
+        if user_row is not None and _is_row_active(user_row) and verify_password(payload.password, user_row.password_hash):
+            user_row.last_login_at = utcnow()
+            db.commit()
+            return _issue_token(user_row, subject_type="user")
+
+        # Compatibility path for frontends using a single login endpoint.
+        admin_row = _lookup_admin_by_phone(db, payload.phone)
+        if admin_row is not None and _is_row_active(admin_row) and verify_password(payload.password, admin_row.password_hash):
+            admin_row.last_login_at = utcnow()
+            db.commit()
+            return _issue_token(admin_row, subject_type="admin")
+
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid phone or password")
 
     @app.get("/api/v1/auth/me")
     async def auth_me(
