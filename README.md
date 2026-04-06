@@ -225,6 +225,7 @@ To keep admin configuration data consistent, the backend applies a shared write 
 
 - when a new row is created as `active=true` or `enabled=true`, older active/enabled rows for the same business key are automatically set to `false`
 - old rows are also closed by setting their end time (`ends_at` / `expires_at`) to the new row start time
+- when a request is sent with `active=false` / `enabled=false` for an existing active business key, backend updates the current active row(s) to false instead of inserting an extra disabled row
 - this policy is currently applied to:
   - `exchange_rates`
   - `pricing_rules`

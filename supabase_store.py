@@ -438,6 +438,31 @@ class SupabaseStore:
             if previous_end_at is None or previous_end_at > new_start_at:
                 setattr(previous, previous_end_field, getattr(row, new_start_field))
 
+    def _deactivate_matching_rows_without_insert(
+        self,
+        *,
+        model: Any,
+        flag_field: str,
+        key_fields: list[str],
+        payload: dict[str, Any],
+        end_field: str | None = None,
+        end_at: datetime | None = None,
+    ) -> list[Any]:
+        filters = [getattr(model, key) == payload.get(key) for key in key_fields]
+        filters.append(getattr(model, flag_field).is_(True))
+        rows = self.session.scalars(select(model).where(*filters)).all()
+        if not rows:
+            return []
+        for row in rows:
+            setattr(row, flag_field, False)
+            if end_field is not None and end_at is not None:
+                current_end = self._to_app_timezone(getattr(row, end_field))
+                if current_end is None or current_end > end_at:
+                    setattr(row, end_field, end_at)
+        self.session.flush()
+        rows.sort(key=lambda item: (item.created_at, item.id), reverse=True)
+        return rows
+
     def ensure_user(
         self,
         *,
@@ -1177,6 +1202,28 @@ class SupabaseStore:
 
     def save_pricing_rule(self, payload: dict[str, Any]) -> PricingRule:
         payload = dict(payload)
+        if payload.get("active", True) is False:
+            ended_at = self._to_app_timezone(payload.get("starts_at")) or utcnow()
+            updated_rows = self._deactivate_matching_rows_without_insert(
+                model=PricingRule,
+                flag_field="active",
+                key_fields=[
+                    "service_type",
+                    "rule_scope",
+                    "country_code",
+                    "package_code",
+                    "provider_code",
+                    "applies_to",
+                    "currency_code",
+                ],
+                payload=payload,
+                end_field="ends_at",
+                end_at=ended_at,
+            )
+            if updated_rows:
+                self.session.commit()
+                self.session.refresh(updated_rows[0])
+                return updated_rows[0]
         if payload.get("active", True) and payload.get("starts_at") is None:
             payload["starts_at"] = utcnow()
         row = PricingRule(**payload)
@@ -1204,6 +1251,28 @@ class SupabaseStore:
 
     def save_discount_rule(self, payload: dict[str, Any]) -> DiscountRule:
         payload = dict(payload)
+        if payload.get("active", True) is False:
+            ended_at = self._to_app_timezone(payload.get("starts_at")) or utcnow()
+            updated_rows = self._deactivate_matching_rows_without_insert(
+                model=DiscountRule,
+                flag_field="active",
+                key_fields=[
+                    "service_type",
+                    "rule_scope",
+                    "country_code",
+                    "package_code",
+                    "provider_code",
+                    "applies_to",
+                    "currency_code",
+                ],
+                payload=payload,
+                end_field="ends_at",
+                end_at=ended_at,
+            )
+            if updated_rows:
+                self.session.commit()
+                self.session.refresh(updated_rows[0])
+                return updated_rows[0]
         if payload.get("active", True) and payload.get("starts_at") is None:
             payload["starts_at"] = utcnow()
         row = DiscountRule(**payload)
@@ -1231,6 +1300,20 @@ class SupabaseStore:
 
     def save_featured_location(self, payload: dict[str, Any]) -> FeaturedLocation:
         payload = dict(payload)
+        if payload.get("enabled", True) is False:
+            ended_at = self._to_app_timezone(payload.get("starts_at")) or utcnow()
+            updated_rows = self._deactivate_matching_rows_without_insert(
+                model=FeaturedLocation,
+                flag_field="enabled",
+                key_fields=["service_type", "location_type", "code"],
+                payload=payload,
+                end_field="ends_at",
+                end_at=ended_at,
+            )
+            if updated_rows:
+                self.session.commit()
+                self.session.refresh(updated_rows[0])
+                return updated_rows[0]
         if payload.get("enabled", True) and payload.get("starts_at") is None:
             payload["starts_at"] = utcnow()
         row = FeaturedLocation(**payload)
@@ -1249,6 +1332,21 @@ class SupabaseStore:
         return row
 
     def save_exchange_rate(self, payload: dict[str, Any]) -> ExchangeRate:
+        payload = dict(payload)
+        if payload.get("active", True) is False:
+            ended_at = self._to_app_timezone(payload.get("effective_at")) or utcnow()
+            updated_rows = self._deactivate_matching_rows_without_insert(
+                model=ExchangeRate,
+                flag_field="active",
+                key_fields=["base_currency", "quote_currency"],
+                payload=payload,
+                end_field="expires_at",
+                end_at=ended_at,
+            )
+            if updated_rows:
+                self.session.commit()
+                self.session.refresh(updated_rows[0])
+                return updated_rows[0]
         if payload.get("effective_at") is None:
             payload["effective_at"] = utcnow()
         row = ExchangeRate(**payload)
