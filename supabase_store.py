@@ -339,7 +339,10 @@ class ProviderPayloadSnapshot(TimeMixin, Base):
 
 def create_database(database_url: str) -> sessionmaker[Session]:
     database_url = normalize_database_url(database_url)
-    connect_args = {"check_same_thread": False} if database_url.startswith("sqlite") else {}
+    if database_url.startswith("sqlite"):
+        connect_args = {"check_same_thread": False}
+    else:
+        connect_args = {"options": "-c timezone=Asia/Baghdad"}
     engine = create_engine(database_url, future=True, connect_args=connect_args)
     return sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
@@ -1270,7 +1273,11 @@ class SupabaseStore:
         for row in rows:
             result.append(
                 {
-                    column.name: getattr(row, column.name)
+                    column.name: (
+                        self._to_app_timezone(getattr(row, column.name))
+                        if isinstance(getattr(row, column.name), datetime)
+                        else getattr(row, column.name)
+                    )
                     for column in row.__table__.columns
                     if column.name not in exclude
                 }

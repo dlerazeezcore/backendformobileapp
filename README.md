@@ -231,7 +231,7 @@ To keep admin configuration data consistent, the backend applies a shared write 
   - `discount_rules`
   - `featured_locations`
 
-Application timestamps are stored in GMT+3 (Baghdad local time) for backend-generated times.
+Application timestamps are managed in GMT+3 (Baghdad local time) for backend-generated times, and admin list APIs return datetime values normalized to GMT+3.
 
 `featured_locations`
 
