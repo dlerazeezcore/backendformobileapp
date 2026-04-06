@@ -84,6 +84,7 @@ class AppUser(TimeMixin, Base):
     phone: Mapped[str] = mapped_column(String(64), unique=True)
     name: Mapped[str] = mapped_column(String(255))
     email: Mapped[str | None] = mapped_column(String(255))
+    password_hash: Mapped[str | None] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(32), default="active", nullable=False, index=True)
     is_loyalty: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     notes: Mapped[str | None] = mapped_column(Text)
@@ -100,6 +101,7 @@ class AdminUser(TimeMixin, Base):
     phone: Mapped[str] = mapped_column(String(64), unique=True)
     name: Mapped[str] = mapped_column(String(255))
     email: Mapped[str | None] = mapped_column(String(255))
+    password_hash: Mapped[str | None] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(32), default="active", nullable=False, index=True)
     role: Mapped[str] = mapped_column(String(64), default="admin", nullable=False, index=True)
     can_manage_users: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
@@ -392,6 +394,7 @@ class SupabaseStore:
         phone: str,
         name: str,
         email: str | None = None,
+        password_hash: str | None = None,
         status: str = "active",
         is_loyalty: bool = False,
         notes: str | None = None,
@@ -406,6 +409,8 @@ class SupabaseStore:
         user.phone = phone
         user.name = name
         user.email = email
+        if password_hash is not None:
+            user.password_hash = password_hash
         user.status = status
         user.is_loyalty = is_loyalty
         user.notes = notes
@@ -421,6 +426,7 @@ class SupabaseStore:
         phone: str,
         name: str,
         email: str | None = None,
+        password_hash: str | None = None,
         status: str = "active",
         role: str = "admin",
         can_manage_users: bool = False,
@@ -441,6 +447,8 @@ class SupabaseStore:
         admin_user.phone = phone
         admin_user.name = name
         admin_user.email = email
+        if password_hash is not None:
+            admin_user.password_hash = password_hash
         admin_user.status = status
         admin_user.role = role
         admin_user.can_manage_users = can_manage_users
@@ -1143,11 +1151,18 @@ class SupabaseStore:
         self.session.refresh(row)
         return row
 
-    def list_rows(self, model: Any) -> list[dict[str, Any]]:
+    def list_rows(self, model: Any, *, exclude: set[str] | None = None) -> list[dict[str, Any]]:
         rows = self.session.scalars(select(model).order_by(model.created_at.desc())).all()
+        exclude = exclude or set()
         result = []
         for row in rows:
-            result.append({column.name: getattr(row, column.name) for column in row.__table__.columns})
+            result.append(
+                {
+                    column.name: getattr(row, column.name)
+                    for column in row.__table__.columns
+                    if column.name not in exclude
+                }
+            )
         return result
 
     def save_payload(

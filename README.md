@@ -36,7 +36,7 @@ Not in scope yet:
 
 - B2B agents
 - reseller accounts
-- full admin auth and RBAC enforcement
+- full RBAC middleware and per-route authorization enforcement
 - flights, hotels, transfers implementation
 - payment gateway integration
 
@@ -49,7 +49,7 @@ Main runtime files:
 - [dependencies.py](/Users/laveencompany/Desktop/backendformobileapp/dependencies.py): shared DB/provider access helpers for FastAPI
 - [admin.py](/Users/laveencompany/Desktop/backendformobileapp/admin.py): admin operational, pricing, and reporting routes
 - [users.py](/Users/laveencompany/Desktop/backendformobileapp/users.py): B2C user and admin-user payloads and API routes
-- [auth.py](/Users/laveencompany/Desktop/backendformobileapp/auth.py): small B2C auth helpers and future login/token primitives
+- [auth.py](/Users/laveencompany/Desktop/backendformobileapp/auth.py): login endpoints, password hashing helpers, and bearer-token helpers
 - [esim_access_api.py](/Users/laveencompany/Desktop/backendformobileapp/esim_access_api.py): all eSIM Access code, including provider client, request/response models, and eSIM routes
 - [supabase_store.py](/Users/laveencompany/Desktop/backendformobileapp/supabase_store.py): SQLAlchemy models, persistence logic, pricing engine, sync logic
 
@@ -69,7 +69,7 @@ This structure is already minimal and appropriate for this phase. I do not recom
 
 Current root-level split:
 
-- `auth.py`: B2C app login helpers, bearer-token helpers, and future token/session primitives
+- `auth.py`: B2C login endpoints, password hashing, bearer-token helpers, and current-user resolution
 - `users.py`: B2C app-user account logic and admin-user CRUD routes
 - `admin.py`: admin operational, pricing, and reporting routes
 - `esim_access_api.py`: all provider-facing and managed eSIM logic
@@ -84,9 +84,9 @@ The backend is split into 4 layers:
 1. API layer
    - FastAPI bootstrap in `app.py`
    - user/admin-user routes in `users.py`
+   - auth routes in `auth.py`
    - admin routes in `admin.py`
    - eSIM routes in `esim_access_api.py`
-   - future auth route wiring in `auth.py`
 2. Provider layer
    - eSIM Access integration in `esim_access_api.py`
 3. Data layer
@@ -298,10 +298,9 @@ Create a local `.env` file with:
 ```env
 ESIM_ACCESS_ACCESS_CODE=your_access_code
 ESIM_ACCESS_SECRET_KEY=your_secret_key
-ESIM_ACCESS_BASE_URL=https://api.esimaccess.com
-ESIM_ACCESS_TIMEOUT_SECONDS=30
-ESIM_ACCESS_RATE_LIMIT_PER_SECOND=8
 DATABASE_URL=postgresql://USER:PASSWORD@HOST:PORT/DATABASE
+AUTH_SECRET_KEY=replace_with_a_long_random_secret
+AUTH_TOKEN_TTL_SECONDS=86400
 ```
 
 Notes:
@@ -391,8 +390,8 @@ Current decision for this backend:
 Database usage:
 
 - `users.py` is database-backed because it manages `app_users` and `admin_users`
-- `auth.py` does not need its own tables yet
-- `auth.py` can stay small and stateless at first if it only handles token parsing and current-user validation
+- `auth.py` reads those same tables to verify credentials and issue access tokens
+- password hashes are stored on `app_users.password_hash` and `admin_users.password_hash`
 
 Add auth-specific tables only when real needs appear, such as:
 
@@ -467,6 +466,12 @@ These are the routes frontend should mainly use.
 - `GET /api/v1/admin/profiles`
 - `GET /api/v1/admin/lifecycle-events`
 
+### Auth routes
+
+- `POST /api/v1/auth/admin/login`
+- `POST /api/v1/auth/user/login`
+- `GET /api/v1/auth/me`
+
 ## Frontend Integration Guide
 
 Frontend should prefer the managed routes, not the raw passthrough routes.
@@ -492,6 +497,7 @@ Example payload:
   "phone": "+9647700000000",
   "name": "Dler",
   "email": "dler@example.com",
+  "password": "UserPass123",
   "status": "active",
   "isLoyalty": false,
   "notes": "Created by admin"
@@ -511,6 +517,7 @@ Example payload:
   "phone": "+9647701111111",
   "name": "Admin User",
   "email": "admin@example.com",
+  "password": "StrongPass123",
   "status": "active",
   "role": "super_admin",
   "canManageUsers": true,
@@ -526,6 +533,44 @@ Example payload:
 ```
 
 Use `GET /api/v1/admin/admin-users` to list admin/operator accounts.
+
+### Admin login
+
+`POST /api/v1/auth/admin/login`
+
+```json
+{
+  "phone": "+9647507343635",
+  "password": "StrongPass123"
+}
+```
+
+Example response:
+
+```json
+{
+  "accessToken": "eyJ...",
+  "tokenType": "bearer",
+  "expiresIn": 86400
+}
+```
+
+### User login
+
+`POST /api/v1/auth/user/login`
+
+```json
+{
+  "phone": "+9647700000000",
+  "password": "UserPass123"
+}
+```
+
+### Current authenticated user
+
+`GET /api/v1/auth/me`
+
+Pass the token in `Authorization: Bearer <accessToken>`.
 
 Important:
 

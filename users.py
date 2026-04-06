@@ -7,6 +7,7 @@ from fastapi import Depends, FastAPI
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from auth import hash_password
 from supabase_store import AdminUser, AppUser, SupabaseStore
 
 
@@ -14,6 +15,7 @@ class UserPayload(BaseModel):
     phone: str
     name: str
     email: str | None = None
+    password: str | None = Field(default=None, min_length=8)
     status: str = "active"
     is_loyalty: bool = Field(default=False, alias="isLoyalty")
     notes: str | None = None
@@ -26,6 +28,7 @@ class AdminUserPayload(BaseModel):
     phone: str
     name: str
     email: str | None = None
+    password: str | None = Field(default=None, min_length=8)
     status: str = "active"
     role: str = "admin"
     can_manage_users: bool = Field(default=False, alias="canManageUsers")
@@ -43,18 +46,26 @@ class AdminUserPayload(BaseModel):
 def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
     @app.post("/api/v1/admin/users")
     async def save_user(payload: UserPayload, db: Session = Depends(get_db)) -> dict[str, Any]:
-        user = SupabaseStore(db).ensure_user(**payload.model_dump(by_alias=False))
+        data = payload.model_dump(by_alias=False)
+        password = data.pop("password", None)
+        if password is not None:
+            data["password_hash"] = hash_password(password)
+        user = SupabaseStore(db).ensure_user(**data)
         db.commit()
         db.refresh(user)
         return {"user": {"id": user.id, "phone": user.phone, "name": user.name, "status": user.status}}
 
     @app.get("/api/v1/admin/users")
     async def list_users(db: Session = Depends(get_db)) -> dict[str, Any]:
-        return {"users": SupabaseStore(db).list_rows(AppUser)}
+        return {"users": SupabaseStore(db).list_rows(AppUser, exclude={"password_hash"})}
 
     @app.post("/api/v1/admin/admin-users")
     async def save_admin_user(payload: AdminUserPayload, db: Session = Depends(get_db)) -> dict[str, Any]:
-        admin_user = SupabaseStore(db).ensure_admin_user(**payload.model_dump(by_alias=False))
+        data = payload.model_dump(by_alias=False)
+        password = data.pop("password", None)
+        if password is not None:
+            data["password_hash"] = hash_password(password)
+        admin_user = SupabaseStore(db).ensure_admin_user(**data)
         db.commit()
         db.refresh(admin_user)
         return {
@@ -69,4 +80,4 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
 
     @app.get("/api/v1/admin/admin-users")
     async def list_admin_users(db: Session = Depends(get_db)) -> dict[str, Any]:
-        return {"adminUsers": SupabaseStore(db).list_rows(AdminUser)}
+        return {"adminUsers": SupabaseStore(db).list_rows(AdminUser, exclude={"password_hash"})}

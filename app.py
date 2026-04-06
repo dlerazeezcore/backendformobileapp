@@ -7,6 +7,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from admin import register_admin_routes
+from auth import register_auth_routes
 from config import (
     DEFAULT_ESIM_ACCESS_BASE_URL,
     DEFAULT_ESIM_ACCESS_RATE_LIMIT_PER_SECOND,
@@ -60,6 +61,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"status": "ok"}
 
     register_user_routes(app, get_db)
+    register_auth_routes(app, get_db)
     register_esim_access_routes(app, get_db, get_provider)
     register_admin_routes(app, get_db)
 
