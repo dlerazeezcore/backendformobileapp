@@ -430,7 +430,6 @@ class ManagedOrderPayload(BaseModel):
     user: UserPayload
     platform_code: str = Field(alias="platformCode")
     platform_name: str | None = Field(default=None, alias="platformName")
-    purchase_channel: str | None = Field(default=None, alias="purchaseChannel")
     currency_code: str | None = Field(default=None, alias="currencyCode")
     provider_currency_code: str | None = Field(default=None, alias="providerCurrencyCode")
     exchange_rate: float | None = Field(default=None, alias="exchangeRate")
@@ -499,7 +498,6 @@ def register_esim_access_routes(
             platform_name=payload.platform_name,
             order_request=payload.provider_request.model_dump(by_alias=True, exclude_none=True),
             provider_response=provider_response.model_dump(by_alias=True, exclude_none=True),
-            purchase_channel=payload.purchase_channel,
             currency_code=payload.currency_code,
             provider_currency_code=payload.provider_currency_code,
             exchange_rate=payload.exchange_rate,

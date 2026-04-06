@@ -226,11 +226,6 @@ class OrderItem(TimeMixin, Base):
     provider: Mapped[str] = mapped_column(String(80), default="esim_access", nullable=False)
     provider_order_no: Mapped[str | None] = mapped_column(String(120), unique=True)
     provider_transaction_id: Mapped[str | None] = mapped_column(String(255), unique=True)
-    purchase_channel: Mapped[str | None] = mapped_column(String(80))
-    booked_via_platform: Mapped[str | None] = mapped_column(String(80))
-    canceled_via_platform: Mapped[str | None] = mapped_column(String(80))
-    refunded_via_platform: Mapped[str | None] = mapped_column(String(80))
-    revoked_via_platform: Mapped[str | None] = mapped_column(String(80))
     provider_status: Mapped[str | None] = mapped_column(String(80))
     country_code: Mapped[str | None] = mapped_column(String(8), index=True)
     country_name: Mapped[str | None] = mapped_column(String(255))
@@ -712,7 +707,6 @@ class SupabaseStore:
         platform_name: str | None,
         order_request: dict[str, Any],
         provider_response: dict[str, Any],
-        purchase_channel: str | None = None,
         currency_code: str | None = None,
         provider_currency_code: str | None = None,
         exchange_rate: float | None = None,
@@ -820,8 +814,6 @@ class SupabaseStore:
         item.item_status = "BOOKED" if provider_response.get("success") else "FAILED"
         item.provider_order_no = provider_obj.get("orderNo")
         item.provider_transaction_id = provider_obj.get("transactionId") or order_request.get("transactionId")
-        item.purchase_channel = purchase_channel
-        item.booked_via_platform = platform_code
         item.provider_status = "SUCCESS" if provider_response.get("success") else "FAILED"
         item.country_code = country_code
         item.country_name = country_name
@@ -1092,7 +1084,6 @@ class SupabaseStore:
             if order_item:
                 order_item.item_status = "CANCELLED"
                 order_item.canceled_at = now
-                order_item.canceled_via_platform = platform_code
             if customer_order:
                 customer_order.order_status = "CANCELLED"
         elif action == "revoke":
@@ -1101,7 +1092,6 @@ class SupabaseStore:
             if order_item:
                 order_item.item_status = "REVOKED"
                 order_item.revoked_at = now
-                order_item.revoked_via_platform = platform_code
             if customer_order:
                 customer_order.order_status = "REVOKED"
         elif action == "suspend":
@@ -1124,7 +1114,6 @@ class SupabaseStore:
             if order_item:
                 order_item.item_status = "REFUNDED"
                 order_item.refunded_at = now
-                order_item.refunded_via_platform = platform_code
                 order_item.refund_amount_minor = refund_amount_minor
             if customer_order:
                 customer_order.order_status = "REFUNDED"

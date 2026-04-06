@@ -676,7 +676,6 @@ Example payload:
   },
   "platformCode": "mobile_app",
   "platformName": "Mobile App",
-  "purchaseChannel": "mobile_app",
   "currencyCode": "IQD",
   "providerCurrencyCode": "USD",
   "countryCode": "TR",
