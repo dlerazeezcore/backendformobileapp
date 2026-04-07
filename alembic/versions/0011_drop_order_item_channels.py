@@ -1,6 +1,6 @@
 """drop unused order_items channel/platform columns
 
-Revision ID: 0011_drop_order_item_channel_columns
+Revision ID: 0011_drop_order_item_channels
 Revises: 0010_add_password_hash_columns
 Create Date: 2026-04-07 01:25:00
 """
@@ -10,7 +10,7 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "0011_drop_order_item_channel_columns"
+revision = "0011_drop_order_item_channels"
 down_revision = "0010_add_password_hash_columns"
 branch_labels = None
 depends_on = None
