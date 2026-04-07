@@ -4,7 +4,22 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, Uuid, create_engine, select
+from sqlalchemy import (
+    BigInteger,
+    JSON,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    Uuid,
+    create_engine,
+    select,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 from phone_utils import normalize_phone, phone_lookup_candidates
@@ -215,6 +230,7 @@ class CustomerOrder(TimeMixin, Base):
     order_items: Mapped[list["OrderItem"]] = relationship(back_populates="customer_order")
     lifecycle_events: Mapped[list["ESimLifecycleEvent"]] = relationship(back_populates="customer_order")
     payload_snapshots: Mapped[list["ProviderPayloadSnapshot"]] = relationship(back_populates="customer_order")
+    payment_attempts: Mapped[list["PaymentAttempt"]] = relationship(back_populates="customer_order")
 
 
 class OrderItem(TimeMixin, Base):
@@ -256,6 +272,84 @@ class OrderItem(TimeMixin, Base):
     profiles: Mapped[list["ESimProfile"]] = relationship(back_populates="order_item")
     lifecycle_events: Mapped[list["ESimLifecycleEvent"]] = relationship(back_populates="order_item")
     payload_snapshots: Mapped[list["ProviderPayloadSnapshot"]] = relationship(back_populates="order_item")
+    payment_attempts: Mapped[list["PaymentAttempt"]] = relationship(back_populates="order_item")
+
+
+class PaymentAttempt(TimeMixin, Base):
+    __tablename__ = "payment_attempts"
+    __table_args__ = (
+        UniqueConstraint("transaction_id", name="uq_payment_attempts_transaction_id"),
+        UniqueConstraint("provider", "provider_payment_id", name="uq_payment_attempts_provider_payment_id"),
+        Index("ix_payment_attempts_customer_order_id", "customer_order_id"),
+        Index("ix_payment_attempts_order_item_id", "order_item_id"),
+        Index("ix_payment_attempts_user_created", "user_id", "created_at"),
+        Index("ix_payment_attempts_status_created", "status", "created_at"),
+        Index("ix_payment_attempts_method_created", "payment_method", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(Uuid(as_uuid=False), primary_key=True, default=lambda: str(uuid.uuid4()))
+    customer_order_id: Mapped[int | None] = mapped_column(
+        ForeignKey("customer_orders.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    order_item_id: Mapped[int | None] = mapped_column(
+        ForeignKey("order_items.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    user_id: Mapped[str | None] = mapped_column(
+        Uuid(as_uuid=False),
+        ForeignKey("app_users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    service_type: Mapped[str] = mapped_column(String(32), default="esim", nullable=False)
+    payment_method: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    amount_minor: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    currency_code: Mapped[str] = mapped_column(String(8), nullable=False)
+    provider_payment_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    provider_reference: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    transaction_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metadata_payload: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict, nullable=False)
+    provider_request: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    provider_response: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    canceled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    customer_order: Mapped[CustomerOrder | None] = relationship(back_populates="payment_attempts")
+    order_item: Mapped[OrderItem | None] = relationship(back_populates="payment_attempts")
+    provider_events: Mapped[list["PaymentProviderEvent"]] = relationship(back_populates="payment_attempt")
+
+
+class PaymentProviderEvent(Base):
+    __tablename__ = "payment_provider_events"
+    __table_args__ = (
+        Index("ix_payment_provider_events_provider_event_id", "provider", "provider_event_id"),
+        Index("ix_payment_provider_events_attempt_id", "payment_attempt_id"),
+        Index("ix_payment_provider_events_processed_created", "processed", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer(), "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
+    payment_attempt_id: Mapped[str | None] = mapped_column(
+        Uuid(as_uuid=False),
+        ForeignKey("payment_attempts.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    provider_event_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    signature_valid: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    raw_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    processed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    processing_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    payment_attempt: Mapped[PaymentAttempt | None] = relationship(back_populates="provider_events")
 
 
 class ESimProfile(TimeMixin, Base):
@@ -458,6 +552,15 @@ class SupabaseStore:
         rows.sort(key=lambda item: (item.created_at, item.id), reverse=True)
         return rows
 
+    @staticmethod
+    def _merge_json_dict(
+        base: dict[str, Any] | None,
+        incoming: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        merged = dict(base or {})
+        merged.update(incoming or {})
+        return merged
+
     def ensure_user(
         self,
         *,
@@ -490,6 +593,269 @@ class SupabaseStore:
         user.last_login_at = last_login_at
         self.session.flush()
         return user
+
+    @staticmethod
+    def _normalize_payment_status(status: str) -> str:
+        normalized = status.strip().lower()
+        if normalized == "cancelled":
+            return "canceled"
+        return normalized
+
+    @staticmethod
+    def _is_payment_terminal_status(status: str) -> bool:
+        return status in {"paid", "failed", "canceled", "expired", "refunded"}
+
+    def get_payment_attempt_by_id(
+        self,
+        payment_attempt_id: str,
+        *,
+        for_update: bool = False,
+    ) -> PaymentAttempt | None:
+        query = select(PaymentAttempt).where(PaymentAttempt.id == payment_attempt_id)
+        if for_update:
+            query = query.with_for_update()
+        return self.session.scalar(query)
+
+    def get_payment_attempt_by_transaction_id(
+        self,
+        transaction_id: str,
+        *,
+        for_update: bool = False,
+    ) -> PaymentAttempt | None:
+        query = select(PaymentAttempt).where(PaymentAttempt.transaction_id == transaction_id)
+        if for_update:
+            query = query.with_for_update()
+        return self.session.scalar(query)
+
+    def get_payment_attempt_by_provider_payment_id(
+        self,
+        *,
+        provider: str | None,
+        provider_payment_id: str,
+        for_update: bool = False,
+    ) -> PaymentAttempt | None:
+        query = select(PaymentAttempt).where(PaymentAttempt.provider_payment_id == provider_payment_id)
+        if provider is not None:
+            query = query.where(PaymentAttempt.provider == provider)
+        if for_update:
+            query = query.with_for_update()
+        return self.session.scalar(query)
+
+    def get_payment_attempt_by_any_reference(self, reference: str) -> PaymentAttempt | None:
+        row = self.get_payment_attempt_by_id(reference)
+        if row is not None:
+            return row
+        row = self.session.scalar(select(PaymentAttempt).where(PaymentAttempt.provider_payment_id == reference))
+        if row is not None:
+            return row
+        row = self.session.scalar(select(PaymentAttempt).where(PaymentAttempt.transaction_id == reference))
+        if row is not None:
+            return row
+        return None
+
+    def create_payment_attempt(
+        self,
+        *,
+        transaction_id: str,
+        payment_method: str = "fib",
+        provider: str | None = "fib",
+        customer_order_id: int | None = None,
+        provider_payment_id: str | None = None,
+        provider_reference: str | None = None,
+        status: str = "pending",
+        amount_minor: int = 0,
+        currency_code: str = "IQD",
+        user_id: str | None = None,
+        service_type: str = "esim",
+        order_item_id: int | None = None,
+        idempotency_key: str | None = None,
+        failure_reason: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        provider_request: dict[str, Any] | None = None,
+        provider_response: dict[str, Any] | None = None,
+        paid_at: datetime | None = None,
+        failed_at: datetime | None = None,
+        canceled_at: datetime | None = None,
+    ) -> PaymentAttempt:
+        normalized_status = self._normalize_payment_status(status)
+        row = PaymentAttempt(
+            customer_order_id=customer_order_id,
+            order_item_id=order_item_id,
+            user_id=user_id,
+            service_type=service_type,
+            payment_method=payment_method.strip().lower(),
+            provider=provider.strip().lower() if provider else None,
+            status=normalized_status,
+            amount_minor=amount_minor,
+            currency_code=currency_code.strip().upper(),
+            provider_payment_id=provider_payment_id,
+            provider_reference=provider_reference,
+            transaction_id=transaction_id,
+            idempotency_key=idempotency_key,
+            failure_reason=failure_reason,
+            metadata_payload=metadata or {},
+            provider_request=provider_request or {},
+            provider_response=provider_response or {},
+            paid_at=paid_at,
+            failed_at=failed_at,
+            canceled_at=canceled_at,
+        )
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+    def update_payment_attempt(
+        self,
+        row: PaymentAttempt,
+        *,
+        status: str | None = None,
+        customer_order_id: int | None = None,
+        order_item_id: int | None = None,
+        provider: str | None = None,
+        provider_payment_id: str | None = None,
+        provider_reference: str | None = None,
+        idempotency_key: str | None = None,
+        failure_reason: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        provider_request: dict[str, Any] | None = None,
+        provider_response: dict[str, Any] | None = None,
+        merge_provider_response: bool = True,
+        paid_at: datetime | None = None,
+        failed_at: datetime | None = None,
+        canceled_at: datetime | None = None,
+    ) -> PaymentAttempt:
+        if status is not None:
+            row.status = self._normalize_payment_status(status)
+        if customer_order_id is not None:
+            row.customer_order_id = customer_order_id
+        if order_item_id is not None:
+            row.order_item_id = order_item_id
+        if provider is not None:
+            row.provider = provider.strip().lower() if provider else None
+        if provider_payment_id and not row.provider_payment_id:
+            row.provider_payment_id = provider_payment_id
+        if provider_reference is not None:
+            row.provider_reference = provider_reference
+        if idempotency_key is not None:
+            row.idempotency_key = idempotency_key
+        if failure_reason is not None:
+            row.failure_reason = failure_reason
+        if metadata is not None:
+            row.metadata_payload = metadata
+        if provider_request is not None:
+            row.provider_request = provider_request
+        if provider_response is not None:
+            if merge_provider_response:
+                row.provider_response = self._merge_json_dict(row.provider_response, provider_response)
+            else:
+                row.provider_response = provider_response
+        if row.status == "paid":
+            row.paid_at = paid_at or row.paid_at or utcnow()
+        if row.status == "failed":
+            row.failed_at = failed_at or row.failed_at or utcnow()
+        if row.status == "canceled":
+            row.canceled_at = canceled_at or row.canceled_at or utcnow()
+        self.session.flush()
+        return row
+
+    def apply_payment_status_transition(
+        self,
+        row: PaymentAttempt,
+        *,
+        new_status: str,
+        failure_reason: str | None = None,
+        paid_at: datetime | None = None,
+        failed_at: datetime | None = None,
+        canceled_at: datetime | None = None,
+    ) -> bool:
+        normalized_new = self._normalize_payment_status(new_status)
+        current = self._normalize_payment_status(row.status)
+        if current == normalized_new:
+            return False
+        if self._is_payment_terminal_status(current):
+            # Allow paid -> refunded only, otherwise keep terminal state.
+            if not (current == "paid" and normalized_new == "refunded"):
+                return False
+        row.status = normalized_new
+        if normalized_new == "paid":
+            row.paid_at = paid_at or row.paid_at or utcnow()
+        elif normalized_new == "failed":
+            row.failed_at = failed_at or row.failed_at or utcnow()
+            if failure_reason:
+                row.failure_reason = failure_reason
+        elif normalized_new == "canceled":
+            row.canceled_at = canceled_at or row.canceled_at or utcnow()
+        self.session.flush()
+        return True
+
+    def link_payment_attempt_to_order(
+        self,
+        *,
+        payment_attempt: PaymentAttempt,
+        customer_order: CustomerOrder,
+        order_item: OrderItem,
+    ) -> PaymentAttempt:
+        payment_attempt.customer_order_id = customer_order.id
+        payment_attempt.order_item_id = order_item.id
+        payment_attempt.user_id = customer_order.user_id
+        if customer_order.currency_code and not payment_attempt.currency_code:
+            payment_attempt.currency_code = customer_order.currency_code
+        self.session.flush()
+        return payment_attempt
+
+    def get_payment_provider_event(
+        self,
+        *,
+        provider: str,
+        provider_event_id: str,
+    ) -> PaymentProviderEvent | None:
+        return self.session.scalar(
+            select(PaymentProviderEvent).where(
+                PaymentProviderEvent.provider == provider,
+                PaymentProviderEvent.provider_event_id == provider_event_id,
+            )
+        )
+
+    def create_payment_provider_event(
+        self,
+        *,
+        provider: str,
+        event_type: str,
+        raw_payload: dict[str, Any],
+        payment_attempt_id: str | None = None,
+        provider_event_id: str | None = None,
+        signature_valid: bool | None = None,
+        processed: bool = False,
+        processing_error: str | None = None,
+    ) -> PaymentProviderEvent:
+        event = PaymentProviderEvent(
+            payment_attempt_id=payment_attempt_id,
+            provider=provider,
+            event_type=event_type,
+            provider_event_id=provider_event_id,
+            signature_valid=signature_valid,
+            raw_payload=raw_payload,
+            processed=processed,
+            processing_error=processing_error,
+        )
+        self.session.add(event)
+        self.session.flush()
+        return event
+
+    def mark_payment_provider_event_processed(
+        self,
+        event: PaymentProviderEvent,
+        *,
+        processed: bool,
+        processing_error: str | None = None,
+        payment_attempt_id: str | None = None,
+    ) -> PaymentProviderEvent:
+        event.processed = processed
+        event.processing_error = processing_error
+        if payment_attempt_id is not None:
+            event.payment_attempt_id = payment_attempt_id
+        self.session.flush()
+        return event
 
     def ensure_admin_user(
         self,

@@ -1,14 +1,25 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import unittest
-from typing import Any
+from typing import Any, Generator
 
 import httpx
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session, sessionmaker
 
-from fib_payment_api import CreatePaymentRequest, FIBPaymentAPI, register_fib_payment_routes
+from fib_payment_api import (
+    CreatePaymentRequest,
+    CreatePaymentResponse,
+    FIBPaymentAPI,
+    PaymentStatusResponse,
+    register_fib_payment_routes,
+)
+from supabase_store import Base, PaymentAttempt, PaymentProviderEvent
 
 
 class FIBPaymentAPITest(unittest.IsolatedAsyncioTestCase):
@@ -42,7 +53,7 @@ class FIBPaymentAPITest(unittest.IsolatedAsyncioTestCase):
             client_id="cid",
             client_secret="secret",
             base_url="https://fib.stage.fib.iq",
-            default_status_callback_url="https://backend.example.com/api/v1/fib-payments/webhooks/events",
+            default_status_callback_url="https://backend.example.com/api/v1/payments/fib/webhook",
             default_redirect_uri="tulip://payment/result",
             transport=httpx.MockTransport(handler),
         )
@@ -60,56 +71,164 @@ class FIBPaymentAPITest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(auth_header, "Bearer token-123")
         self.assertEqual(
             request_body.get("statusCallbackUrl"),
-            "https://backend.example.com/api/v1/fib-payments/webhooks/events",
+            "https://backend.example.com/api/v1/payments/fib/webhook",
         )
         self.assertEqual(request_body.get("redirectUri"), "tulip://payment/result")
 
 
-class FIBPaymentWebhookRouteTest(unittest.TestCase):
+class _FakeProvider:
+    webhook_secret = "whsec"
+
+    async def create_payment(self, payload: CreatePaymentRequest) -> CreatePaymentResponse:
+        _ = payload
+        return CreatePaymentResponse(
+            paymentId="fib-pay-1",
+            readableCode="FIB-READABLE",
+            qrCode="https://example.com/qr.png",
+            validUntil="2026-04-08T00:00:00+03:00",
+            personalAppLink="https://pay.example.com/fib-pay-1",
+        )
+
+    async def get_payment_status(self, payment_id: str) -> PaymentStatusResponse:
+        return PaymentStatusResponse(
+            paymentId=payment_id,
+            status="PAID",
+            paidAt="2026-04-07T00:10:00+03:00",
+            validUntil="2026-04-08T00:00:00+03:00",
+            amount={"amount": 5000, "currency": "IQD"},
+        )
+
+    async def cancel_payment(self, payment_id: str) -> None:
+        _ = payment_id
+
+    async def refund_payment(self, payment_id: str) -> None:
+        _ = payment_id
+
+
+class FIBPaymentRoutesTest(unittest.TestCase):
     def setUp(self) -> None:
+        temp_db = tempfile.NamedTemporaryFile(prefix="fib_test_", suffix=".db", delete=False)
+        temp_db.close()
+        self.db_path = temp_db.name
+        self.engine = create_engine(
+            f"sqlite+pysqlite:///{self.db_path}",
+            connect_args={"check_same_thread": False},
+            future=True,
+        )
+        Base.metadata.create_all(self.engine)
+        self.session_factory = sessionmaker(bind=self.engine, autoflush=False, autocommit=False, future=True)
+
         app = FastAPI()
 
-        class _Provider:
-            webhook_secret = "whsec"
+        def _get_provider() -> _FakeProvider:
+            return _FakeProvider()
 
-            async def create_payment(self, payload):  # pragma: no cover - route plumbing only
-                _ = payload
-                return None
+        def _get_db() -> Generator[Session, None, None]:
+            session = self.session_factory()
+            try:
+                yield session
+            finally:
+                session.close()
 
-            async def get_payment_status(self, payment_id):  # pragma: no cover - route plumbing only
-                _ = payment_id
-                return None
-
-            async def cancel_payment(self, payment_id):  # pragma: no cover - route plumbing only
-                _ = payment_id
-                return None
-
-            async def refund_payment(self, payment_id):  # pragma: no cover - route plumbing only
-                _ = payment_id
-                return None
-
-        def get_fib_provider() -> _Provider:
-            return _Provider()
-
-        register_fib_payment_routes(app, get_fib_provider)
+        register_fib_payment_routes(app, _get_provider, _get_db)
         self.client = TestClient(app)
+
+    def tearDown(self) -> None:
+        self.engine.dispose()
+        if os.path.exists(self.db_path):
+            os.remove(self.db_path)
+
+    def test_checkout_aliases_are_idempotent_by_transaction_id(self) -> None:
+        payload = {
+            "amount": 5000,
+            "currency": "IQD",
+            "description": "Top-up checkout",
+            "metadata": {
+                "transactionId": "tx-1001",
+                "serviceType": "esim",
+            },
+        }
+
+        first = self.client.post("/api/v1/payments/fib/checkout", json=payload)
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.json().get("paymentId"), "fib-pay-1")
+        self.assertEqual(first.json().get("status"), "pending")
+
+        second = self.client.post("/api/v1/payments/fib/create", json=payload)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.json().get("paymentId"), "fib-pay-1")
+        self.assertEqual(second.json().get("transactionId"), "tx-1001")
+
+        with self.session_factory() as session:
+            rows = session.scalars(select(PaymentAttempt)).all()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].transaction_id, "tx-1001")
+
+    def test_get_payment_updates_status_to_paid(self) -> None:
+        payload = {
+            "amount": 5000,
+            "currency": "IQD",
+            "description": "Top-up checkout",
+            "metadata": {"transactionId": "tx-2002"},
+        }
+        create_response = self.client.post("/api/v1/payments/fib/checkout", json=payload)
+        self.assertEqual(create_response.status_code, 200)
+
+        status_response = self.client.get("/api/v1/payments/fib/fib-pay-1?refresh=true")
+        self.assertEqual(status_response.status_code, 200)
+        self.assertEqual(status_response.json().get("status"), "paid")
+        self.assertTrue(status_response.json().get("paidAt"))
+
+    def test_invalid_payment_id_returns_json_404(self) -> None:
+        response = self.client.get("/api/v1/payments/fib/does-not-exist")
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json().get("success"), False)
+        self.assertEqual(response.json().get("errorCode"), "FIB_PAYMENT_NOT_FOUND")
 
     def test_webhook_requires_secret_when_configured(self) -> None:
         rejected = self.client.post(
-            "/api/v1/fib-payments/webhooks/events",
-            json={"id": "pay-1", "status": {"status": "PAID"}},
+            "/api/v1/payments/fib/webhook",
+            json={"paymentId": "fib-pay-1", "status": "PAID"},
         )
         self.assertEqual(rejected.status_code, 401)
 
         accepted = self.client.post(
-            "/api/v1/fib-payments/webhooks/events",
+            "/api/v1/payments/fib/webhook",
             headers={"X-FIB-WEBHOOK-SECRET": "whsec"},
-            json={"id": "pay-1", "status": {"status": "PAID"}},
+            json={"paymentId": "fib-pay-1", "status": "PAID"},
         )
         self.assertEqual(accepted.status_code, 202)
-        self.assertEqual(accepted.json().get("status"), "accepted")
-        self.assertEqual(accepted.json().get("paymentId"), "pay-1")
-        self.assertEqual(accepted.json().get("paymentStatus"), "PAID")
+        self.assertEqual(accepted.json().get("success"), True)
+
+    def test_webhook_is_idempotent_by_provider_event_id(self) -> None:
+        payload = {
+            "amount": 5000,
+            "currency": "IQD",
+            "description": "Top-up checkout",
+            "metadata": {"transactionId": "tx-webhook-1"},
+        }
+        create_response = self.client.post("/api/v1/payments/fib/checkout", json=payload)
+        self.assertEqual(create_response.status_code, 200)
+
+        first = self.client.post(
+            "/api/v1/payments/fib/webhook",
+            headers={"X-FIB-WEBHOOK-SECRET": "whsec"},
+            json={"eventId": "evt-100", "paymentId": "fib-pay-1", "status": "PAID"},
+        )
+        self.assertEqual(first.status_code, 202)
+        self.assertEqual(first.json().get("transitionApplied"), True)
+
+        second = self.client.post(
+            "/api/v1/payments/fib/webhook",
+            headers={"X-FIB-WEBHOOK-SECRET": "whsec"},
+            json={"eventId": "evt-100", "paymentId": "fib-pay-1", "status": "PAID"},
+        )
+        self.assertEqual(second.status_code, 202)
+        self.assertEqual(second.json().get("duplicateEvent"), True)
+
+        with self.session_factory() as session:
+            events = session.scalars(select(PaymentProviderEvent)).all()
+            self.assertEqual(len(events), 1)
 
 
 if __name__ == "__main__":

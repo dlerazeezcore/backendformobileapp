@@ -346,6 +346,7 @@ ESIM_ACCESS_ACCESS_CODE=your_access_code
 ESIM_ACCESS_SECRET_KEY=your_secret_key
 FIB_PAYMENT_CLIENT_ID=your_fib_client_id
 FIB_PAYMENT_CLIENT_SECRET=your_fib_client_secret
+FIB_PAYMENT_WEBHOOK_SECRET=optional_webhook_secret
 DATABASE_URL=postgresql://USER:PASSWORD@HOST:PORT/DATABASE
 AUTH_SECRET_KEY=replace_with_a_long_random_secret
 AUTH_TOKEN_TTL_SECONDS=86400
@@ -356,6 +357,7 @@ Notes:
 - `DATABASE_URL` may be plain `postgresql://...`; the backend normalizes it to SQLAlchemy `psycopg`
 - for Supabase, prefer the pooler connection string when the direct host is not reachable
 - if `FIB_PAYMENT_CLIENT_ID` and `FIB_PAYMENT_CLIENT_SECRET` are missing, FIB routes return `503` (integration disabled)
+- `FIB_PAYMENT_WEBHOOK_SECRET` is optional; set it when you want signed webhook validation
 - FIB runtime defaults are hardcoded in [app.py](/Users/laveencompany/Desktop/backendformobileapp/app.py):
   - `FIB_PAYMENT_BASE_URL = "https://fib.prod.fib.iq"`
   - `FIB_PAYMENT_TIMEOUT_SECONDS = 30`
@@ -475,11 +477,14 @@ This keeps the backend simple now without blocking a more professional auth desi
 
 These are the backend routes for FIB payment lifecycle.
 
-- `POST /api/v1/fib-payments/payments`
-- `GET /api/v1/fib-payments/payments/{payment_id}/status`
-- `POST /api/v1/fib-payments/payments/{payment_id}/cancel`
-- `POST /api/v1/fib-payments/payments/{payment_id}/refund`
-- `POST /api/v1/fib-payments/webhooks/events`
+- `POST /api/v1/payments/fib/checkout` (canonical create endpoint)
+- `POST /api/v1/payments/fib/create` (alias)
+- `POST /api/v1/payments/fib/intent` (alias)
+- `POST /api/v1/payments/fib/initiate` (alias)
+- `GET /api/v1/payments/fib/{paymentId}`
+- `POST /api/v1/payments/fib/confirm`
+- `POST /api/v1/payments/fib/webhook`
+- legacy compatibility routes remain available under `/api/v1/fib-payments/*`
 
 ### Direct eSIM Access passthrough-style routes
 
@@ -542,6 +547,8 @@ These are the routes frontend should mainly use.
 - `GET /api/v1/admin/order-items`
 - `GET /api/v1/admin/profiles`
 - `GET /api/v1/admin/lifecycle-events`
+- `GET /api/v1/admin/payment-attempts`
+- `GET /api/v1/admin/payment-provider-events`
 
 ### Auth routes
 
@@ -563,13 +570,14 @@ Recommended frontend usage:
 
 1. admin creates pricing rules, discount rules, exchange rates, and featured countries
 2. app queries package list from backend
-3. app submits managed order request
-4. backend calls eSIM Access
-5. backend saves user, customer order, order item, pricing snapshot, and lifecycle event
-6. app creates FIB payment through backend FIB route
-7. backend receives FIB callback and app polls payment status when needed
-8. backend later syncs profile state and usage
-9. admin UI reads orders, order items, profiles, and lifecycle history from admin routes
+3. app creates payment attempt (FIB checkout or loyalty flow)
+4. backend receives webhook callbacks and app polls payment status when needed
+5. app submits managed order request after payment success
+6. backend calls eSIM Access
+7. backend saves user, customer order, order item, pricing snapshot, and lifecycle event
+8. backend links booking to payment attempt for reconciliation
+9. backend later syncs profile state and usage
+10. admin UI reads orders, order items, payment attempts, provider events, profiles, and lifecycle history
 
 ### Create or update an app user
 
@@ -855,84 +863,151 @@ The backend uses FIB OAuth2 `client_credentials` internally and caches bearer to
 
 Current backend default target is hardcoded to production in [app.py](/Users/laveencompany/Desktop/backendformobileapp/app.py) as `FIB_PAYMENT_BASE_URL`.
 
-### Backend FIB routes
+### Canonical routes and aliases
 
-Create payment:
+Create payment intent:
 
-- `POST /api/v1/fib-payments/payments`
+- `POST /api/v1/payments/fib/checkout` (canonical)
+- `POST /api/v1/payments/fib/create` (alias)
+- `POST /api/v1/payments/fib/intent` (alias)
+- `POST /api/v1/payments/fib/initiate` (alias)
 
-Check payment status:
+Read payment status:
 
-- `GET /api/v1/fib-payments/payments/{payment_id}/status`
+- `GET /api/v1/payments/fib/{paymentId}`
 
-Cancel payment:
+Notes:
 
-- `POST /api/v1/fib-payments/payments/{payment_id}/cancel` (returns `204`)
+- returns canonical status from database by default
+- pass `?refresh=true` to force provider status refresh before response
 
-Refund payment:
+Force verification with provider:
 
-- `POST /api/v1/fib-payments/payments/{payment_id}/refund` (returns `202`)
+- `POST /api/v1/payments/fib/confirm`
 
-Receive payment status callbacks from FIB:
+Webhook receiver:
 
-- `POST /api/v1/fib-payments/webhooks/events` (returns `202`)
+- `POST /api/v1/payments/fib/webhook` (returns `202`)
 
-### Create payment request shape
+Legacy compatibility routes are still mounted under `/api/v1/fib-payments/*`.
 
-`POST /api/v1/fib-payments/payments`
+### Checkout request contract
+
+`POST /api/v1/payments/fib/checkout`
 
 ```json
 {
-  "monetaryValue": {
-    "amount": "1300",
-    "currency": "IQD"
-  },
-  "statusCallbackUrl": "https://YOUR-KOYEB-DOMAIN/api/v1/fib-payments/webhooks/events",
-  "description": "Payment description",
-  "redirectUri": "tulip://payment/result",
-  "expiresIn": "PT8H6M12.345S",
-  "category": "ECOMMERCE",
-  "refundableFor": "PT48H"
+  "amount": 5000,
+  "currency": "IQD",
+  "description": "Tulip eSIM checkout",
+  "returnUrl": "tulip://payment/result",
+  "successUrl": "tulip://payment/success",
+  "cancelUrl": "tulip://payment/cancel",
+  "metadata": {
+    "transactionId": "txn_123",
+    "userId": "optional-user-uuid",
+    "serviceType": "esim",
+    "orderItemId": 123
+  }
 }
 ```
 
-Important behavior:
+Response shape:
 
-- `statusCallbackUrl` and `redirectUri` are optional in request payload
-- if missing, backend auto-fills them from hardcoded defaults in [app.py](/Users/laveencompany/Desktop/backendformobileapp/app.py):
-  - `FIB_PAYMENT_STATUS_CALLBACK_URL`
-  - `FIB_PAYMENT_REDIRECT_URI`
+```json
+{
+  "paymentAttemptId": "uuid",
+  "paymentId": "fib-provider-payment-id",
+  "providerPaymentId": "fib-provider-payment-id",
+  "transactionId": "txn_123",
+  "paymentMethod": "fib",
+  "provider": "fib",
+  "status": "pending",
+  "amountMinor": 5000,
+  "currencyCode": "IQD",
+  "customerOrderId": 123,
+  "orderItemId": 456,
+  "paymentLink": "https://...",
+  "qrCodeUrl": "https://...",
+  "expiresAt": "2026-04-08T00:00:00+03:00",
+  "providerInfo": {
+    "name": "fib",
+    "paymentId": "fib-provider-payment-id"
+  }
+}
+```
 
-### Payment status values
+### Status normalization
 
-From FIB docs and response samples:
+Backend normalizes provider status into:
 
-- `UNPAID`
-- `PAID`
-- `DECLINED`
-- `REFUND_REQUESTED`
-- `REFUNDED`
+- `pending`
+- `paid`
+- `failed`
+- `canceled`
+- `expired`
+- `refunded`
 
-Possible `decliningReason` values include:
+### Idempotency and persistence
 
-- `SERVER_FAILURE`
-- `PAYMENT_EXPIRATION`
-- `PAYMENT_CANCELLATION`
+FIB and loyalty attempts are persisted in `payment_attempts` with idempotency by `transaction_id`.
 
-### FIB callback/webhook expectations
+Table highlights:
 
-FIB callback payload includes:
+- `id` UUID primary key
+- `customer_order_id`, `order_item_id`, `user_id` links for reconciliation
+- `payment_method` (`fib`, `loyalty`, future methods)
+- `transaction_id` unique
+- `provider + provider_payment_id` unique
+- `user_id + created_at` index
+- `status + created_at` index
+- `payment_method + created_at` index
 
-- `id` (payment id)
-- `status` (status object equivalent to payment status response)
+Provider webhook payloads are persisted in `payment_provider_events` and then mapped idempotently into `payment_attempts` state transitions.
 
-Backend callback endpoint returns `202 Accepted` on success.
+Managed booking route can now link payment attempts:
 
-If `FIB_PAYMENT_WEBHOOK_SECRET` constant is set in [app.py](/Users/laveencompany/Desktop/backendformobileapp/app.py), backend expects header:
+- `POST /api/v1/esim-access/orders/managed`
 
-- `X-FIB-WEBHOOK-SECRET: <secret>`
+Optional fields for linking/creating payment records:
 
-If this header is missing or invalid while secret is configured, backend returns `401`.
+- `paymentAttemptId`
+- `paymentTransactionId`
+- `paymentMethod`
+- `paymentProvider`
+- `paymentStatus`
+- `paymentAmountMinor`
+- `paymentCurrencyCode`
+- `paymentProviderPaymentId`
+- `paymentProviderReference`
+- `paymentIdempotencyKey`
+
+For `paymentMethod = loyalty`, backend creates or updates a `payment_attempts` row with `provider = internal_loyalty` and marks it paid when booking succeeds.
+
+### Error contract for frontend
+
+All FIB managed endpoints return structured JSON errors:
+
+```json
+{
+  "success": false,
+  "errorCode": "FIB_PROVIDER_REJECTED",
+  "message": "Payment request was rejected by provider.",
+  "providerMessage": "provider message if available",
+  "requestId": "uuid",
+  "traceId": "uuid"
+}
+```
+
+### Webhook signature behavior
+
+When `FIB_PAYMENT_WEBHOOK_SECRET` is configured, webhook route validates one of:
+
+- `X-FIB-SIGNATURE` (HMAC-SHA256 of raw body using webhook secret)
+- `X-Signature` or `X-Webhook-Signature` (same HMAC scheme)
+- `X-FIB-WEBHOOK-SECRET` (legacy shared-secret header fallback)
+
+If validation fails, backend returns `401`.
 
 ### Mark install and activation states
 

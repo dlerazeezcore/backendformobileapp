@@ -51,10 +51,9 @@ CORS_ALLOW_ORIGIN_REGEX = r"^https://([a-zA-Z0-9-]+\.)?figma\.site$"
 FIB_PAYMENT_BASE_URL = "https://fib.prod.fib.iq"
 FIB_PAYMENT_TIMEOUT_SECONDS = 30.0
 FIB_PAYMENT_RATE_LIMIT_PER_SECOND = 8.0
-FIB_PAYMENT_STATUS_CALLBACK_URL = "https://mean-lettie-corevia-0bd7cc91.koyeb.app/api/v1/fib-payments/webhooks/events"
+FIB_PAYMENT_STATUS_CALLBACK_URL = "https://mean-lettie-corevia-0bd7cc91.koyeb.app/api/v1/payments/fib/webhook"
 FIB_PAYMENT_REDIRECT_URI = "tulip://payment/result"
-# Optional hardcoded shared secret for webhook header validation.
-# Keep as None to disable shared-secret checks.
+# Optional hardcoded fallback when env var is not set.
 FIB_PAYMENT_WEBHOOK_SECRET: str | None = None
 
 
@@ -80,7 +79,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 rate_limit_per_second=FIB_PAYMENT_RATE_LIMIT_PER_SECOND,
                 default_status_callback_url=FIB_PAYMENT_STATUS_CALLBACK_URL,
                 default_redirect_uri=FIB_PAYMENT_REDIRECT_URI,
-                webhook_secret=FIB_PAYMENT_WEBHOOK_SECRET,
+                webhook_secret=cfg.fib_payment_webhook_secret or FIB_PAYMENT_WEBHOOK_SECRET,
             )
         yield
         await app.state.esim_access_api.close()
@@ -148,7 +147,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     register_user_routes(app, get_db)
     register_auth_routes(app, get_db)
     register_esim_access_routes(app, get_db, get_provider)
-    register_fib_payment_routes(app, get_fib_provider)
+    register_fib_payment_routes(app, get_fib_provider, get_db)
     register_admin_routes(app, get_db)
 
     return app

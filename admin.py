@@ -16,6 +16,8 @@ from supabase_store import (
     FeaturedLocation,
     OrderItem,
     PricingRule,
+    PaymentAttempt,
+    PaymentProviderEvent,
     ProviderFieldRule,
     SupabaseStore,
 )
@@ -204,3 +206,11 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
     @app.get("/api/v1/admin/lifecycle-events")
     async def list_lifecycle_events(db: Session = Depends(get_db)) -> dict[str, Any]:
         return {"events": SupabaseStore(db).list_rows(ESimLifecycleEvent)}
+
+    @app.get("/api/v1/admin/payment-attempts")
+    async def list_payment_attempts(db: Session = Depends(get_db)) -> dict[str, Any]:
+        return {"paymentAttempts": SupabaseStore(db).list_rows(PaymentAttempt)}
+
+    @app.get("/api/v1/admin/payment-provider-events")
+    async def list_payment_provider_events(db: Session = Depends(get_db)) -> dict[str, Any]:
+        return {"paymentProviderEvents": SupabaseStore(db).list_rows(PaymentProviderEvent)}

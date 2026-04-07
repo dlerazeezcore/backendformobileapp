@@ -15,7 +15,7 @@ from fastapi import Depends, FastAPI
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
-from supabase_store import SupabaseStore
+from supabase_store import PaymentAttempt, SupabaseStore, utcnow
 from users import UserPayload
 
 
@@ -543,6 +543,16 @@ class ManagedOrderPayload(BaseModel):
     package_slug: str | None = Field(default=None, alias="packageSlug")
     package_name: str | None = Field(default=None, alias="packageName")
     custom_fields: dict[str, Any] = Field(default_factory=dict, alias="customFields")
+    payment_attempt_id: str | None = Field(default=None, alias="paymentAttemptId")
+    payment_transaction_id: str | None = Field(default=None, alias="paymentTransactionId")
+    payment_method: str | None = Field(default=None, alias="paymentMethod")
+    payment_provider: str | None = Field(default=None, alias="paymentProvider")
+    payment_status: str | None = Field(default=None, alias="paymentStatus")
+    payment_amount_minor: int | None = Field(default=None, alias="paymentAmountMinor")
+    payment_currency_code: str | None = Field(default=None, alias="paymentCurrencyCode")
+    payment_provider_payment_id: str | None = Field(default=None, alias="paymentProviderPaymentId")
+    payment_provider_reference: str | None = Field(default=None, alias="paymentProviderReference")
+    payment_idempotency_key: str | None = Field(default=None, alias="paymentIdempotencyKey")
 
 
 class ManagedProfileSyncPayload(BaseModel):
@@ -575,6 +585,96 @@ class ManagedIccidActionPayload(BaseModel):
     context: ActionContext
 
 
+def _normalize_payment_method(
+    payment_method: str | None,
+    payment_provider: str | None,
+) -> tuple[str | None, str | None]:
+    normalized_method = payment_method.strip().lower() if isinstance(payment_method, str) and payment_method.strip() else None
+    normalized_provider = payment_provider.strip().lower() if isinstance(payment_provider, str) and payment_provider.strip() else None
+    if normalized_method == "loyalty" and normalized_provider is None:
+        normalized_provider = "internal_loyalty"
+    if normalized_method == "fib" and normalized_provider is None:
+        normalized_provider = "fib"
+    return normalized_method, normalized_provider
+
+
+def _resolve_or_create_payment_for_managed_order(
+    *,
+    store: SupabaseStore,
+    payload: ManagedOrderPayload,
+    customer_order_id: int,
+    order_item_id: int,
+    user_id: str | None,
+    service_type: str,
+    amount_minor: int,
+    currency_code: str,
+    provider_request_payload: dict[str, Any],
+    provider_response_payload: dict[str, Any],
+) -> PaymentAttempt | None:
+    method, provider_code = _normalize_payment_method(payload.payment_method, payload.payment_provider)
+    attempt: PaymentAttempt | None = None
+    if payload.payment_attempt_id:
+        attempt = store.get_payment_attempt_by_id(payload.payment_attempt_id, for_update=True)
+    elif payload.payment_transaction_id:
+        attempt = store.get_payment_attempt_by_transaction_id(payload.payment_transaction_id, for_update=True)
+
+    # Loyalty can work without a prior checkout intent. Create and mark paid here.
+    if attempt is None and method == "loyalty":
+        transaction_id = payload.payment_transaction_id or f"loyalty-{order_item_id}-{uuid.uuid4().hex[:12]}"
+        attempt = store.get_payment_attempt_by_transaction_id(transaction_id, for_update=True)
+        if attempt is None:
+            attempt = store.create_payment_attempt(
+                transaction_id=transaction_id,
+                payment_method="loyalty",
+                provider=provider_code or "internal_loyalty",
+                customer_order_id=customer_order_id,
+                order_item_id=order_item_id,
+                user_id=user_id,
+                service_type=service_type,
+                status="paid",
+                amount_minor=payload.payment_amount_minor if payload.payment_amount_minor is not None else amount_minor,
+                currency_code=payload.payment_currency_code or currency_code,
+                provider_payment_id=payload.payment_provider_payment_id,
+                provider_reference=payload.payment_provider_reference,
+                idempotency_key=payload.payment_idempotency_key,
+                metadata={
+                    "source": "orders_managed",
+                    "paymentMethod": "loyalty",
+                    "autoPaidOnBooking": True,
+                },
+                provider_request={"managedOrderRequest": provider_request_payload},
+                provider_response={"managedOrderResponse": provider_response_payload},
+                paid_at=utcnow(),
+            )
+
+    if attempt is None:
+        return None
+
+    store.update_payment_attempt(
+        attempt,
+        customer_order_id=customer_order_id,
+        order_item_id=order_item_id,
+        provider=provider_code,
+        provider_payment_id=payload.payment_provider_payment_id,
+        provider_reference=payload.payment_provider_reference,
+        idempotency_key=payload.payment_idempotency_key,
+        metadata=store._merge_json_dict(
+            attempt.metadata_payload,
+            {
+                "source": "orders_managed",
+                "requestedMethod": method,
+            },
+        ),
+        provider_request={"managedOrderRequest": provider_request_payload},
+        provider_response={"managedOrderResponse": provider_response_payload},
+    )
+    if payload.payment_status:
+        store.apply_payment_status_transition(attempt, new_status=payload.payment_status)
+    elif method == "loyalty":
+        store.apply_payment_status_transition(attempt, new_status="paid")
+    return attempt
+
+
 def register_esim_access_routes(
     app: FastAPI,
     get_db: Callable[..., Any],
@@ -602,12 +702,14 @@ def register_esim_access_routes(
     ) -> dict[str, Any]:
         provider_response = await provider.order_profiles(payload.provider_request)
         store = SupabaseStore(db)
+        provider_request_payload = payload.provider_request.model_dump(by_alias=True, exclude_none=True)
+        provider_response_payload = provider_response.model_dump(by_alias=True, exclude_none=True)
         customer_order, order_item = store.save_managed_order(
             user_data=payload.user.model_dump(by_alias=False),
             platform_code=payload.platform_code,
             platform_name=payload.platform_name,
-            order_request=payload.provider_request.model_dump(by_alias=True, exclude_none=True),
-            provider_response=provider_response.model_dump(by_alias=True, exclude_none=True),
+            order_request=provider_request_payload,
+            provider_response=provider_response_payload,
             currency_code=payload.currency_code,
             provider_currency_code=payload.provider_currency_code,
             exchange_rate=payload.exchange_rate,
@@ -620,8 +722,23 @@ def register_esim_access_routes(
             package_name=payload.package_name,
             custom_fields=payload.custom_fields,
         )
+        payment_attempt = _resolve_or_create_payment_for_managed_order(
+            store=store,
+            payload=payload,
+            customer_order_id=customer_order.id,
+            order_item_id=order_item.id,
+            user_id=customer_order.user_id,
+            service_type=order_item.service_type,
+            amount_minor=order_item.sale_price_minor or customer_order.total_minor or 0,
+            currency_code=customer_order.currency_code or "IQD",
+            provider_request_payload=provider_request_payload,
+            provider_response_payload=provider_response_payload,
+        )
+        if payment_attempt is not None:
+            db.commit()
+            db.refresh(payment_attempt)
         return {
-            "provider": provider_response.model_dump(by_alias=True, exclude_none=True),
+            "provider": provider_response_payload,
             "database": {
                 "customerOrderId": customer_order.id,
                 "orderNumber": customer_order.order_number,
@@ -635,6 +752,18 @@ def register_esim_access_routes(
                     "discountMinor": customer_order.discount_minor,
                     "totalMinor": customer_order.total_minor,
                 },
+                "payment": (
+                    {
+                        "paymentAttemptId": payment_attempt.id,
+                        "paymentMethod": payment_attempt.payment_method,
+                        "provider": payment_attempt.provider,
+                        "status": payment_attempt.status,
+                        "transactionId": payment_attempt.transaction_id,
+                        "providerPaymentId": payment_attempt.provider_payment_id,
+                    }
+                    if payment_attempt is not None
+                    else None
+                ),
             },
         }
 
