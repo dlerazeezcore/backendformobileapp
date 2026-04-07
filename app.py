@@ -27,6 +27,10 @@ from supabase_store import create_database
 from users import register_user_routes
 
 CORS_ALLOWED_ORIGINS = [
+    "capacitor://localhost",
+    "ionic://localhost",
+    "http://localhost",
+    "https://localhost",
     "https://www.figma.com",
     "https://figma.com",
     "https://makeproxy-m.figma.site",
