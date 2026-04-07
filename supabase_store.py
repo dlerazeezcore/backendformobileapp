@@ -309,6 +309,7 @@ class PaymentAttempt(TimeMixin, Base):
     currency_code: Mapped[str] = mapped_column(String(8), nullable=False)
     provider_payment_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     provider_reference: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    external_user_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
     transaction_id: Mapped[str] = mapped_column(String(255), nullable=False)
     idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -662,6 +663,7 @@ class SupabaseStore:
         customer_order_id: int | None = None,
         provider_payment_id: str | None = None,
         provider_reference: str | None = None,
+        external_user_ref: str | None = None,
         status: str = "pending",
         amount_minor: int = 0,
         currency_code: str = "IQD",
@@ -690,6 +692,7 @@ class SupabaseStore:
             currency_code=currency_code.strip().upper(),
             provider_payment_id=provider_payment_id,
             provider_reference=provider_reference,
+            external_user_ref=external_user_ref,
             transaction_id=transaction_id,
             idempotency_key=idempotency_key,
             failure_reason=failure_reason,
@@ -714,6 +717,7 @@ class SupabaseStore:
         provider: str | None = None,
         provider_payment_id: str | None = None,
         provider_reference: str | None = None,
+        external_user_ref: str | None = None,
         idempotency_key: str | None = None,
         failure_reason: str | None = None,
         metadata: dict[str, Any] | None = None,
@@ -736,6 +740,8 @@ class SupabaseStore:
             row.provider_payment_id = provider_payment_id
         if provider_reference is not None:
             row.provider_reference = provider_reference
+        if external_user_ref is not None:
+            row.external_user_ref = external_user_ref
         if idempotency_key is not None:
             row.idempotency_key = idempotency_key
         if failure_reason is not None:

@@ -12,10 +12,11 @@ import httpx
 from fastapi import Depends, FastAPI, Header, Request, status
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from supabase_store import PaymentAttempt, SupabaseStore, parse_provider_datetime
+from supabase_store import AppUser, PaymentAttempt, SupabaseStore, parse_provider_datetime
 
 
 class FIBPaymentError(Exception):
@@ -551,6 +552,7 @@ def _to_checkout_response(row: PaymentAttempt) -> dict[str, Any]:
         "transactionId": row.transaction_id,
         "paymentMethod": row.payment_method,
         "provider": row.provider,
+        "externalUserRef": row.external_user_ref,
         "status": row.status,
         "amountMinor": row.amount_minor,
         "currencyCode": row.currency_code,
@@ -600,6 +602,41 @@ def _metadata_int(metadata: dict[str, Any], keys: tuple[str, ...]) -> int | None
             except ValueError:
                 continue
     return None
+
+
+def _extract_checkout_user_ref(metadata: dict[str, Any]) -> tuple[str | None, str | None]:
+    ordered_keys = ("customerUserId", "customer_user_id", "userId", "user_id")
+    for key in ordered_keys:
+        raw_value = metadata.get(key)
+        if raw_value is None:
+            continue
+        if isinstance(raw_value, str):
+            cleaned = raw_value.strip()
+            if cleaned:
+                return key, cleaned
+            continue
+        return key, str(raw_value)
+    return None, None
+
+
+def _resolve_checkout_user_link(
+    *,
+    db: Session,
+    metadata: dict[str, Any],
+) -> tuple[str | None, str | None, str | None]:
+    source_key, raw_user_ref = _extract_checkout_user_ref(metadata)
+    if raw_user_ref is None:
+        return None, None, source_key
+    try:
+        parsed_uuid = uuid.UUID(raw_user_ref)
+    except (ValueError, AttributeError):
+        return None, raw_user_ref, source_key
+
+    candidate_ids = [str(parsed_uuid), parsed_uuid.hex]
+    user = db.scalar(select(AppUser).where(AppUser.id.in_(candidate_ids)))
+    if user is None:
+        return None, raw_user_ref, source_key
+    return user.id, raw_user_ref, source_key
 
 
 def _apply_verified_status(
@@ -666,6 +703,16 @@ async def _create_checkout_attempt(
     provider_response = await provider.create_payment(provider_payload)
     provider_payload_dict = provider_payload.model_dump(by_alias=True, exclude_none=True)
     provider_response_dict = provider_response.model_dump(by_alias=True, exclude_none=True)
+    linked_user_id, external_user_ref, user_ref_source = _resolve_checkout_user_link(
+        db=db,
+        metadata=metadata,
+    )
+    if external_user_ref:
+        metadata["externalUserRef"] = external_user_ref
+    if user_ref_source:
+        metadata["userRefSource"] = user_ref_source
+    if linked_user_id:
+        metadata["linkedUserId"] = linked_user_id
 
     row = store.create_payment_attempt(
         transaction_id=transaction_id,
@@ -673,11 +720,12 @@ async def _create_checkout_attempt(
         provider="fib",
         provider_payment_id=provider_response.payment_id,
         provider_reference=provider_response.readable_code,
+        external_user_ref=external_user_ref,
         status="pending",
         amount_minor=amount_minor,
         currency_code=currency_code,
         customer_order_id=_metadata_int(metadata, ("customerOrderId", "customer_order_id")),
-        user_id=_metadata_string(metadata, ("userId", "user_id")),
+        user_id=linked_user_id,
         service_type=_metadata_string(metadata, ("serviceType", "service_type")) or "esim",
         order_item_id=_metadata_int(metadata, ("orderItemId", "order_item_id")),
         idempotency_key=_metadata_string(metadata, ("idempotencyKey", "idempotency_key")),
