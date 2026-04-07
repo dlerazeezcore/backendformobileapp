@@ -20,7 +20,7 @@ from fib_payment_api import (
     PaymentStatusResponse,
     register_fib_payment_routes,
 )
-from supabase_store import AppUser, Base, PaymentAttempt, PaymentProviderEvent
+from supabase_store import AdminUser, AppUser, Base, PaymentAttempt, PaymentProviderEvent
 
 
 class FIBPaymentAPITest(unittest.IsolatedAsyncioTestCase):
@@ -134,6 +134,28 @@ class FIBPaymentRoutesTest(unittest.TestCase):
         register_fib_payment_routes(app, _get_provider, _get_db)
         self.client = TestClient(app)
 
+        self.known_user_id = str(uuid.uuid4())
+        self.known_admin_id = str(uuid.uuid4())
+        with self.session_factory() as session:
+            session.add(
+                AppUser(
+                    id=self.known_user_id,
+                    phone="+9647700000999",
+                    name="Known User",
+                    status="active",
+                )
+            )
+            session.add(
+                AdminUser(
+                    id=self.known_admin_id,
+                    phone="+9647700000888",
+                    name="Known Admin",
+                    status="active",
+                    role="admin",
+                )
+            )
+            session.commit()
+
     def tearDown(self) -> None:
         self.engine.dispose()
         if os.path.exists(self.db_path):
@@ -147,6 +169,7 @@ class FIBPaymentRoutesTest(unittest.TestCase):
             "metadata": {
                 "transactionId": "tx-1001",
                 "serviceType": "esim",
+                "customerUserId": self.known_user_id,
             },
         }
 
@@ -165,7 +188,7 @@ class FIBPaymentRoutesTest(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0].transaction_id, "tx-1001")
 
-    def test_checkout_with_non_uuid_user_ref_succeeds_without_linking(self) -> None:
+    def test_checkout_with_non_uuid_user_ref_returns_422(self) -> None:
         payload = {
             "amount": 5000,
             "currency": "IQD",
@@ -176,18 +199,16 @@ class FIBPaymentRoutesTest(unittest.TestCase):
             },
         }
         response = self.client.post("/api/v1/payments/fib/checkout", json=payload)
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json().get("externalUserRef"), "mobile-user-abc")
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json().get("success"), False)
+        self.assertEqual(response.json().get("errorCode"), "INVALID_PAYMENT_REQUEST")
         with self.session_factory() as session:
             row = session.scalar(
                 select(PaymentAttempt).where(PaymentAttempt.transaction_id == "tx-non-uuid-user")
             )
-            self.assertIsNotNone(row)
-            assert row is not None
-            self.assertIsNone(row.user_id)
-            self.assertEqual(row.external_user_ref, "mobile-user-abc")
+            self.assertIsNone(row)
 
-    def test_checkout_with_unknown_uuid_user_ref_succeeds_without_fk_linking(self) -> None:
+    def test_checkout_with_unknown_uuid_user_ref_returns_422(self) -> None:
         unknown_user_id = str(uuid.uuid4())
         payload = {
             "amount": 5000,
@@ -199,37 +220,23 @@ class FIBPaymentRoutesTest(unittest.TestCase):
             },
         }
         response = self.client.post("/api/v1/payments/fib/checkout", json=payload)
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json().get("externalUserRef"), unknown_user_id)
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json().get("success"), False)
+        self.assertEqual(response.json().get("errorCode"), "INVALID_PAYMENT_REQUEST")
         with self.session_factory() as session:
             row = session.scalar(
                 select(PaymentAttempt).where(PaymentAttempt.transaction_id == "tx-unknown-uuid-user")
             )
-            self.assertIsNotNone(row)
-            assert row is not None
-            self.assertIsNone(row.user_id)
-            self.assertEqual(row.external_user_ref, unknown_user_id)
+            self.assertIsNone(row)
 
     def test_checkout_with_known_uuid_user_ref_links_user(self) -> None:
-        known_user_id = str(uuid.uuid4())
-        with self.session_factory() as session:
-            session.add(
-                AppUser(
-                    id=known_user_id,
-                    phone="+9647700000999",
-                    name="Known User",
-                    status="active",
-                )
-            )
-            session.commit()
-
         payload = {
             "amount": 5000,
             "currency": "IQD",
             "description": "Checkout known uuid user",
             "metadata": {
                 "transactionId": "tx-known-uuid-user",
-                "customerUserId": known_user_id,
+                "customerUserId": self.known_user_id,
                 "userId": str(uuid.uuid4()),  # should prefer customerUserId
             },
         }
@@ -241,15 +248,37 @@ class FIBPaymentRoutesTest(unittest.TestCase):
             )
             self.assertIsNotNone(row)
             assert row is not None
-            self.assertEqual(row.user_id, known_user_id)
-            self.assertEqual(row.external_user_ref, known_user_id)
+            self.assertEqual(row.user_id, self.known_user_id)
+            self.assertEqual(row.external_user_ref, self.known_user_id)
+
+    def test_checkout_with_known_admin_uuid_links_admin_user(self) -> None:
+        payload = {
+            "amount": 5000,
+            "currency": "IQD",
+            "description": "Checkout known admin uuid user",
+            "metadata": {
+                "transactionId": "tx-known-admin-uuid-user",
+                "customerUserId": self.known_admin_id,
+            },
+        }
+        response = self.client.post("/api/v1/payments/fib/checkout", json=payload)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json().get("adminUserId"), self.known_admin_id)
+        with self.session_factory() as session:
+            row = session.scalar(
+                select(PaymentAttempt).where(PaymentAttempt.transaction_id == "tx-known-admin-uuid-user")
+            )
+            self.assertIsNotNone(row)
+            assert row is not None
+            self.assertIsNone(row.user_id)
+            self.assertEqual(row.admin_user_id, self.known_admin_id)
 
     def test_get_payment_updates_status_to_paid(self) -> None:
         payload = {
             "amount": 5000,
             "currency": "IQD",
             "description": "Top-up checkout",
-            "metadata": {"transactionId": "tx-2002"},
+            "metadata": {"transactionId": "tx-2002", "customerUserId": self.known_user_id},
         }
         create_response = self.client.post("/api/v1/payments/fib/checkout", json=payload)
         self.assertEqual(create_response.status_code, 200)
@@ -285,7 +314,7 @@ class FIBPaymentRoutesTest(unittest.TestCase):
             "amount": 5000,
             "currency": "IQD",
             "description": "Top-up checkout",
-            "metadata": {"transactionId": "tx-webhook-1"},
+            "metadata": {"transactionId": "tx-webhook-1", "customerUserId": self.known_user_id},
         }
         create_response = self.client.post("/api/v1/payments/fib/checkout", json=payload)
         self.assertEqual(create_response.status_code, 200)

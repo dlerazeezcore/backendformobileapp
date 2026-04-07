@@ -895,6 +895,13 @@ Legacy compatibility routes are still mounted under `/api/v1/fib-payments/*`.
 
 `POST /api/v1/payments/fib/checkout`
 
+Logged-in subject requirement:
+
+- `metadata.customerUserId` is preferred.
+- `metadata.userId` is accepted as legacy fallback.
+- one of them must resolve to an existing `app_users.id` or `admin_users.id`.
+- if resolution fails, checkout returns `422 INVALID_PAYMENT_REQUEST` (never `500`).
+
 ```json
 {
   "amount": 5000,
@@ -905,7 +912,7 @@ Legacy compatibility routes are still mounted under `/api/v1/fib-payments/*`.
   "cancelUrl": "tulip://payment/cancel",
   "metadata": {
     "transactionId": "txn_123",
-    "userId": "optional-user-uuid",
+    "customerUserId": "required-logged-in-user-uuid",
     "serviceType": "esim",
     "orderItemId": 123
   }
@@ -922,6 +929,9 @@ Response shape:
   "transactionId": "txn_123",
   "paymentMethod": "fib",
   "provider": "fib",
+  "userId": "app-user-uuid-or-null",
+  "adminUserId": "admin-user-uuid-or-null",
+  "externalUserRef": "raw-user-reference-from-metadata",
   "status": "pending",
   "amountMinor": 5000,
   "currencyCode": "IQD",
@@ -955,15 +965,18 @@ FIB and loyalty attempts are persisted in `payment_attempts` with idempotency by
 Table highlights:
 
 - `id` UUID primary key
-- `customer_order_id`, `order_item_id`, `user_id` links for reconciliation
+- `customer_order_id`, `order_item_id`, `user_id`, `admin_user_id` links for reconciliation
+- payment ownership rule is enforced: a payment attempt must belong to either `app_users` (`user_id`) or `admin_users` (`admin_user_id`)
 - `payment_method` (`fib`, `loyalty`, future methods)
 - `transaction_id` unique
 - `provider + provider_payment_id` unique
 - `user_id + created_at` index
+- `admin_user_id` index
 - `status + created_at` index
 - `payment_method + created_at` index
 
 Provider webhook payloads are persisted in `payment_provider_events` and then mapped idempotently into `payment_attempts` state transitions.
+Webhook handler no longer creates orphan payment attempts when no existing owned attempt is found.
 
 Managed booking route can now link payment attempts:
 

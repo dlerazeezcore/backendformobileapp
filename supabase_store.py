@@ -6,6 +6,7 @@ from typing import Any
 
 from sqlalchemy import (
     BigInteger,
+    CheckConstraint,
     JSON,
     Boolean,
     DateTime,
@@ -133,6 +134,7 @@ class AdminUser(TimeMixin, Base):
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     custom_fields: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    payment_attempts: Mapped[list["PaymentAttempt"]] = relationship(back_populates="admin_user")
 
 class ProviderFieldRule(TimeMixin, Base):
     __tablename__ = "provider_field_rules"
@@ -280,8 +282,13 @@ class PaymentAttempt(TimeMixin, Base):
     __table_args__ = (
         UniqueConstraint("transaction_id", name="uq_payment_attempts_transaction_id"),
         UniqueConstraint("provider", "provider_payment_id", name="uq_payment_attempts_provider_payment_id"),
+        CheckConstraint(
+            "(user_id IS NOT NULL) OR (admin_user_id IS NOT NULL)",
+            name="ck_payment_attempts_has_owner",
+        ),
         Index("ix_payment_attempts_customer_order_id", "customer_order_id"),
         Index("ix_payment_attempts_order_item_id", "order_item_id"),
+        Index("ix_payment_attempts_admin_user_id", "admin_user_id"),
         Index("ix_payment_attempts_user_created", "user_id", "created_at"),
         Index("ix_payment_attempts_status_created", "status", "created_at"),
         Index("ix_payment_attempts_method_created", "payment_method", "created_at"),
@@ -299,6 +306,11 @@ class PaymentAttempt(TimeMixin, Base):
     user_id: Mapped[str | None] = mapped_column(
         Uuid(as_uuid=False),
         ForeignKey("app_users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    admin_user_id: Mapped[str | None] = mapped_column(
+        Uuid(as_uuid=False),
+        ForeignKey("admin_users.id", ondelete="SET NULL"),
         nullable=True,
     )
     service_type: Mapped[str] = mapped_column(String(32), default="esim", nullable=False)
@@ -321,6 +333,7 @@ class PaymentAttempt(TimeMixin, Base):
     canceled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     customer_order: Mapped[CustomerOrder | None] = relationship(back_populates="payment_attempts")
     order_item: Mapped[OrderItem | None] = relationship(back_populates="payment_attempts")
+    admin_user: Mapped[AdminUser | None] = relationship(back_populates="payment_attempts")
     provider_events: Mapped[list["PaymentProviderEvent"]] = relationship(back_populates="payment_attempt")
 
 
@@ -668,6 +681,7 @@ class SupabaseStore:
         amount_minor: int = 0,
         currency_code: str = "IQD",
         user_id: str | None = None,
+        admin_user_id: str | None = None,
         service_type: str = "esim",
         order_item_id: int | None = None,
         idempotency_key: str | None = None,
@@ -684,6 +698,7 @@ class SupabaseStore:
             customer_order_id=customer_order_id,
             order_item_id=order_item_id,
             user_id=user_id,
+            admin_user_id=admin_user_id,
             service_type=service_type,
             payment_method=payment_method.strip().lower(),
             provider=provider.strip().lower() if provider else None,
@@ -718,6 +733,8 @@ class SupabaseStore:
         provider_payment_id: str | None = None,
         provider_reference: str | None = None,
         external_user_ref: str | None = None,
+        user_id: str | None = None,
+        admin_user_id: str | None = None,
         idempotency_key: str | None = None,
         failure_reason: str | None = None,
         metadata: dict[str, Any] | None = None,
@@ -742,6 +759,10 @@ class SupabaseStore:
             row.provider_reference = provider_reference
         if external_user_ref is not None:
             row.external_user_ref = external_user_ref
+        if user_id is not None:
+            row.user_id = user_id
+        if admin_user_id is not None:
+            row.admin_user_id = admin_user_id
         if idempotency_key is not None:
             row.idempotency_key = idempotency_key
         if failure_reason is not None:

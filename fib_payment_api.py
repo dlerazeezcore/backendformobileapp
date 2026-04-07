@@ -16,7 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from supabase_store import AppUser, PaymentAttempt, SupabaseStore, parse_provider_datetime
+from supabase_store import AdminUser, AppUser, PaymentAttempt, SupabaseStore, parse_provider_datetime
 
 
 class FIBPaymentError(Exception):
@@ -552,6 +552,8 @@ def _to_checkout_response(row: PaymentAttempt) -> dict[str, Any]:
         "transactionId": row.transaction_id,
         "paymentMethod": row.payment_method,
         "provider": row.provider,
+        "userId": row.user_id,
+        "adminUserId": row.admin_user_id,
         "externalUserRef": row.external_user_ref,
         "status": row.status,
         "amountMinor": row.amount_minor,
@@ -623,20 +625,23 @@ def _resolve_checkout_user_link(
     *,
     db: Session,
     metadata: dict[str, Any],
-) -> tuple[str | None, str | None, str | None]:
+) -> tuple[str | None, str | None, str | None, str | None]:
     source_key, raw_user_ref = _extract_checkout_user_ref(metadata)
     if raw_user_ref is None:
-        return None, None, source_key
+        return None, None, None, source_key
     try:
         parsed_uuid = uuid.UUID(raw_user_ref)
     except (ValueError, AttributeError):
-        return None, raw_user_ref, source_key
+        return None, None, raw_user_ref, source_key
 
     candidate_ids = [str(parsed_uuid), parsed_uuid.hex]
     user = db.scalar(select(AppUser).where(AppUser.id.in_(candidate_ids)))
-    if user is None:
-        return None, raw_user_ref, source_key
-    return user.id, raw_user_ref, source_key
+    if user is not None:
+        return user.id, None, raw_user_ref, source_key
+    admin_user = db.scalar(select(AdminUser).where(AdminUser.id.in_(candidate_ids)))
+    if admin_user is not None:
+        return None, admin_user.id, raw_user_ref, source_key
+    return None, None, raw_user_ref, source_key
 
 
 def _apply_verified_status(
@@ -703,16 +708,22 @@ async def _create_checkout_attempt(
     provider_response = await provider.create_payment(provider_payload)
     provider_payload_dict = provider_payload.model_dump(by_alias=True, exclude_none=True)
     provider_response_dict = provider_response.model_dump(by_alias=True, exclude_none=True)
-    linked_user_id, external_user_ref, user_ref_source = _resolve_checkout_user_link(
+    linked_user_id, linked_admin_user_id, external_user_ref, user_ref_source = _resolve_checkout_user_link(
         db=db,
         metadata=metadata,
     )
+    if linked_user_id is None and linked_admin_user_id is None:
+        raise ValueError(
+            "A logged-in user is required. Provide metadata.customerUserId or metadata.userId with a valid UUID."
+        )
     if external_user_ref:
         metadata["externalUserRef"] = external_user_ref
     if user_ref_source:
         metadata["userRefSource"] = user_ref_source
     if linked_user_id:
         metadata["linkedUserId"] = linked_user_id
+    if linked_admin_user_id:
+        metadata["linkedAdminUserId"] = linked_admin_user_id
 
     row = store.create_payment_attempt(
         transaction_id=transaction_id,
@@ -726,6 +737,7 @@ async def _create_checkout_attempt(
         currency_code=currency_code,
         customer_order_id=_metadata_int(metadata, ("customerOrderId", "customer_order_id")),
         user_id=linked_user_id,
+        admin_user_id=linked_admin_user_id,
         service_type=_metadata_string(metadata, ("serviceType", "service_type")) or "esim",
         order_item_id=_metadata_int(metadata, ("orderItemId", "order_item_id")),
         idempotency_key=_metadata_string(metadata, ("idempotencyKey", "idempotency_key")),
@@ -966,26 +978,27 @@ def register_fib_payment_routes(
             row = store.get_payment_attempt_by_transaction_id(webhook_transaction_id, for_update=True)
 
         if row is None:
-            metadata = {
-                "source": "fib_webhook",
-                "providerPaymentId": provider_payment_id,
-                "providerEventId": provider_event_id,
-            }
-            row = store.create_payment_attempt(
-                transaction_id=webhook_transaction_id or _extract_transaction_id(metadata),
-                payment_method="fib",
-                provider="fib",
-                provider_payment_id=provider_payment_id,
-                provider_reference=provider_event_id,
-                status="pending",
-                amount_minor=0,
-                currency_code="IQD",
-                metadata=metadata,
-                provider_request={},
-                provider_response={
-                    "providerStatus": provider_status,
-                    "webhookPayload": payload,
-                    "providerRefs": {"providerPaymentId": provider_payment_id},
+            store.mark_payment_provider_event_processed(
+                event,
+                processed=False,
+                processing_error=(
+                    "Payment attempt not found for webhook reference. "
+                    "Skipping orphan row creation because payments require an owned user context."
+                ),
+            )
+            db.commit()
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "success": True,
+                    "status": "accepted",
+                    "eventId": event.id,
+                    "paymentAttemptId": None,
+                    "paymentId": provider_payment_id,
+                    "transactionId": webhook_transaction_id,
+                    "normalizedStatus": normalized_status,
+                    "transitionApplied": False,
+                    "resolvedPaymentAttempt": False,
                 },
             )
         store.update_payment_attempt(
