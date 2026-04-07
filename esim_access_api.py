@@ -15,7 +15,8 @@ from fastapi import Depends, FastAPI
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
-from supabase_store import PaymentAttempt, SupabaseStore, utcnow
+from auth import get_token_claims, require_active_subject
+from supabase_store import AppUser, PaymentAttempt, SupabaseStore, utcnow
 from users import UserPayload
 
 
@@ -669,7 +670,9 @@ def _resolve_or_create_payment_for_managed_order(
         provider_response={"managedOrderResponse": provider_response_payload},
     )
     if payload.payment_status:
-        store.apply_payment_status_transition(attempt, new_status=payload.payment_status)
+        normalized_status = store._normalize_payment_status(payload.payment_status)
+        if normalized_status in {"paid", "refunded"}:
+            store.apply_payment_status_transition(attempt, new_status=normalized_status)
     elif method == "loyalty":
         store.apply_payment_status_transition(attempt, new_status="paid")
     return attempt
@@ -699,43 +702,60 @@ def register_esim_access_routes(
         payload: ManagedOrderPayload,
         provider: ESimAccessAPI = Depends(get_provider),
         db: Session = Depends(get_db),
+        claims: dict[str, Any] = Depends(get_token_claims),
     ) -> dict[str, Any]:
+        auth_user = require_active_subject(db, claims=claims, subject_type="user")
+        assert isinstance(auth_user, AppUser)
         provider_response = await provider.order_profiles(payload.provider_request)
         store = SupabaseStore(db)
         provider_request_payload = payload.provider_request.model_dump(by_alias=True, exclude_none=True)
         provider_response_payload = provider_response.model_dump(by_alias=True, exclude_none=True)
-        customer_order, order_item = store.save_managed_order(
-            user_data=payload.user.model_dump(by_alias=False),
-            platform_code=payload.platform_code,
-            platform_name=payload.platform_name,
-            order_request=provider_request_payload,
-            provider_response=provider_response_payload,
-            currency_code=payload.currency_code,
-            provider_currency_code=payload.provider_currency_code,
-            exchange_rate=payload.exchange_rate,
-            sale_price_minor=payload.sale_price_minor,
-            provider_price_minor=payload.provider_price_minor,
-            country_code=payload.country_code,
-            country_name=payload.country_name,
-            package_code=payload.package_code,
-            package_slug=payload.package_slug,
-            package_name=payload.package_name,
-            custom_fields=payload.custom_fields,
-        )
-        payment_attempt = _resolve_or_create_payment_for_managed_order(
-            store=store,
-            payload=payload,
-            customer_order_id=customer_order.id,
-            order_item_id=order_item.id,
-            user_id=customer_order.user_id,
-            service_type=order_item.service_type,
-            amount_minor=order_item.sale_price_minor or customer_order.total_minor or 0,
-            currency_code=customer_order.currency_code or "IQD",
-            provider_request_payload=provider_request_payload,
-            provider_response_payload=provider_response_payload,
-        )
-        if payment_attempt is not None:
+        try:
+            customer_order, order_item = store.save_managed_order(
+                user_data={
+                    "phone": auth_user.phone,
+                    "name": auth_user.name,
+                    "email": auth_user.email,
+                    "status": auth_user.status,
+                    "is_loyalty": auth_user.is_loyalty,
+                    "notes": auth_user.notes,
+                },
+                platform_code=payload.platform_code,
+                platform_name=payload.platform_name,
+                order_request=provider_request_payload,
+                provider_response=provider_response_payload,
+                currency_code=payload.currency_code,
+                provider_currency_code=payload.provider_currency_code,
+                exchange_rate=payload.exchange_rate,
+                sale_price_minor=payload.sale_price_minor,
+                provider_price_minor=payload.provider_price_minor,
+                country_code=payload.country_code,
+                country_name=payload.country_name,
+                package_code=payload.package_code,
+                package_slug=payload.package_slug,
+                package_name=payload.package_name,
+                custom_fields=payload.custom_fields,
+                auto_commit=False,
+            )
+            payment_attempt = _resolve_or_create_payment_for_managed_order(
+                store=store,
+                payload=payload,
+                customer_order_id=customer_order.id,
+                order_item_id=order_item.id,
+                user_id=customer_order.user_id,
+                service_type=order_item.service_type,
+                amount_minor=order_item.sale_price_minor or customer_order.total_minor or 0,
+                currency_code=customer_order.currency_code or "IQD",
+                provider_request_payload=provider_request_payload,
+                provider_response_payload=provider_response_payload,
+            )
             db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        db.refresh(customer_order)
+        db.refresh(order_item)
+        if payment_attempt is not None:
             db.refresh(payment_attempt)
         return {
             "provider": provider_response_payload,

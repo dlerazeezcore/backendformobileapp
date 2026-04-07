@@ -142,8 +142,38 @@ def require_bearer_token(authorization: str | None = Header(default=None)) -> st
     return token
 
 
+def get_token_claims(token: str = Depends(require_bearer_token)) -> dict[str, Any]:
+    settings = get_settings()
+    return decode_access_token(token, secret_key=settings.auth_secret_key)
+
+
 def _is_row_active(row: AppUser | AdminUser) -> bool:
     return row.status == "active" and row.deleted_at is None and row.blocked_at is None
+
+
+def require_active_subject(
+    db: Session,
+    *,
+    claims: dict[str, Any],
+    subject_type: str | None = None,
+) -> AppUser | AdminUser:
+    token_subject_type = claims.get("typ")
+    subject_id = claims.get("sub")
+    if subject_type is not None and token_subject_type != subject_type:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+    if not isinstance(subject_id, str) or not isinstance(token_subject_type, str):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid auth subject")
+    if token_subject_type == "admin":
+        row = db.scalar(select(AdminUser).where(AdminUser.id == subject_id))
+    elif token_subject_type == "user":
+        row = db.scalar(select(AppUser).where(AppUser.id == subject_id))
+    else:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid auth token type")
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Auth subject not found")
+    if not _is_row_active(row):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Inactive account")
+    return row
 
 
 def _lookup_admin_by_phone(db: Session, phone: str) -> AdminUser | None:

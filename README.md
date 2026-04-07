@@ -524,6 +524,9 @@ These are the routes frontend should mainly use.
 
 ### Admin routes
 
+- All `/api/v1/admin/*` routes now require an authenticated **admin** bearer token.
+- Admin list routes support pagination query params: `limit` (1-500, default 100) and `offset` (default 0).
+
 - `POST /api/v1/admin/users`
 - `GET /api/v1/admin/users`
 - `POST /api/v1/admin/admin-users`
@@ -690,6 +693,12 @@ Important:
 ### Create a managed eSIM booking
 
 `POST /api/v1/esim-access/orders/managed`
+
+Authorization requirement:
+
+- requires a valid bearer token for an active `app_users` account
+- backend now binds booking ownership to the token subject (not client-supplied `user` identifiers)
+- the `user` object in payload is kept for backward compatibility but token identity is authoritative
 
 Example payload:
 
@@ -897,10 +906,10 @@ Legacy compatibility routes are still mounted under `/api/v1/fib-payments/*`.
 
 Logged-in subject requirement:
 
-- `metadata.customerUserId` is preferred.
-- `metadata.userId` is accepted as legacy fallback.
-- one of them must resolve to an existing `app_users.id` or `admin_users.id`.
-- if resolution fails, checkout returns `422 INVALID_PAYMENT_REQUEST` (never `500`).
+- requires `Authorization: Bearer <accessToken>` for an active user/admin account.
+- checkout ownership is taken from the token subject.
+- `metadata.customerUserId` / `metadata.userId` are treated as optional external references only.
+- user-reference parsing no longer triggers internal server errors.
 
 ```json
 {
@@ -912,7 +921,7 @@ Logged-in subject requirement:
   "cancelUrl": "tulip://payment/cancel",
   "metadata": {
     "transactionId": "txn_123",
-    "customerUserId": "required-logged-in-user-uuid",
+    "customerUserId": "optional-external-reference",
     "serviceType": "esim",
     "orderItemId": 123
   }
@@ -978,6 +987,7 @@ Table highlights:
 - `payment_method` (`fib`, `loyalty`, future methods)
 - `transaction_id` unique
 - `provider + provider_payment_id` unique
+- status is constrained to successful values only (`paid`, `refunded`)
 - `user_id + created_at` index
 - `admin_user_id` index
 - `status + created_at` index

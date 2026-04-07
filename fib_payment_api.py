@@ -12,10 +12,10 @@ import httpx
 from fastapi import Depends, FastAPI, Header, Request, status
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from auth import get_token_claims, require_active_subject
 from supabase_store import AdminUser, AppUser, PaymentAttempt, SupabaseStore, parse_provider_datetime
 
 
@@ -611,6 +611,27 @@ def _build_checkout_context_payload(
     }
 
 
+def _actor_matches_payment_context(
+    *,
+    owner_user_id: str | None,
+    owner_admin_user_id: str | None,
+    row: PaymentAttempt | None = None,
+    context: dict[str, Any] | None = None,
+) -> bool:
+    if row is not None:
+        subject_user_id = row.user_id
+        subject_admin_id = row.admin_user_id
+    else:
+        context_payload = context or {}
+        subject_user_id = _metadata_string(context_payload, ("userId", "user_id"))
+        subject_admin_id = _metadata_string(context_payload, ("adminUserId", "admin_user_id"))
+    if owner_user_id:
+        return owner_user_id == subject_user_id
+    if owner_admin_user_id:
+        return owner_admin_user_id == subject_admin_id
+    return False
+
+
 def _upsert_successful_attempt_from_provider_status(
     *,
     db: Session,
@@ -620,7 +641,7 @@ def _upsert_successful_attempt_from_provider_status(
     transaction_id_hint: str | None = None,
 ) -> PaymentAttempt | None:
     row = store.get_payment_attempt_by_provider_payment_id(
-        provider=None,
+        provider="fib",
         provider_payment_id=provider_payment_id,
         for_update=True,
     )
@@ -632,12 +653,7 @@ def _upsert_successful_attempt_from_provider_status(
     raw_status = provider_status.status if isinstance(provider_status, PaymentStatusResponse) else _extract_provider_status(payload)
     normalized_status = _normalize_payment_status(raw_status)
     if row is not None:
-        _apply_verified_status(
-            store=store,
-            row=row,
-            provider_payment_id=provider_payment_id,
-            provider_status=provider_status,
-        )
+        _apply_verified_status(store=store, row=row, provider_payment_id=provider_payment_id, provider_status=provider_status)
         return row
 
     if normalized_status not in PERSISTED_PAYMENT_STATUSES:
@@ -845,29 +861,6 @@ def _extract_checkout_user_ref(metadata: dict[str, Any]) -> tuple[str | None, st
     return None, None
 
 
-def _resolve_checkout_user_link(
-    *,
-    db: Session,
-    metadata: dict[str, Any],
-) -> tuple[str | None, str | None, str | None, str | None]:
-    source_key, raw_user_ref = _extract_checkout_user_ref(metadata)
-    if raw_user_ref is None:
-        return None, None, None, source_key
-    try:
-        parsed_uuid = uuid.UUID(raw_user_ref)
-    except (ValueError, AttributeError):
-        return None, None, raw_user_ref, source_key
-
-    candidate_ids = [str(parsed_uuid), parsed_uuid.hex]
-    user = db.scalar(select(AppUser).where(AppUser.id.in_(candidate_ids)))
-    if user is not None:
-        return user.id, None, raw_user_ref, source_key
-    admin_user = db.scalar(select(AdminUser).where(AdminUser.id.in_(candidate_ids)))
-    if admin_user is not None:
-        return None, admin_user.id, raw_user_ref, source_key
-    return None, None, raw_user_ref, source_key
-
-
 def _apply_verified_status(
     *,
     store: SupabaseStore,
@@ -897,11 +890,12 @@ def _apply_verified_status(
             },
         },
     )
-    store.apply_payment_status_transition(
-        row,
-        new_status=normalized_status,
-        paid_at=paid_at,
-    )
+    if normalized_status in PERSISTED_PAYMENT_STATUSES:
+        store.apply_payment_status_transition(
+            row,
+            new_status=normalized_status,
+            paid_at=paid_at,
+        )
 
 
 async def _create_checkout_attempt(
@@ -909,6 +903,9 @@ async def _create_checkout_attempt(
     payload: FIBCheckoutRequest,
     provider: FIBPaymentAPI,
     db: Session,
+    owner_user_id: str | None,
+    owner_admin_user_id: str | None,
+    owner_external_user_ref: str | None,
 ) -> PaymentAttempt:
     store = SupabaseStore(db)
     metadata = dict(payload.metadata or {})
@@ -919,6 +916,12 @@ async def _create_checkout_attempt(
         return existing_success
     existing_context = _resolve_checkout_context(store=store, transaction_id=transaction_id)
     if existing_context is not None:
+        if not _actor_matches_payment_context(
+            owner_user_id=owner_user_id,
+            owner_admin_user_id=owner_admin_user_id,
+            context=existing_context,
+        ):
+            raise ValueError("Transaction ID already exists for another account.")
         return PaymentAttempt(
             id=_metadata_string(existing_context, ("paymentAttemptId", "payment_attempt_id")) or str(uuid.uuid4()),
             transaction_id=transaction_id,
@@ -965,14 +968,10 @@ async def _create_checkout_attempt(
     provider_response = await provider.create_payment(provider_payload)
     provider_payload_dict = provider_payload.model_dump(by_alias=True, exclude_none=True)
     provider_response_dict = provider_response.model_dump(by_alias=True, exclude_none=True)
-    linked_user_id, linked_admin_user_id, external_user_ref, user_ref_source = _resolve_checkout_user_link(
-        db=db,
-        metadata=metadata,
-    )
-    if linked_user_id is None and linked_admin_user_id is None:
-        raise ValueError(
-            "A logged-in user is required. Provide metadata.customerUserId or metadata.userId with a valid UUID."
-        )
+    user_ref_source, metadata_user_ref = _extract_checkout_user_ref(metadata)
+    external_user_ref = metadata_user_ref or owner_external_user_ref
+    linked_user_id = owner_user_id
+    linked_admin_user_id = owner_admin_user_id
     if external_user_ref:
         metadata["externalUserRef"] = external_user_ref
     if user_ref_source:
@@ -1053,6 +1052,16 @@ def register_fib_payment_routes(
     get_fib_provider: Callable[..., FIBPaymentAPI],
     get_db: Callable[..., Any],
 ) -> None:
+    async def _require_payment_actor(
+        claims: dict[str, Any] = Depends(get_token_claims),
+        db: Session = Depends(get_db),
+    ) -> tuple[str | None, str | None, str]:
+        row = require_active_subject(db, claims=claims)
+        if isinstance(row, AppUser):
+            return row.id, None, row.phone
+        assert isinstance(row, AdminUser)
+        return None, row.id, row.phone
+
     @app.post("/api/v1/payments/fib/checkout")
     @app.post("/api/v1/payments/fib/create")
     @app.post("/api/v1/payments/fib/intent")
@@ -1061,9 +1070,18 @@ def register_fib_payment_routes(
         payload: FIBCheckoutRequest,
         provider: FIBPaymentAPI = Depends(get_fib_provider),
         db: Session = Depends(get_db),
+        actor: tuple[str | None, str | None, str] = Depends(_require_payment_actor),
     ) -> Any:
+        owner_user_id, owner_admin_user_id, owner_phone = actor
         try:
-            row = await _create_checkout_attempt(payload=payload, provider=provider, db=db)
+            row = await _create_checkout_attempt(
+                payload=payload,
+                provider=provider,
+                db=db,
+                owner_user_id=owner_user_id,
+                owner_admin_user_id=owner_admin_user_id,
+                owner_external_user_ref=owner_phone,
+            )
             return _to_checkout_response(row)
         except ValueError as exc:
             return _error_response(
@@ -1081,12 +1099,24 @@ def register_fib_payment_routes(
         refresh: bool = False,
         provider: FIBPaymentAPI = Depends(get_fib_provider),
         db: Session = Depends(get_db),
+        actor: tuple[str | None, str | None, str] = Depends(_require_payment_actor),
     ) -> Any:
+        owner_user_id, owner_admin_user_id, _ = actor
         store = SupabaseStore(db)
         row = store.get_payment_attempt_by_any_reference(payment_id)
         if row is None and not refresh:
             checkout_context = _resolve_checkout_context(store=store, provider_payment_id=payment_id)
             if checkout_context is not None:
+                if not _actor_matches_payment_context(
+                    owner_user_id=owner_user_id,
+                    owner_admin_user_id=owner_admin_user_id,
+                    context=checkout_context,
+                ):
+                    return _error_response(
+                        status_code=403,
+                        error_code="PAYMENT_FORBIDDEN",
+                        message="You do not have access to this payment.",
+                    )
                 return _to_checkout_response_from_context(checkout_context)
         if row is None and not refresh:
             return _error_response(
@@ -1096,6 +1126,16 @@ def register_fib_payment_routes(
                 details={"paymentId": payment_id},
             )
         if row is not None and not refresh:
+            if not _actor_matches_payment_context(
+                owner_user_id=owner_user_id,
+                owner_admin_user_id=owner_admin_user_id,
+                row=row,
+            ):
+                return _error_response(
+                    status_code=403,
+                    error_code="PAYMENT_FORBIDDEN",
+                    message="You do not have access to this payment.",
+                )
             return _to_checkout_response(row)
 
         provider_payment_id = row.provider_payment_id if row is not None else payment_id
@@ -1118,9 +1158,29 @@ def register_fib_payment_routes(
             )
             db.commit()
             if resolved_row is not None:
+                if not _actor_matches_payment_context(
+                    owner_user_id=owner_user_id,
+                    owner_admin_user_id=owner_admin_user_id,
+                    row=resolved_row,
+                ):
+                    return _error_response(
+                        status_code=403,
+                        error_code="PAYMENT_FORBIDDEN",
+                        message="You do not have access to this payment.",
+                    )
                 db.refresh(resolved_row)
                 return _to_checkout_response(resolved_row)
             checkout_context = _resolve_checkout_context(store=store, provider_payment_id=provider_payment_id) or {}
+            if not _actor_matches_payment_context(
+                owner_user_id=owner_user_id,
+                owner_admin_user_id=owner_admin_user_id,
+                context=checkout_context,
+            ):
+                return _error_response(
+                    status_code=403,
+                    error_code="PAYMENT_FORBIDDEN",
+                    message="You do not have access to this payment.",
+                )
             status_payload = provider_status.model_dump(by_alias=True, exclude_none=True)
             checkout_context = {
                 **checkout_context,
@@ -1143,7 +1203,9 @@ def register_fib_payment_routes(
         payload: FIBConfirmRequest,
         provider: FIBPaymentAPI = Depends(get_fib_provider),
         db: Session = Depends(get_db),
+        actor: tuple[str | None, str | None, str] = Depends(_require_payment_actor),
     ) -> Any:
+        owner_user_id, owner_admin_user_id, _ = actor
         if not payload.payment_id and not payload.transaction_id:
             return _error_response(
                 status_code=422,
@@ -1155,13 +1217,23 @@ def register_fib_payment_routes(
         row: PaymentAttempt | None = None
         if payload.payment_id:
             row = store.get_payment_attempt_by_provider_payment_id(
-                provider=None,
+                provider="fib",
                 provider_payment_id=payload.payment_id,
             )
             if row is None:
                 row = store.get_payment_attempt_by_any_reference(payload.payment_id)
         if row is None and payload.transaction_id:
             row = store.get_payment_attempt_by_transaction_id(payload.transaction_id)
+        if row is not None and not _actor_matches_payment_context(
+            owner_user_id=owner_user_id,
+            owner_admin_user_id=owner_admin_user_id,
+            row=row,
+        ):
+            return _error_response(
+                status_code=403,
+                error_code="PAYMENT_FORBIDDEN",
+                message="You do not have access to this payment.",
+            )
 
         provider_payment_id = payload.payment_id or (row.provider_payment_id if row is not None else None)
         if provider_payment_id is None and payload.transaction_id:
@@ -1185,6 +1257,16 @@ def register_fib_payment_routes(
             )
             db.commit()
             if resolved_row is not None:
+                if not _actor_matches_payment_context(
+                    owner_user_id=owner_user_id,
+                    owner_admin_user_id=owner_admin_user_id,
+                    row=resolved_row,
+                ):
+                    return _error_response(
+                        status_code=403,
+                        error_code="PAYMENT_FORBIDDEN",
+                        message="You do not have access to this payment.",
+                    )
                 db.refresh(resolved_row)
                 return _to_checkout_response(resolved_row)
             checkout_context = _resolve_checkout_context(
@@ -1192,6 +1274,16 @@ def register_fib_payment_routes(
                 transaction_id=payload.transaction_id,
                 provider_payment_id=provider_payment_id,
             ) or {}
+            if not _actor_matches_payment_context(
+                owner_user_id=owner_user_id,
+                owner_admin_user_id=owner_admin_user_id,
+                context=checkout_context,
+            ):
+                return _error_response(
+                    status_code=403,
+                    error_code="PAYMENT_FORBIDDEN",
+                    message="You do not have access to this payment.",
+                )
             status_payload = provider_status.model_dump(by_alias=True, exclude_none=True)
             checkout_context = {
                 **checkout_context,
@@ -1290,7 +1382,7 @@ def register_fib_payment_routes(
         row: PaymentAttempt | None = None
         if provider_payment_id:
             row = store.get_payment_attempt_by_provider_payment_id(
-                provider=None,
+                provider="fib",
                 provider_payment_id=provider_payment_id,
                 for_update=True,
             )
@@ -1313,15 +1405,21 @@ def register_fib_payment_routes(
                     },
                 },
             )
-            transition_applied = store.apply_payment_status_transition(
-                row,
-                new_status=normalized_status,
-                paid_at=paid_at,
-            )
+            if normalized_status in PERSISTED_PAYMENT_STATUSES:
+                transition_applied = store.apply_payment_status_transition(
+                    row,
+                    new_status=normalized_status,
+                    paid_at=paid_at,
+                )
+                processing_error = None
+            else:
+                transition_applied = False
+                processing_error = "Ignored non-success payment status for success-only payment_attempts policy."
             store.mark_payment_provider_event_processed(
                 event,
                 processed=True,
                 payment_attempt_id=row.id,
+                processing_error=processing_error,
             )
         elif provider_payment_id:
             resolved_row = _upsert_successful_attempt_from_provider_status(
@@ -1342,7 +1440,7 @@ def register_fib_payment_routes(
             else:
                 store.mark_payment_provider_event_processed(
                     event,
-                    processed=False,
+                    processed=True,
                     processing_error=(
                         "Payment attempt not persisted because status is non-successful "
                         "or owner context could not be resolved."
@@ -1361,7 +1459,7 @@ def register_fib_payment_routes(
             db.rollback()
             if provider_payment_id:
                 row = store.get_payment_attempt_by_provider_payment_id(
-                    provider=None,
+                    provider="fib",
                     provider_payment_id=provider_payment_id,
                 )
             if row is None:

@@ -3,11 +3,11 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Callable
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from auth import hash_password
+from auth import get_token_claims, hash_password, require_active_subject
 from supabase_store import AdminUser, AppUser, SupabaseStore
 
 
@@ -44,8 +44,20 @@ class AdminUserPayload(BaseModel):
 
 
 def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
+    async def _require_admin_actor(
+        claims: dict[str, Any] = Depends(get_token_claims),
+        db: Session = Depends(get_db),
+    ) -> AdminUser:
+        row = require_active_subject(db, claims=claims, subject_type="admin")
+        assert isinstance(row, AdminUser)
+        return row
+
     @app.post("/api/v1/admin/users")
-    async def save_user(payload: UserPayload, db: Session = Depends(get_db)) -> dict[str, Any]:
+    async def save_user(
+        payload: UserPayload,
+        db: Session = Depends(get_db),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
         data = payload.model_dump(by_alias=False)
         password = data.pop("password", None)
         if password is not None:
@@ -56,11 +68,21 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return {"user": {"id": user.id, "phone": user.phone, "name": user.name, "status": user.status}}
 
     @app.get("/api/v1/admin/users")
-    async def list_users(db: Session = Depends(get_db)) -> dict[str, Any]:
-        return {"users": SupabaseStore(db).list_rows(AppUser, exclude={"password_hash"})}
+    async def list_users(
+        db: Session = Depends(get_db),
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
+        rows = SupabaseStore(db).list_rows(AppUser, exclude={"password_hash"}, limit=limit, offset=offset)
+        return {"users": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
 
     @app.post("/api/v1/admin/admin-users")
-    async def save_admin_user(payload: AdminUserPayload, db: Session = Depends(get_db)) -> dict[str, Any]:
+    async def save_admin_user(
+        payload: AdminUserPayload,
+        db: Session = Depends(get_db),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
         data = payload.model_dump(by_alias=False)
         password = data.pop("password", None)
         if password is not None:
@@ -79,5 +101,11 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         }
 
     @app.get("/api/v1/admin/admin-users")
-    async def list_admin_users(db: Session = Depends(get_db)) -> dict[str, Any]:
-        return {"adminUsers": SupabaseStore(db).list_rows(AdminUser, exclude={"password_hash"})}
+    async def list_admin_users(
+        db: Session = Depends(get_db),
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
+        rows = SupabaseStore(db).list_rows(AdminUser, exclude={"password_hash"}, limit=limit, offset=offset)
+        return {"adminUsers": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}

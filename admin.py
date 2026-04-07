@@ -3,11 +3,13 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Callable
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from auth import get_token_claims, require_active_subject
 from supabase_store import (
+    AdminUser,
     CustomerOrder,
     DiscountRule,
     ESimLifecycleEvent,
@@ -104,8 +106,20 @@ class FeaturedLocationPayload(BaseModel):
 
 
 def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
+    async def _require_admin_actor(
+        claims: dict[str, Any] = Depends(get_token_claims),
+        db: Session = Depends(get_db),
+    ) -> AdminUser:
+        row = require_active_subject(db, claims=claims, subject_type="admin")
+        assert isinstance(row, AdminUser)
+        return row
+
     @app.post("/api/v1/admin/profiles/refund")
-    async def refund_profile(payload: RefundPayload, db: Session = Depends(get_db)) -> dict[str, Any]:
+    async def refund_profile(
+        payload: RefundPayload,
+        db: Session = Depends(get_db),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
         profile = SupabaseStore(db).apply_profile_action(
             action="refund",
             identifier_key="iccid",
@@ -119,7 +133,11 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return {"database": {"profileId": profile.id if profile else None}}
 
     @app.post("/api/v1/admin/profiles/install")
-    async def install_profile(payload: ProfileStatePayload, db: Session = Depends(get_db)) -> dict[str, Any]:
+    async def install_profile(
+        payload: ProfileStatePayload,
+        db: Session = Depends(get_db),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
         profile = SupabaseStore(db).apply_profile_action(
             action="install",
             identifier_key="iccid",
@@ -132,7 +150,11 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return {"database": {"profileId": profile.id if profile else None}}
 
     @app.post("/api/v1/admin/profiles/activate")
-    async def activate_profile(payload: ProfileStatePayload, db: Session = Depends(get_db)) -> dict[str, Any]:
+    async def activate_profile(
+        payload: ProfileStatePayload,
+        db: Session = Depends(get_db),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
         profile = SupabaseStore(db).apply_profile_action(
             action="activate",
             identifier_key="iccid",
@@ -145,72 +167,158 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return {"database": {"profileId": profile.id if profile else None}}
 
     @app.post("/api/v1/admin/provider-field-rules")
-    async def save_field_rule(payload: ProviderFieldRulePayload, db: Session = Depends(get_db)) -> dict[str, Any]:
+    async def save_field_rule(
+        payload: ProviderFieldRulePayload,
+        db: Session = Depends(get_db),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
         rule = SupabaseStore(db).save_field_rule(payload.entity_type, payload.field_paths, payload.provider, payload.enabled)
         return {"rule": {"id": rule.id, "entityType": rule.entity_type, "fieldPaths": rule.field_paths}}
 
     @app.get("/api/v1/admin/provider-field-rules")
-    async def list_field_rules(db: Session = Depends(get_db)) -> dict[str, Any]:
-        return {"rules": SupabaseStore(db).list_rows(ProviderFieldRule)}
+    async def list_field_rules(
+        db: Session = Depends(get_db),
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
+        rows = SupabaseStore(db).list_rows(ProviderFieldRule, limit=limit, offset=offset)
+        return {"rules": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
 
     @app.post("/api/v1/admin/pricing-rules")
     @app.post("/api/v1/admin/prices")
-    async def save_pricing_rule(payload: PricingRulePayload, db: Session = Depends(get_db)) -> dict[str, Any]:
+    async def save_pricing_rule(
+        payload: PricingRulePayload,
+        db: Session = Depends(get_db),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
         row = SupabaseStore(db).save_pricing_rule(payload.model_dump(by_alias=False))
         return {"pricingRule": {"id": row.id}}
 
     @app.get("/api/v1/admin/pricing-rules")
     @app.get("/api/v1/admin/prices")
-    async def list_pricing_rules(db: Session = Depends(get_db)) -> dict[str, Any]:
-        return {"pricingRules": SupabaseStore(db).list_rows(PricingRule)}
+    async def list_pricing_rules(
+        db: Session = Depends(get_db),
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
+        rows = SupabaseStore(db).list_rows(PricingRule, limit=limit, offset=offset)
+        return {"pricingRules": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
 
     @app.post("/api/v1/admin/discount-rules")
-    async def save_discount_rule(payload: DiscountRulePayload, db: Session = Depends(get_db)) -> dict[str, Any]:
+    async def save_discount_rule(
+        payload: DiscountRulePayload,
+        db: Session = Depends(get_db),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
         row = SupabaseStore(db).save_discount_rule(payload.model_dump(by_alias=False))
         return {"discountRule": {"id": row.id}}
 
     @app.get("/api/v1/admin/discount-rules")
-    async def list_discount_rules(db: Session = Depends(get_db)) -> dict[str, Any]:
-        return {"discountRules": SupabaseStore(db).list_rows(DiscountRule)}
+    async def list_discount_rules(
+        db: Session = Depends(get_db),
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
+        rows = SupabaseStore(db).list_rows(DiscountRule, limit=limit, offset=offset)
+        return {"discountRules": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
 
     @app.post("/api/v1/admin/featured-locations")
-    async def save_featured_location(payload: FeaturedLocationPayload, db: Session = Depends(get_db)) -> dict[str, Any]:
+    async def save_featured_location(
+        payload: FeaturedLocationPayload,
+        db: Session = Depends(get_db),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
         row = SupabaseStore(db).save_featured_location(payload.model_dump(by_alias=False))
         return {"location": {"id": row.id}}
 
     @app.get("/api/v1/admin/featured-locations")
-    async def list_featured_locations(db: Session = Depends(get_db)) -> dict[str, Any]:
-        return {"locations": SupabaseStore(db).list_rows(FeaturedLocation)}
+    async def list_featured_locations(
+        db: Session = Depends(get_db),
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
+        rows = SupabaseStore(db).list_rows(FeaturedLocation, limit=limit, offset=offset)
+        return {"locations": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
 
     @app.post("/api/v1/admin/exchange-rates")
-    async def save_exchange_rate(payload: ExchangeRatePayload, db: Session = Depends(get_db)) -> dict[str, Any]:
+    async def save_exchange_rate(
+        payload: ExchangeRatePayload,
+        db: Session = Depends(get_db),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
         row = SupabaseStore(db).save_exchange_rate(payload.model_dump(by_alias=False))
         return {"exchangeRate": {"id": row.id}}
 
     @app.get("/api/v1/admin/exchange-rates")
-    async def list_exchange_rates(db: Session = Depends(get_db)) -> dict[str, Any]:
-        return {"exchangeRates": SupabaseStore(db).list_rows(ExchangeRate)}
+    async def list_exchange_rates(
+        db: Session = Depends(get_db),
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
+        rows = SupabaseStore(db).list_rows(ExchangeRate, limit=limit, offset=offset)
+        return {"exchangeRates": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
 
     @app.get("/api/v1/admin/orders")
-    async def list_orders(db: Session = Depends(get_db)) -> dict[str, Any]:
-        return {"orders": SupabaseStore(db).list_rows(CustomerOrder)}
+    async def list_orders(
+        db: Session = Depends(get_db),
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
+        rows = SupabaseStore(db).list_rows(CustomerOrder, limit=limit, offset=offset)
+        return {"orders": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
 
     @app.get("/api/v1/admin/order-items")
-    async def list_order_items(db: Session = Depends(get_db)) -> dict[str, Any]:
-        return {"orderItems": SupabaseStore(db).list_rows(OrderItem)}
+    async def list_order_items(
+        db: Session = Depends(get_db),
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
+        rows = SupabaseStore(db).list_rows(OrderItem, limit=limit, offset=offset)
+        return {"orderItems": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
 
     @app.get("/api/v1/admin/profiles")
-    async def list_profiles(db: Session = Depends(get_db)) -> dict[str, Any]:
-        return {"profiles": SupabaseStore(db).list_rows(ESimProfile)}
+    async def list_profiles(
+        db: Session = Depends(get_db),
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
+        rows = SupabaseStore(db).list_rows(ESimProfile, limit=limit, offset=offset)
+        return {"profiles": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
 
     @app.get("/api/v1/admin/lifecycle-events")
-    async def list_lifecycle_events(db: Session = Depends(get_db)) -> dict[str, Any]:
-        return {"events": SupabaseStore(db).list_rows(ESimLifecycleEvent)}
+    async def list_lifecycle_events(
+        db: Session = Depends(get_db),
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
+        rows = SupabaseStore(db).list_rows(ESimLifecycleEvent, limit=limit, offset=offset)
+        return {"events": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
 
     @app.get("/api/v1/admin/payment-attempts")
-    async def list_payment_attempts(db: Session = Depends(get_db)) -> dict[str, Any]:
-        return {"paymentAttempts": SupabaseStore(db).list_rows(PaymentAttempt)}
+    async def list_payment_attempts(
+        db: Session = Depends(get_db),
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
+        rows = SupabaseStore(db).list_rows(PaymentAttempt, limit=limit, offset=offset)
+        return {"paymentAttempts": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
 
     @app.get("/api/v1/admin/payment-provider-events")
-    async def list_payment_provider_events(db: Session = Depends(get_db)) -> dict[str, Any]:
-        return {"paymentProviderEvents": SupabaseStore(db).list_rows(PaymentProviderEvent)}
+    async def list_payment_provider_events(
+        db: Session = Depends(get_db),
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
+        rows = SupabaseStore(db).list_rows(PaymentProviderEvent, limit=limit, offset=offset)
+        return {"paymentProviderEvents": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}

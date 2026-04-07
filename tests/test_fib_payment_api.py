@@ -13,6 +13,8 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from auth import create_access_token
+from config import get_settings
 from fib_payment_api import (
     CreatePaymentRequest,
     CreatePaymentResponse,
@@ -108,6 +110,8 @@ class _FakeProvider:
 
 class FIBPaymentRoutesTest(unittest.TestCase):
     def setUp(self) -> None:
+        os.environ["AUTH_SECRET_KEY"] = "test-auth-secret"
+        get_settings.cache_clear()
         temp_db = tempfile.NamedTemporaryFile(prefix="fib_test_", suffix=".db", delete=False)
         temp_db.close()
         self.db_path = temp_db.name
@@ -155,11 +159,32 @@ class FIBPaymentRoutesTest(unittest.TestCase):
                 )
             )
             session.commit()
+        self.user_headers = {
+            "Authorization": "Bearer "
+            + create_access_token(
+                subject_id=self.known_user_id,
+                phone="+9647700000999",
+                subject_type="user",
+                secret_key="test-auth-secret",
+                ttl_seconds=3600,
+            )
+        }
+        self.admin_headers = {
+            "Authorization": "Bearer "
+            + create_access_token(
+                subject_id=self.known_admin_id,
+                phone="+9647700000888",
+                subject_type="admin",
+                secret_key="test-auth-secret",
+                ttl_seconds=3600,
+            )
+        }
 
     def tearDown(self) -> None:
         self.engine.dispose()
         if os.path.exists(self.db_path):
             os.remove(self.db_path)
+        get_settings.cache_clear()
 
     def test_checkout_aliases_are_idempotent_by_transaction_id(self) -> None:
         payload = {
@@ -173,12 +198,12 @@ class FIBPaymentRoutesTest(unittest.TestCase):
             },
         }
 
-        first = self.client.post("/api/v1/payments/fib/checkout", json=payload)
+        first = self.client.post("/api/v1/payments/fib/checkout", json=payload, headers=self.user_headers)
         self.assertEqual(first.status_code, 200)
         self.assertEqual(first.json().get("paymentId"), "fib-pay-1")
         self.assertEqual(first.json().get("status"), "pending")
 
-        second = self.client.post("/api/v1/payments/fib/create", json=payload)
+        second = self.client.post("/api/v1/payments/fib/create", json=payload, headers=self.user_headers)
         self.assertEqual(second.status_code, 200)
         self.assertEqual(second.json().get("paymentId"), "fib-pay-1")
         self.assertEqual(second.json().get("transactionId"), "tx-1001")
@@ -190,7 +215,7 @@ class FIBPaymentRoutesTest(unittest.TestCase):
             # 2 markers are stored: checkout_tx and checkout_payment
             self.assertEqual(len(events), 2)
 
-    def test_checkout_with_non_uuid_user_ref_returns_422(self) -> None:
+    def test_checkout_with_non_uuid_user_ref_uses_authenticated_user(self) -> None:
         payload = {
             "amount": 5000,
             "currency": "IQD",
@@ -200,17 +225,17 @@ class FIBPaymentRoutesTest(unittest.TestCase):
                 "customerUserId": "mobile-user-abc",
             },
         }
-        response = self.client.post("/api/v1/payments/fib/checkout", json=payload)
-        self.assertEqual(response.status_code, 422)
-        self.assertEqual(response.json().get("success"), False)
-        self.assertEqual(response.json().get("errorCode"), "INVALID_PAYMENT_REQUEST")
+        response = self.client.post("/api/v1/payments/fib/checkout", json=payload, headers=self.user_headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json().get("userId"), self.known_user_id)
+        self.assertEqual(response.json().get("status"), "pending")
         with self.session_factory() as session:
             row = session.scalar(
                 select(PaymentAttempt).where(PaymentAttempt.transaction_id == "tx-non-uuid-user")
             )
             self.assertIsNone(row)
 
-    def test_checkout_with_unknown_uuid_user_ref_returns_422(self) -> None:
+    def test_checkout_with_unknown_uuid_user_ref_uses_authenticated_user(self) -> None:
         unknown_user_id = str(uuid.uuid4())
         payload = {
             "amount": 5000,
@@ -221,10 +246,9 @@ class FIBPaymentRoutesTest(unittest.TestCase):
                 "customerUserId": unknown_user_id,
             },
         }
-        response = self.client.post("/api/v1/payments/fib/checkout", json=payload)
-        self.assertEqual(response.status_code, 422)
-        self.assertEqual(response.json().get("success"), False)
-        self.assertEqual(response.json().get("errorCode"), "INVALID_PAYMENT_REQUEST")
+        response = self.client.post("/api/v1/payments/fib/checkout", json=payload, headers=self.user_headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json().get("userId"), self.known_user_id)
         with self.session_factory() as session:
             row = session.scalar(
                 select(PaymentAttempt).where(PaymentAttempt.transaction_id == "tx-unknown-uuid-user")
@@ -242,7 +266,7 @@ class FIBPaymentRoutesTest(unittest.TestCase):
                 "userId": str(uuid.uuid4()),  # should prefer customerUserId
             },
         }
-        response = self.client.post("/api/v1/payments/fib/checkout", json=payload)
+        response = self.client.post("/api/v1/payments/fib/checkout", json=payload, headers=self.user_headers)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json().get("userId"), self.known_user_id)
         with self.session_factory() as session:
@@ -265,7 +289,7 @@ class FIBPaymentRoutesTest(unittest.TestCase):
                 "customerUserId": self.known_admin_id,
             },
         }
-        response = self.client.post("/api/v1/payments/fib/checkout", json=payload)
+        response = self.client.post("/api/v1/payments/fib/checkout", json=payload, headers=self.admin_headers)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json().get("adminUserId"), self.known_admin_id)
         with self.session_factory() as session:
@@ -285,10 +309,10 @@ class FIBPaymentRoutesTest(unittest.TestCase):
             "description": "Top-up checkout",
             "metadata": {"transactionId": "tx-2002", "customerUserId": self.known_user_id},
         }
-        create_response = self.client.post("/api/v1/payments/fib/checkout", json=payload)
+        create_response = self.client.post("/api/v1/payments/fib/checkout", json=payload, headers=self.user_headers)
         self.assertEqual(create_response.status_code, 200)
 
-        status_response = self.client.get("/api/v1/payments/fib/fib-pay-1?refresh=true")
+        status_response = self.client.get("/api/v1/payments/fib/fib-pay-1?refresh=true", headers=self.user_headers)
         self.assertEqual(status_response.status_code, 200)
         self.assertEqual(status_response.json().get("status"), "paid")
         self.assertTrue(status_response.json().get("paidAt"))
@@ -300,7 +324,7 @@ class FIBPaymentRoutesTest(unittest.TestCase):
             self.assertEqual(row.user_id, self.known_user_id)
 
     def test_invalid_payment_id_returns_json_404(self) -> None:
-        response = self.client.get("/api/v1/payments/fib/does-not-exist")
+        response = self.client.get("/api/v1/payments/fib/does-not-exist", headers=self.user_headers)
         self.assertEqual(response.status_code, 404)
         self.assertEqual(response.json().get("success"), False)
         self.assertEqual(response.json().get("errorCode"), "FIB_PAYMENT_NOT_FOUND")
@@ -327,7 +351,7 @@ class FIBPaymentRoutesTest(unittest.TestCase):
             "description": "Top-up checkout",
             "metadata": {"transactionId": "tx-webhook-1", "customerUserId": self.known_user_id},
         }
-        create_response = self.client.post("/api/v1/payments/fib/checkout", json=payload)
+        create_response = self.client.post("/api/v1/payments/fib/checkout", json=payload, headers=self.user_headers)
         self.assertEqual(create_response.status_code, 200)
 
         first = self.client.post(

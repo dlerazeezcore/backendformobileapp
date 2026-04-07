@@ -8,7 +8,9 @@ from sqlalchemy import (
     BigInteger,
     CheckConstraint,
     JSON,
+    and_,
     Boolean,
+    case,
     DateTime,
     Float,
     ForeignKey,
@@ -19,6 +21,7 @@ from sqlalchemy import (
     UniqueConstraint,
     Uuid,
     create_engine,
+    or_,
     select,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
@@ -958,20 +961,17 @@ class SupabaseStore:
         if base_currency == quote_currency:
             return None
         now = at_time or utcnow()
-        rows = self.session.scalars(
+        return self.session.scalar(
             select(ExchangeRate).where(
                 ExchangeRate.base_currency == base_currency,
                 ExchangeRate.quote_currency == quote_currency,
                 ExchangeRate.active.is_(True),
+                ExchangeRate.effective_at <= now,
+                or_(ExchangeRate.expires_at.is_(None), ExchangeRate.expires_at > now),
             )
-        ).all()
-        eligible = [
-            row
-            for row in rows
-            if row.effective_at <= now and (row.expires_at is None or row.expires_at > now)
-        ]
-        eligible.sort(key=lambda row: (row.effective_at, row.id), reverse=True)
-        return eligible[0] if eligible else None
+            .order_by(ExchangeRate.effective_at.desc(), ExchangeRate.id.desc())
+            .limit(1)
+        )
 
     def _rule_specificity(
         self,
@@ -1001,40 +1001,35 @@ class SupabaseStore:
         at_time: datetime | None = None,
     ) -> PricingRule | None:
         now = at_time or utcnow()
-        rows = self.session.scalars(
+        scope_filters = [PricingRule.rule_scope == "global"]
+        if package_code:
+            scope_filters.append(and_(PricingRule.rule_scope == "package", PricingRule.package_code == package_code))
+        if country_code:
+            scope_filters.append(and_(PricingRule.rule_scope == "country", PricingRule.country_code == country_code))
+        if provider_code:
+            scope_filters.append(and_(PricingRule.rule_scope == "provider", PricingRule.provider_code == provider_code))
+        specificity = case(
+            (PricingRule.rule_scope == "package", 4),
+            (PricingRule.rule_scope == "country", 3),
+            (PricingRule.rule_scope == "provider", 2),
+            else_=1,
+        )
+        return self.session.scalar(
             select(PricingRule).where(
                 PricingRule.service_type == service_type,
                 PricingRule.active.is_(True),
+                or_(PricingRule.starts_at.is_(None), PricingRule.starts_at <= now),
+                or_(PricingRule.ends_at.is_(None), PricingRule.ends_at > now),
+                or_(*scope_filters),
             )
-        ).all()
-        eligible: list[PricingRule] = []
-        for row in rows:
-            if row.starts_at and row.starts_at > now:
-                continue
-            if row.ends_at and row.ends_at <= now:
-                continue
-            if row.rule_scope == "package" and row.package_code != package_code:
-                continue
-            if row.rule_scope == "country" and row.country_code != country_code:
-                continue
-            if row.rule_scope == "provider" and row.provider_code != provider_code:
-                continue
-            eligible.append(row)
-        eligible.sort(
-            key=lambda row: (
-                self._rule_specificity(
-                    rule_scope=row.rule_scope,
-                    package_code=row.package_code,
-                    country_code=row.country_code,
-                    provider_code=row.provider_code,
-                ),
-                row.priority,
-                row.created_at,
-                row.id,
-            ),
-            reverse=True,
+            .order_by(
+                specificity.desc(),
+                PricingRule.priority.desc(),
+                PricingRule.created_at.desc(),
+                PricingRule.id.desc(),
+            )
+            .limit(1)
         )
-        return eligible[0] if eligible else None
 
     def get_best_discount_rule(
         self,
@@ -1046,40 +1041,35 @@ class SupabaseStore:
         at_time: datetime | None = None,
     ) -> DiscountRule | None:
         now = at_time or utcnow()
-        rows = self.session.scalars(
+        scope_filters = [DiscountRule.rule_scope == "global"]
+        if package_code:
+            scope_filters.append(and_(DiscountRule.rule_scope == "package", DiscountRule.package_code == package_code))
+        if country_code:
+            scope_filters.append(and_(DiscountRule.rule_scope == "country", DiscountRule.country_code == country_code))
+        if provider_code:
+            scope_filters.append(and_(DiscountRule.rule_scope == "provider", DiscountRule.provider_code == provider_code))
+        specificity = case(
+            (DiscountRule.rule_scope == "package", 4),
+            (DiscountRule.rule_scope == "country", 3),
+            (DiscountRule.rule_scope == "provider", 2),
+            else_=1,
+        )
+        return self.session.scalar(
             select(DiscountRule).where(
                 DiscountRule.service_type == service_type,
                 DiscountRule.active.is_(True),
+                or_(DiscountRule.starts_at.is_(None), DiscountRule.starts_at <= now),
+                or_(DiscountRule.ends_at.is_(None), DiscountRule.ends_at > now),
+                or_(*scope_filters),
             )
-        ).all()
-        eligible: list[DiscountRule] = []
-        for row in rows:
-            if row.starts_at and row.starts_at > now:
-                continue
-            if row.ends_at and row.ends_at <= now:
-                continue
-            if row.rule_scope == "package" and row.package_code != package_code:
-                continue
-            if row.rule_scope == "country" and row.country_code != country_code:
-                continue
-            if row.rule_scope == "provider" and row.provider_code != provider_code:
-                continue
-            eligible.append(row)
-        eligible.sort(
-            key=lambda row: (
-                self._rule_specificity(
-                    rule_scope=row.rule_scope,
-                    package_code=row.package_code,
-                    country_code=row.country_code,
-                    provider_code=row.provider_code,
-                ),
-                row.priority,
-                row.created_at,
-                row.id,
-            ),
-            reverse=True,
+            .order_by(
+                specificity.desc(),
+                DiscountRule.priority.desc(),
+                DiscountRule.created_at.desc(),
+                DiscountRule.id.desc(),
+            )
+            .limit(1)
         )
-        return eligible[0] if eligible else None
 
     def _calculate_adjustment_minor(
         self,
@@ -1111,6 +1101,7 @@ class SupabaseStore:
         package_slug: str | None = None,
         package_name: str | None = None,
         custom_fields: dict[str, Any] | None = None,
+        auto_commit: bool = True,
     ) -> tuple[CustomerOrder, OrderItem]:
         user = self.ensure_user(**user_data)
         _ = platform_name
@@ -1261,9 +1252,12 @@ class SupabaseStore:
         )
         self.save_payload("order_request", "request", order_request, customer_order=order, order_item=item)
         self.save_payload("order_response", "response", provider_response, customer_order=order, order_item=item)
-        self.session.commit()
-        self.session.refresh(order)
-        self.session.refresh(item)
+        if auto_commit:
+            self.session.commit()
+            self.session.refresh(order)
+            self.session.refresh(item)
+        else:
+            self.session.flush()
         return order, item
 
     def sync_profiles(
@@ -1746,8 +1740,22 @@ class SupabaseStore:
         self.session.refresh(row)
         return row
 
-    def list_rows(self, model: Any, *, exclude: set[str] | None = None) -> list[dict[str, Any]]:
-        rows = self.session.scalars(select(model).order_by(model.created_at.desc())).all()
+    def list_rows(
+        self,
+        model: Any,
+        *,
+        exclude: set[str] | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        effective_limit = max(1, min(limit, 500))
+        effective_offset = max(0, offset)
+        rows = self.session.scalars(
+            select(model)
+            .order_by(model.created_at.desc())
+            .offset(effective_offset)
+            .limit(effective_limit)
+        ).all()
         exclude = exclude or set()
         result = []
         for row in rows:
