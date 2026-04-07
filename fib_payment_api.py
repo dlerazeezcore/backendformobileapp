@@ -485,6 +485,230 @@ def _payment_link_from_create(result: CreatePaymentResponse) -> str | None:
     return result.personal_app_link or result.business_app_link or result.corporate_app_link
 
 
+PERSISTED_PAYMENT_STATUSES = {"paid", "refunded"}
+
+
+def _checkout_event_id_by_transaction(transaction_id: str) -> str:
+    return f"checkout_tx:{transaction_id}"
+
+
+def _checkout_event_id_by_payment(payment_id: str) -> str:
+    return f"checkout_payment:{payment_id}"
+
+
+def _as_int(value: Any, *, default: int = 0) -> int:
+    if isinstance(value, bool) or value is None:
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return default
+        try:
+            return int(cleaned)
+        except ValueError:
+            try:
+                return int(float(cleaned))
+            except ValueError:
+                return default
+    return default
+
+
+def _to_checkout_response_from_context(context: dict[str, Any]) -> dict[str, Any]:
+    provider_payment_id = _metadata_string(context, ("providerPaymentId", "paymentId"))
+    transaction_id = _metadata_string(context, ("transactionId", "transaction_id")) or f"fib-{uuid.uuid4().hex}"
+    raw_provider_status = _metadata_string(context, ("providerStatus",)) or "UNPAID"
+    normalized_status = _metadata_string(context, ("normalizedStatus",)) or _normalize_payment_status(raw_provider_status)
+    response = {
+        "paymentAttemptId": _metadata_string(context, ("paymentAttemptId", "payment_attempt_id")),
+        "paymentId": provider_payment_id or transaction_id,
+        "providerPaymentId": provider_payment_id,
+        "transactionId": transaction_id,
+        "paymentMethod": "fib",
+        "provider": "fib",
+        "userId": _metadata_string(context, ("userId", "user_id")),
+        "adminUserId": _metadata_string(context, ("adminUserId", "admin_user_id")),
+        "externalUserRef": _metadata_string(context, ("externalUserRef", "external_user_ref")),
+        "status": normalized_status,
+        "amountMinor": _as_int(context.get("amountMinor"), default=0),
+        "currencyCode": (_metadata_string(context, ("currencyCode", "currency_code")) or "IQD").upper(),
+        "customerOrderId": _metadata_int(context, ("customerOrderId", "customer_order_id")),
+        "orderItemId": _metadata_int(context, ("orderItemId", "order_item_id")),
+        "paymentLink": _metadata_string(context, ("paymentLink",)),
+        "qrCodeUrl": _metadata_string(context, ("qrCodeUrl",)),
+        "expiresAt": _metadata_string(context, ("expiresAt",)),
+        "providerInfo": {
+            "name": "fib",
+            "paymentId": provider_payment_id,
+            "reference": _metadata_string(context, ("providerReference", "readableCode")),
+            "status": raw_provider_status,
+            "refs": {
+                "providerPaymentId": provider_payment_id,
+                "readableCode": _metadata_string(context, ("providerReference", "readableCode")),
+            },
+        },
+    }
+    return _clean_none(response)
+
+
+def _resolve_checkout_context(
+    *,
+    store: SupabaseStore,
+    transaction_id: str | None = None,
+    provider_payment_id: str | None = None,
+) -> dict[str, Any] | None:
+    event = None
+    if transaction_id:
+        event = store.get_payment_provider_event(provider="fib", provider_event_id=_checkout_event_id_by_transaction(transaction_id))
+    if event is None and provider_payment_id:
+        event = store.get_payment_provider_event(provider="fib", provider_event_id=_checkout_event_id_by_payment(provider_payment_id))
+    if event is None:
+        return None
+    payload = event.raw_payload if isinstance(event.raw_payload, dict) else None
+    return payload
+
+
+def _build_checkout_context_payload(
+    *,
+    transaction_id: str,
+    metadata: dict[str, Any],
+    provider_payload_dict: dict[str, Any],
+    provider_response: CreatePaymentResponse,
+    provider_response_dict: dict[str, Any],
+    amount_minor: int,
+    currency_code: str,
+    user_id: str | None,
+    admin_user_id: str | None,
+    external_user_ref: str | None,
+) -> dict[str, Any]:
+    return {
+        "paymentAttemptId": str(uuid.uuid5(uuid.NAMESPACE_URL, f"fib:{transaction_id}")),
+        "transactionId": transaction_id,
+        "providerPaymentId": provider_response.payment_id,
+        "providerReference": provider_response.readable_code,
+        "paymentMethod": "fib",
+        "provider": "fib",
+        "providerStatus": "UNPAID",
+        "normalizedStatus": "pending",
+        "amountMinor": amount_minor,
+        "currencyCode": currency_code,
+        "paymentLink": _payment_link_from_create(provider_response),
+        "qrCodeUrl": provider_response.qr_code,
+        "expiresAt": provider_response.valid_until,
+        "serviceType": _metadata_string(metadata, ("serviceType", "service_type")) or "esim",
+        "customerOrderId": _metadata_int(metadata, ("customerOrderId", "customer_order_id")),
+        "orderItemId": _metadata_int(metadata, ("orderItemId", "order_item_id")),
+        "idempotencyKey": _metadata_string(metadata, ("idempotencyKey", "idempotency_key")),
+        "userId": user_id,
+        "adminUserId": admin_user_id,
+        "externalUserRef": external_user_ref,
+        "metadata": metadata,
+        "providerRequest": provider_payload_dict,
+        "providerCreatePayload": provider_response_dict,
+    }
+
+
+def _upsert_successful_attempt_from_provider_status(
+    *,
+    db: Session,
+    store: SupabaseStore,
+    provider_payment_id: str,
+    provider_status: PaymentStatusResponse | dict[str, Any],
+    transaction_id_hint: str | None = None,
+) -> PaymentAttempt | None:
+    row = store.get_payment_attempt_by_provider_payment_id(
+        provider=None,
+        provider_payment_id=provider_payment_id,
+        for_update=True,
+    )
+    payload = (
+        provider_status.model_dump(by_alias=True, exclude_none=True)
+        if isinstance(provider_status, PaymentStatusResponse)
+        else provider_status
+    )
+    raw_status = provider_status.status if isinstance(provider_status, PaymentStatusResponse) else _extract_provider_status(payload)
+    normalized_status = _normalize_payment_status(raw_status)
+    if row is not None:
+        _apply_verified_status(
+            store=store,
+            row=row,
+            provider_payment_id=provider_payment_id,
+            provider_status=provider_status,
+        )
+        return row
+
+    if normalized_status not in PERSISTED_PAYMENT_STATUSES:
+        return None
+
+    context_payload = _resolve_checkout_context(
+        store=store,
+        transaction_id=transaction_id_hint,
+        provider_payment_id=provider_payment_id,
+    ) or {}
+    user_id = _metadata_string(context_payload, ("userId", "user_id"))
+    admin_user_id = _metadata_string(context_payload, ("adminUserId", "admin_user_id"))
+    if not user_id and not admin_user_id:
+        return None
+
+    transaction_id = (
+        _metadata_string(context_payload, ("transactionId", "transaction_id"))
+        or transaction_id_hint
+        or f"fib-{provider_payment_id}"
+    )
+    amount_minor = _as_int(context_payload.get("amountMinor"), default=0)
+    currency_code = (_metadata_string(context_payload, ("currencyCode", "currency_code")) or "IQD").upper()
+    if isinstance(provider_status, PaymentStatusResponse) and provider_status.amount:
+        amount_minor = _as_int(provider_status.amount.amount, default=amount_minor)
+        currency_code = (provider_status.amount.currency or currency_code).upper()
+    elif isinstance(payload, dict):
+        amount_payload = payload.get("amount")
+        if isinstance(amount_payload, dict):
+            amount_minor = _as_int(amount_payload.get("amount"), default=amount_minor)
+            currency_code = (str(amount_payload.get("currency") or currency_code)).upper()
+
+    row = store.create_payment_attempt(
+        transaction_id=transaction_id,
+        payment_method="fib",
+        provider="fib",
+        provider_payment_id=provider_payment_id,
+        provider_reference=_extract_provider_event_id(payload) or _metadata_string(context_payload, ("providerReference",)),
+        external_user_ref=_metadata_string(context_payload, ("externalUserRef", "external_user_ref")),
+        status=normalized_status,
+        amount_minor=amount_minor,
+        currency_code=currency_code,
+        customer_order_id=_metadata_int(context_payload, ("customerOrderId", "customer_order_id")),
+        user_id=user_id,
+        admin_user_id=admin_user_id,
+        service_type=_metadata_string(context_payload, ("serviceType", "service_type")) or "esim",
+        order_item_id=_metadata_int(context_payload, ("orderItemId", "order_item_id")),
+        idempotency_key=_metadata_string(context_payload, ("idempotencyKey", "idempotency_key")),
+        metadata=dict(context_payload.get("metadata") or {}),
+        provider_request=dict(context_payload.get("providerRequest") or {}),
+        provider_response={
+            "providerStatus": raw_status,
+            "providerStatusPayload": payload,
+            "paymentLink": _metadata_string(context_payload, ("paymentLink",)),
+            "qrCodeUrl": _metadata_string(context_payload, ("qrCodeUrl",)),
+            "expiresAt": _metadata_string(context_payload, ("expiresAt",)),
+            "providerRefs": {
+                "providerPaymentId": provider_payment_id,
+                "providerReference": _extract_provider_event_id(payload),
+            },
+        },
+    )
+    _apply_verified_status(
+        store=store,
+        row=row,
+        provider_payment_id=provider_payment_id,
+        provider_status=provider_status,
+    )
+    db.flush()
+    return row
+
+
 def _error_response(
     *,
     status_code: int,
@@ -690,9 +914,42 @@ async def _create_checkout_attempt(
     metadata = dict(payload.metadata or {})
     transaction_id = _extract_transaction_id(metadata)
 
-    existing = store.get_payment_attempt_by_transaction_id(transaction_id)
-    if existing is not None:
-        return existing
+    existing_success = store.get_payment_attempt_by_transaction_id(transaction_id)
+    if existing_success is not None:
+        return existing_success
+    existing_context = _resolve_checkout_context(store=store, transaction_id=transaction_id)
+    if existing_context is not None:
+        return PaymentAttempt(
+            id=_metadata_string(existing_context, ("paymentAttemptId", "payment_attempt_id")) or str(uuid.uuid4()),
+            transaction_id=transaction_id,
+            payment_method="fib",
+            provider="fib",
+            status=_metadata_string(existing_context, ("normalizedStatus", "status")) or "pending",
+            amount_minor=_as_int(existing_context.get("amountMinor"), default=0),
+            currency_code=(_metadata_string(existing_context, ("currencyCode",)) or "IQD").upper(),
+            provider_payment_id=_metadata_string(existing_context, ("providerPaymentId", "paymentId")),
+            provider_reference=_metadata_string(existing_context, ("providerReference",)),
+            external_user_ref=_metadata_string(existing_context, ("externalUserRef", "external_user_ref")),
+            user_id=_metadata_string(existing_context, ("userId", "user_id")),
+            admin_user_id=_metadata_string(existing_context, ("adminUserId", "admin_user_id")),
+            service_type=_metadata_string(existing_context, ("serviceType", "service_type")) or "esim",
+            customer_order_id=_metadata_int(existing_context, ("customerOrderId", "customer_order_id")),
+            order_item_id=_metadata_int(existing_context, ("orderItemId", "order_item_id")),
+            idempotency_key=_metadata_string(existing_context, ("idempotencyKey", "idempotency_key")),
+            metadata_payload=dict(existing_context.get("metadata") or {}),
+            provider_request=dict(existing_context.get("providerRequest") or {}),
+            provider_response={
+                "providerStatus": _metadata_string(existing_context, ("providerStatus",)) or "UNPAID",
+                "providerCreatePayload": existing_context.get("providerCreatePayload"),
+                "paymentLink": _metadata_string(existing_context, ("paymentLink",)),
+                "qrCodeUrl": _metadata_string(existing_context, ("qrCodeUrl",)),
+                "expiresAt": _metadata_string(existing_context, ("expiresAt",)),
+                "providerRefs": {
+                    "providerPaymentId": _metadata_string(existing_context, ("providerPaymentId", "paymentId")),
+                    "readableCode": _metadata_string(existing_context, ("providerReference",)),
+                },
+            },
+        )
 
     amount_minor = _coerce_amount_minor(payload.amount)
     currency_code = payload.currency.strip().upper() if payload.currency else "IQD"
@@ -725,23 +982,57 @@ async def _create_checkout_attempt(
     if linked_admin_user_id:
         metadata["linkedAdminUserId"] = linked_admin_user_id
 
-    row = store.create_payment_attempt(
+    checkout_context = _build_checkout_context_payload(
+        transaction_id=transaction_id,
+        metadata=metadata,
+        provider_payload_dict=provider_payload_dict,
+        provider_response=provider_response,
+        provider_response_dict=provider_response_dict,
+        amount_minor=amount_minor,
+        currency_code=currency_code,
+        user_id=linked_user_id,
+        admin_user_id=linked_admin_user_id,
+        external_user_ref=external_user_ref,
+    )
+    marker_tx = _checkout_event_id_by_transaction(transaction_id)
+    marker_payment = _checkout_event_id_by_payment(provider_response.payment_id)
+    if store.get_payment_provider_event(provider="fib", provider_event_id=marker_tx) is None:
+        store.create_payment_provider_event(
+            provider="fib",
+            event_type="fib.checkout_created",
+            provider_event_id=marker_tx,
+            signature_valid=None,
+            raw_payload=checkout_context,
+            processed=True,
+        )
+    if store.get_payment_provider_event(provider="fib", provider_event_id=marker_payment) is None:
+        store.create_payment_provider_event(
+            provider="fib",
+            event_type="fib.checkout_created",
+            provider_event_id=marker_payment,
+            signature_valid=None,
+            raw_payload=checkout_context,
+            processed=True,
+        )
+    db.commit()
+    return PaymentAttempt(
+        id=checkout_context["paymentAttemptId"],
         transaction_id=transaction_id,
         payment_method="fib",
         provider="fib",
-        provider_payment_id=provider_response.payment_id,
-        provider_reference=provider_response.readable_code,
-        external_user_ref=external_user_ref,
         status="pending",
         amount_minor=amount_minor,
         currency_code=currency_code,
-        customer_order_id=_metadata_int(metadata, ("customerOrderId", "customer_order_id")),
+        provider_payment_id=provider_response.payment_id,
+        provider_reference=provider_response.readable_code,
+        external_user_ref=external_user_ref,
         user_id=linked_user_id,
         admin_user_id=linked_admin_user_id,
         service_type=_metadata_string(metadata, ("serviceType", "service_type")) or "esim",
+        customer_order_id=_metadata_int(metadata, ("customerOrderId", "customer_order_id")),
         order_item_id=_metadata_int(metadata, ("orderItemId", "order_item_id")),
         idempotency_key=_metadata_string(metadata, ("idempotencyKey", "idempotency_key")),
-        metadata=metadata,
+        metadata_payload=metadata,
         provider_request=provider_payload_dict,
         provider_response={
             "providerStatus": "UNPAID",
@@ -755,22 +1046,6 @@ async def _create_checkout_attempt(
             },
         },
     )
-    try:
-        db.commit()
-    except IntegrityError:
-        db.rollback()
-        duplicate = store.get_payment_attempt_by_transaction_id(transaction_id)
-        if duplicate is not None:
-            return duplicate
-        duplicate = store.get_payment_attempt_by_provider_payment_id(
-            provider=None,
-            provider_payment_id=provider_response.payment_id,
-        )
-        if duplicate is not None:
-            return duplicate
-        raise
-    db.refresh(row)
-    return row
 
 
 def register_fib_payment_routes(
@@ -809,30 +1084,57 @@ def register_fib_payment_routes(
     ) -> Any:
         store = SupabaseStore(db)
         row = store.get_payment_attempt_by_any_reference(payment_id)
-        if row is None:
+        if row is None and not refresh:
+            checkout_context = _resolve_checkout_context(store=store, provider_payment_id=payment_id)
+            if checkout_context is not None:
+                return _to_checkout_response_from_context(checkout_context)
+        if row is None and not refresh:
             return _error_response(
                 status_code=404,
                 error_code="FIB_PAYMENT_NOT_FOUND",
                 message="Payment was not found.",
                 details={"paymentId": payment_id},
             )
-        if not refresh:
+        if row is not None and not refresh:
             return _to_checkout_response(row)
 
-        provider_payment_id = row.provider_payment_id or payment_id
+        provider_payment_id = row.provider_payment_id if row is not None else payment_id
         if not provider_payment_id:
-            return _to_checkout_response(row)
+            if row is not None:
+                return _to_checkout_response(row)
+            return _error_response(
+                status_code=422,
+                error_code="MISSING_PROVIDER_PAYMENT_ID",
+                message="Unable to verify payment without provider payment reference.",
+            )
         try:
             provider_status = await provider.get_payment_status(provider_payment_id)
-            _apply_verified_status(
+            resolved_row = _upsert_successful_attempt_from_provider_status(
+                db=db,
                 store=store,
-                row=row,
                 provider_payment_id=provider_payment_id,
                 provider_status=provider_status,
+                transaction_id_hint=row.transaction_id if row is not None else None,
             )
             db.commit()
-            db.refresh(row)
-            return _to_checkout_response(row)
+            if resolved_row is not None:
+                db.refresh(resolved_row)
+                return _to_checkout_response(resolved_row)
+            checkout_context = _resolve_checkout_context(store=store, provider_payment_id=provider_payment_id) or {}
+            status_payload = provider_status.model_dump(by_alias=True, exclude_none=True)
+            checkout_context = {
+                **checkout_context,
+                "providerPaymentId": provider_payment_id,
+                "paymentId": provider_payment_id,
+                "providerStatus": provider_status.status,
+                "normalizedStatus": _normalize_payment_status(provider_status.status),
+                "amountMinor": _as_int(provider_status.amount.amount if provider_status.amount else None, default=0),
+                "currencyCode": (provider_status.amount.currency if provider_status.amount else "IQD"),
+                "providerStatusPayload": status_payload,
+                "paidAt": provider_status.paid_at,
+                "expiresAt": provider_status.valid_until,
+            }
+            return _to_checkout_response_from_context(checkout_context)
         except Exception as exc:
             return _map_fib_exception(exc)
 
@@ -860,14 +1162,11 @@ def register_fib_payment_routes(
                 row = store.get_payment_attempt_by_any_reference(payload.payment_id)
         if row is None and payload.transaction_id:
             row = store.get_payment_attempt_by_transaction_id(payload.transaction_id)
-        if row is None:
-            return _error_response(
-                status_code=404,
-                error_code="FIB_PAYMENT_NOT_FOUND",
-                message="Payment was not found.",
-            )
 
-        provider_payment_id = payload.payment_id or row.provider_payment_id
+        provider_payment_id = payload.payment_id or (row.provider_payment_id if row is not None else None)
+        if provider_payment_id is None and payload.transaction_id:
+            checkout_context = _resolve_checkout_context(store=store, transaction_id=payload.transaction_id)
+            provider_payment_id = _metadata_string(checkout_context or {}, ("providerPaymentId", "paymentId"))
         if not provider_payment_id:
             return _error_response(
                 status_code=422,
@@ -877,15 +1176,36 @@ def register_fib_payment_routes(
 
         try:
             provider_status = await provider.get_payment_status(provider_payment_id)
-            _apply_verified_status(
+            resolved_row = _upsert_successful_attempt_from_provider_status(
+                db=db,
                 store=store,
-                row=row,
                 provider_payment_id=provider_payment_id,
                 provider_status=provider_status,
+                transaction_id_hint=payload.transaction_id or (row.transaction_id if row is not None else None),
             )
             db.commit()
-            db.refresh(row)
-            return _to_checkout_response(row)
+            if resolved_row is not None:
+                db.refresh(resolved_row)
+                return _to_checkout_response(resolved_row)
+            checkout_context = _resolve_checkout_context(
+                store=store,
+                transaction_id=payload.transaction_id,
+                provider_payment_id=provider_payment_id,
+            ) or {}
+            status_payload = provider_status.model_dump(by_alias=True, exclude_none=True)
+            checkout_context = {
+                **checkout_context,
+                "providerPaymentId": provider_payment_id,
+                "paymentId": provider_payment_id,
+                "providerStatus": provider_status.status,
+                "normalizedStatus": _normalize_payment_status(provider_status.status),
+                "amountMinor": _as_int(provider_status.amount.amount if provider_status.amount else None, default=0),
+                "currencyCode": (provider_status.amount.currency if provider_status.amount else "IQD"),
+                "providerStatusPayload": status_payload,
+                "paidAt": provider_status.paid_at,
+                "expiresAt": provider_status.valid_until,
+            }
+            return _to_checkout_response_from_context(checkout_context)
         except Exception as exc:
             return _map_fib_exception(exc)
 
@@ -977,54 +1297,63 @@ def register_fib_payment_routes(
         if row is None and webhook_transaction_id:
             row = store.get_payment_attempt_by_transaction_id(webhook_transaction_id, for_update=True)
 
-        if row is None:
+        transition_applied = False
+        if row is not None and provider_payment_id:
+            store.update_payment_attempt(
+                row,
+                provider="fib",
+                provider_payment_id=provider_payment_id,
+                provider_reference=provider_event_id,
+                provider_response={
+                    "providerStatus": provider_status,
+                    "webhookPayload": payload,
+                    "providerRefs": {
+                        "providerPaymentId": provider_payment_id,
+                        "providerEventId": provider_event_id,
+                    },
+                },
+            )
+            transition_applied = store.apply_payment_status_transition(
+                row,
+                new_status=normalized_status,
+                paid_at=paid_at,
+            )
+            store.mark_payment_provider_event_processed(
+                event,
+                processed=True,
+                payment_attempt_id=row.id,
+            )
+        elif provider_payment_id:
+            resolved_row = _upsert_successful_attempt_from_provider_status(
+                db=db,
+                store=store,
+                provider_payment_id=provider_payment_id,
+                provider_status=payload,
+                transaction_id_hint=webhook_transaction_id,
+            )
+            if resolved_row is not None:
+                row = resolved_row
+                transition_applied = True
+                store.mark_payment_provider_event_processed(
+                    event,
+                    processed=True,
+                    payment_attempt_id=resolved_row.id,
+                )
+            else:
+                store.mark_payment_provider_event_processed(
+                    event,
+                    processed=False,
+                    processing_error=(
+                        "Payment attempt not persisted because status is non-successful "
+                        "or owner context could not be resolved."
+                    ),
+                )
+        else:
             store.mark_payment_provider_event_processed(
                 event,
                 processed=False,
-                processing_error=(
-                    "Payment attempt not found for webhook reference. "
-                    "Skipping orphan row creation because payments require an owned user context."
-                ),
+                processing_error="Webhook payload is missing provider payment identifier.",
             )
-            db.commit()
-            return JSONResponse(
-                status_code=202,
-                content={
-                    "success": True,
-                    "status": "accepted",
-                    "eventId": event.id,
-                    "paymentAttemptId": None,
-                    "paymentId": provider_payment_id,
-                    "transactionId": webhook_transaction_id,
-                    "normalizedStatus": normalized_status,
-                    "transitionApplied": False,
-                    "resolvedPaymentAttempt": False,
-                },
-            )
-        store.update_payment_attempt(
-            row,
-            provider="fib",
-            provider_payment_id=provider_payment_id,
-            provider_reference=provider_event_id,
-            provider_response={
-                "providerStatus": provider_status,
-                "webhookPayload": payload,
-                "providerRefs": {
-                    "providerPaymentId": provider_payment_id,
-                    "providerEventId": provider_event_id,
-                },
-            },
-        )
-        transition_applied = store.apply_payment_status_transition(
-            row,
-            new_status=normalized_status,
-            paid_at=paid_at,
-        )
-        store.mark_payment_provider_event_processed(
-            event,
-            processed=True,
-            payment_attempt_id=row.id,
-        )
 
         try:
             db.commit()

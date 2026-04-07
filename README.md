@@ -960,7 +960,15 @@ Backend normalizes provider status into:
 
 ### Idempotency and persistence
 
-FIB and loyalty attempts are persisted in `payment_attempts` with idempotency by `transaction_id`.
+For FIB:
+
+- all attempts/events are tracked in `payment_provider_events` (checkout markers + webhook/provider status payloads).
+- only successful payments are persisted in `payment_attempts` (for clean business reporting/reconciliation).
+- non-successful states (`pending`, `failed`, `canceled`, `expired`) remain in `payment_provider_events` and are not inserted into `payment_attempts`.
+
+For loyalty:
+
+- successful managed loyalty purchases are persisted directly in `payment_attempts`.
 
 Table highlights:
 

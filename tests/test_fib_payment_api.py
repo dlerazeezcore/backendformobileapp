@@ -185,8 +185,10 @@ class FIBPaymentRoutesTest(unittest.TestCase):
 
         with self.session_factory() as session:
             rows = session.scalars(select(PaymentAttempt)).all()
-            self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0].transaction_id, "tx-1001")
+            self.assertEqual(len(rows), 0)
+            events = session.scalars(select(PaymentProviderEvent)).all()
+            # 2 markers are stored: checkout_tx and checkout_payment
+            self.assertEqual(len(events), 2)
 
     def test_checkout_with_non_uuid_user_ref_returns_422(self) -> None:
         payload = {
@@ -242,14 +244,16 @@ class FIBPaymentRoutesTest(unittest.TestCase):
         }
         response = self.client.post("/api/v1/payments/fib/checkout", json=payload)
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json().get("userId"), self.known_user_id)
         with self.session_factory() as session:
             row = session.scalar(
                 select(PaymentAttempt).where(PaymentAttempt.transaction_id == "tx-known-uuid-user")
             )
-            self.assertIsNotNone(row)
-            assert row is not None
-            self.assertEqual(row.user_id, self.known_user_id)
-            self.assertEqual(row.external_user_ref, self.known_user_id)
+            self.assertIsNone(row)
+            events = session.scalars(select(PaymentProviderEvent)).all()
+            self.assertGreaterEqual(len(events), 2)
+            payload = events[0].raw_payload
+            self.assertEqual(payload.get("userId"), self.known_user_id)
 
     def test_checkout_with_known_admin_uuid_links_admin_user(self) -> None:
         payload = {
@@ -268,10 +272,11 @@ class FIBPaymentRoutesTest(unittest.TestCase):
             row = session.scalar(
                 select(PaymentAttempt).where(PaymentAttempt.transaction_id == "tx-known-admin-uuid-user")
             )
-            self.assertIsNotNone(row)
-            assert row is not None
-            self.assertIsNone(row.user_id)
-            self.assertEqual(row.admin_user_id, self.known_admin_id)
+            self.assertIsNone(row)
+            events = session.scalars(select(PaymentProviderEvent)).all()
+            self.assertGreaterEqual(len(events), 2)
+            payload = events[0].raw_payload
+            self.assertEqual(payload.get("adminUserId"), self.known_admin_id)
 
     def test_get_payment_updates_status_to_paid(self) -> None:
         payload = {
@@ -287,6 +292,12 @@ class FIBPaymentRoutesTest(unittest.TestCase):
         self.assertEqual(status_response.status_code, 200)
         self.assertEqual(status_response.json().get("status"), "paid")
         self.assertTrue(status_response.json().get("paidAt"))
+        with self.session_factory() as session:
+            row = session.scalar(select(PaymentAttempt).where(PaymentAttempt.transaction_id == "tx-2002"))
+            self.assertIsNotNone(row)
+            assert row is not None
+            self.assertEqual(row.status, "paid")
+            self.assertEqual(row.user_id, self.known_user_id)
 
     def test_invalid_payment_id_returns_json_404(self) -> None:
         response = self.client.get("/api/v1/payments/fib/does-not-exist")
@@ -337,7 +348,11 @@ class FIBPaymentRoutesTest(unittest.TestCase):
 
         with self.session_factory() as session:
             events = session.scalars(select(PaymentProviderEvent)).all()
-            self.assertEqual(len(events), 1)
+            # 2 checkout marker events + 1 webhook event
+            self.assertEqual(len(events), 3)
+            paid_attempts = session.scalars(select(PaymentAttempt)).all()
+            self.assertEqual(len(paid_attempts), 1)
+            self.assertEqual(paid_attempts[0].status, "paid")
 
 
 if __name__ == "__main__":
