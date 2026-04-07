@@ -2,7 +2,7 @@
 
 `backendformobileapp` is the shared B2C backend for the mobile app.
 
-Right now the first implemented service is `eSIM`, but the backend is being shaped as a long-term commerce core so we can later add:
+Right now the first implemented commerce service is `eSIM`, and payment gateway integration is available with `FIB`, while the backend is being shaped as a long-term commerce core so we can later add:
 
 - flights
 - hotels
@@ -31,6 +31,7 @@ These must stay separate long term.
 - Alembic for schema migrations
 - FastAPI as the HTTP backend
 - eSIM Access as the current provider integration
+- FIB payment gateway integration for payment create/status/cancel/refund
 
 Not in scope yet:
 
@@ -38,7 +39,6 @@ Not in scope yet:
 - reseller accounts
 - full RBAC middleware and per-route authorization enforcement
 - flights, hotels, transfers implementation
-- payment gateway integration
 
 ## Deployment Policy (Koyeb Is Source Of Truth)
 
@@ -76,6 +76,7 @@ Main runtime files:
 - [users.py](/Users/laveencompany/Desktop/backendformobileapp/users.py): B2C user and admin-user payloads and API routes
 - [auth.py](/Users/laveencompany/Desktop/backendformobileapp/auth.py): login endpoints, password hashing helpers, and bearer-token helpers
 - [esim_access_api.py](/Users/laveencompany/Desktop/backendformobileapp/esim_access_api.py): all eSIM Access code, including provider client, request/response models, and eSIM routes
+- [fib_payment_api.py](/Users/laveencompany/Desktop/backendformobileapp/fib_payment_api.py): FIB payment client, models, webhook receiver route, and payment routes
 - [supabase_store.py](/Users/laveencompany/Desktop/backendformobileapp/supabase_store.py): SQLAlchemy models, persistence logic, pricing engine, sync logic
 
 Database migration files:
@@ -98,6 +99,7 @@ Current root-level split:
 - `users.py`: B2C app-user account logic and admin-user CRUD routes
 - `admin.py`: admin operational, pricing, and reporting routes
 - `esim_access_api.py`: all provider-facing and managed eSIM logic
+- `fib_payment_api.py`: FIB provider-facing payment and callback logic
 - `config.py`, `dependencies.py`: shared application plumbing
 
 For now, keep these files in the project root and do not create subfolders unless the code volume clearly justifies it.
@@ -112,8 +114,10 @@ The backend is split into 4 layers:
    - auth routes in `auth.py`
    - admin routes in `admin.py`
    - eSIM routes in `esim_access_api.py`
+   - FIB payment routes in `fib_payment_api.py`
 2. Provider layer
    - eSIM Access integration in `esim_access_api.py`
+   - FIB payment integration in `fib_payment_api.py`
 3. Data layer
    - database models and business persistence in `supabase_store.py`
 4. Shared app plumbing
@@ -126,6 +130,7 @@ The backend is split into 4 layers:
 - load settings
 - initialize database access
 - initialize the eSIM provider client
+- initialize the FIB payment provider client (if env vars are configured)
 - register route groups
 - define the health route
 - define global exception handlers
@@ -339,6 +344,14 @@ Create a local `.env` file with:
 ```env
 ESIM_ACCESS_ACCESS_CODE=your_access_code
 ESIM_ACCESS_SECRET_KEY=your_secret_key
+FIB_PAYMENT_CLIENT_ID=your_fib_client_id
+FIB_PAYMENT_CLIENT_SECRET=your_fib_client_secret
+FIB_PAYMENT_BASE_URL=https://fib.prod.fib.iq
+FIB_PAYMENT_TIMEOUT_SECONDS=30
+FIB_PAYMENT_RATE_LIMIT_PER_SECOND=8
+FIB_PAYMENT_STATUS_CALLBACK_URL=https://YOUR-KOYEB-DOMAIN/api/v1/fib-payments/webhooks/events
+FIB_PAYMENT_REDIRECT_URI=tulip://payment/result
+FIB_PAYMENT_WEBHOOK_SECRET=replace_with_optional_shared_secret
 DATABASE_URL=postgresql://USER:PASSWORD@HOST:PORT/DATABASE
 AUTH_SECRET_KEY=replace_with_a_long_random_secret
 AUTH_TOKEN_TTL_SECONDS=86400
@@ -348,6 +361,8 @@ Notes:
 
 - `DATABASE_URL` may be plain `postgresql://...`; the backend normalizes it to SQLAlchemy `psycopg`
 - for Supabase, prefer the pooler connection string when the direct host is not reachable
+- set `FIB_PAYMENT_BASE_URL=https://fib.prod.fib.iq` for live mode and `https://fib.stage.fib.iq` for testing
+- if `FIB_PAYMENT_CLIENT_ID` and `FIB_PAYMENT_CLIENT_SECRET` are missing, FIB routes return `503` (integration disabled)
 - never put real secrets in this README
 
 Example Supabase pooler shape:
@@ -458,6 +473,16 @@ This keeps the backend simple now without blocking a more professional auth desi
 
 - `GET /health`
 
+### FIB payment routes
+
+These are the backend routes for FIB payment lifecycle.
+
+- `POST /api/v1/fib-payments/payments`
+- `GET /api/v1/fib-payments/payments/{payment_id}/status`
+- `POST /api/v1/fib-payments/payments/{payment_id}/cancel`
+- `POST /api/v1/fib-payments/payments/{payment_id}/refund`
+- `POST /api/v1/fib-payments/webhooks/events`
+
 ### Direct eSIM Access passthrough-style routes
 
 These are useful for raw provider communication and debugging.
@@ -543,8 +568,10 @@ Recommended frontend usage:
 3. app submits managed order request
 4. backend calls eSIM Access
 5. backend saves user, customer order, order item, pricing snapshot, and lifecycle event
-6. backend later syncs profile state and usage
-7. admin UI reads orders, order items, profiles, and lifecycle history from admin routes
+6. app creates FIB payment through backend FIB route
+7. backend receives FIB callback and app polls payment status when needed
+8. backend later syncs profile state and usage
+9. admin UI reads orders, order items, profiles, and lifecycle history from admin routes
 
 ### Create or update an app user
 
@@ -814,6 +841,100 @@ Receive webhook events from provider:
 
 - `POST /api/v1/esim-access/webhooks/events`
 - `POST /api/v1/esim-access/webhook/events` (alias)
+
+## FIB Payment Integration
+
+This backend includes a dedicated FIB integration module:
+
+- [fib_payment_api.py](/Users/laveencompany/Desktop/backendformobileapp/fib_payment_api.py)
+
+The backend uses FIB OAuth2 `client_credentials` internally and caches bearer tokens automatically. Frontend clients do not need to call FIB auth directly.
+
+### FIB provider environments
+
+- stage: `https://fib.stage.fib.iq`
+- production: `https://fib.prod.fib.iq`
+
+Set the target through `FIB_PAYMENT_BASE_URL`.
+
+### Backend FIB routes
+
+Create payment:
+
+- `POST /api/v1/fib-payments/payments`
+
+Check payment status:
+
+- `GET /api/v1/fib-payments/payments/{payment_id}/status`
+
+Cancel payment:
+
+- `POST /api/v1/fib-payments/payments/{payment_id}/cancel` (returns `204`)
+
+Refund payment:
+
+- `POST /api/v1/fib-payments/payments/{payment_id}/refund` (returns `202`)
+
+Receive payment status callbacks from FIB:
+
+- `POST /api/v1/fib-payments/webhooks/events` (returns `202`)
+
+### Create payment request shape
+
+`POST /api/v1/fib-payments/payments`
+
+```json
+{
+  "monetaryValue": {
+    "amount": "1300",
+    "currency": "IQD"
+  },
+  "statusCallbackUrl": "https://YOUR-KOYEB-DOMAIN/api/v1/fib-payments/webhooks/events",
+  "description": "Payment description",
+  "redirectUri": "tulip://payment/result",
+  "expiresIn": "PT8H6M12.345S",
+  "category": "ECOMMERCE",
+  "refundableFor": "PT48H"
+}
+```
+
+Important behavior:
+
+- `statusCallbackUrl` and `redirectUri` are optional in request payload
+- if missing, backend will auto-fill them from env vars:
+  - `FIB_PAYMENT_STATUS_CALLBACK_URL`
+  - `FIB_PAYMENT_REDIRECT_URI`
+
+### Payment status values
+
+From FIB docs and response samples:
+
+- `UNPAID`
+- `PAID`
+- `DECLINED`
+- `REFUND_REQUESTED`
+- `REFUNDED`
+
+Possible `decliningReason` values include:
+
+- `SERVER_FAILURE`
+- `PAYMENT_EXPIRATION`
+- `PAYMENT_CANCELLATION`
+
+### FIB callback/webhook expectations
+
+FIB callback payload includes:
+
+- `id` (payment id)
+- `status` (status object equivalent to payment status response)
+
+Backend callback endpoint returns `202 Accepted` on success.
+
+If `FIB_PAYMENT_WEBHOOK_SECRET` is set, backend expects header:
+
+- `X-FIB-WEBHOOK-SECRET: <secret>`
+
+If this header is missing or invalid while secret is configured, backend returns `401`.
 
 ### Mark install and activation states
 
