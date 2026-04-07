@@ -471,17 +471,22 @@ These are useful for raw provider communication and debugging.
 - `POST /api/v1/esim-access/profiles/revoke`
 - `POST /api/v1/esim-access/balance/query`
 - `POST /api/v1/esim-access/topups`
+- `POST /api/v1/esim-access/topup` (alias of `topups`)
 - `POST /api/v1/esim-access/webhooks/configure`
+- `POST /api/v1/esim-access/webhook/save` (alias of `webhooks/configure`)
 - `POST /api/v1/esim-access/sms/send`
 - `POST /api/v1/esim-access/usage/query`
 - `POST /api/v1/esim-access/locations/query`
 - `POST /api/v1/esim-access/webhooks/events`
+- `POST /api/v1/esim-access/webhook/events` (alias of `webhooks/events`)
 
 ### Main managed backend routes
 
 These are the routes frontend should mainly use.
 
 - `POST /api/v1/esim-access/orders/managed`
+- `POST /api/v1/esim-access/topups/managed`
+- `POST /api/v1/esim-access/topup/managed` (alias of `topups/managed`)
 - `POST /api/v1/esim-access/profiles/sync`
 - `POST /api/v1/esim-access/usage/sync`
 - `POST /api/v1/esim-access/profiles/cancel/managed`
@@ -741,6 +746,35 @@ This updates:
 - `remaining_data_mb`
 - `total_data_mb`
 - `last_provider_sync_at`
+
+### Top up eSIM data
+
+Direct passthrough:
+
+- `POST /api/v1/esim-access/topups`
+- `POST /api/v1/esim-access/topup` (alias)
+
+Managed top up with immediate DB sync:
+
+- `POST /api/v1/esim-access/topups/managed`
+- `POST /api/v1/esim-access/topup/managed` (alias)
+
+Managed top up will:
+
+- call provider top up endpoint
+- optionally sync profile state and/or usage right after top up for faster UI updates
+
+### Webhook setup and receiver
+
+Configure provider webhook URL:
+
+- `POST /api/v1/esim-access/webhooks/configure`
+- `POST /api/v1/esim-access/webhook/save` (alias)
+
+Receive webhook events from provider:
+
+- `POST /api/v1/esim-access/webhooks/events`
+- `POST /api/v1/esim-access/webhook/events` (alias)
 
 ### Mark install and activation states
 

@@ -455,6 +455,14 @@ class ManagedUsageSyncPayload(BaseModel):
     actor_phone: str | None = Field(default=None, alias="actorPhone")
 
 
+class ManagedTopUpPayload(BaseModel):
+    provider_request: TopUpRequest = Field(alias="providerRequest")
+    platform_code: str | None = Field(default=None, alias="platformCode")
+    platform_name: str | None = Field(default=None, alias="platformName")
+    actor_phone: str | None = Field(default=None, alias="actorPhone")
+    sync_after_topup: bool = Field(default=True, alias="syncAfterTopup")
+
+
 class ManagedEsimTranActionPayload(BaseModel):
     provider_request: EsimTranNoRequest = Field(alias="providerRequest")
     context: ActionContext
@@ -661,13 +669,54 @@ def register_esim_access_routes(
         return await provider.balance_query()
 
     @app.post("/api/v1/esim-access/topups")
+    @app.post("/api/v1/esim-access/topup")
     async def top_up(
         payload: TopUpRequest,
         provider: ESimAccessAPI = Depends(get_provider),
     ) -> ESimAccessResponse[TopUpResult]:
         return await provider.top_up(payload)
 
+    @app.post("/api/v1/esim-access/topups/managed")
+    @app.post("/api/v1/esim-access/topup/managed")
+    async def top_up_managed(
+        payload: ManagedTopUpPayload,
+        provider: ESimAccessAPI = Depends(get_provider),
+        db: Session = Depends(get_db),
+    ) -> dict[str, Any]:
+        provider_response = await provider.top_up(payload.provider_request)
+        profiles_synced = 0
+        usage_records_synced = 0
+        if payload.sync_after_topup:
+            store = SupabaseStore(db)
+            if payload.provider_request.iccid:
+                query_request = ProfileQueryRequest(iccid=payload.provider_request.iccid)
+                profile_response = await provider.query_profiles(query_request)
+                profiles = store.sync_profiles(
+                    profile_response.model_dump(by_alias=True, exclude_none=True),
+                    platform_code=payload.platform_code,
+                    platform_name=payload.platform_name,
+                    actor_phone=payload.actor_phone,
+                )
+                profiles_synced = len(profiles)
+            if payload.provider_request.esim_tran_no:
+                usage_request = UsageCheckRequest(esim_tran_no_list=[payload.provider_request.esim_tran_no])
+                usage_response = await provider.usage_check(usage_request)
+                usage_profiles = store.sync_usage_records(
+                    usage_response.model_dump(by_alias=True, exclude_none=True),
+                    actor_phone=payload.actor_phone,
+                )
+                usage_records_synced = len(usage_profiles)
+        return {
+            "provider": provider_response.model_dump(by_alias=True, exclude_none=True),
+            "database": {
+                "profilesSynced": profiles_synced,
+                "usageRecordsSynced": usage_records_synced,
+                "syncAfterTopup": payload.sync_after_topup,
+            },
+        }
+
     @app.post("/api/v1/esim-access/webhooks/configure")
+    @app.post("/api/v1/esim-access/webhook/save")
     async def configure_webhook(
         payload: WebhookConfigRequest,
         provider: ESimAccessAPI = Depends(get_provider),
@@ -712,6 +761,7 @@ def register_esim_access_routes(
         return await provider.locations(payload)
 
     @app.post("/api/v1/esim-access/webhooks/events")
+    @app.post("/api/v1/esim-access/webhook/events")
     async def receive_webhook(event: WebhookEvent, db: Session = Depends(get_db)) -> dict[str, Any]:
         lifecycle_event = SupabaseStore(db).record_webhook(event.model_dump(by_alias=True, exclude_none=True))
         return {"status": "accepted", "eventId": lifecycle_event.id}
