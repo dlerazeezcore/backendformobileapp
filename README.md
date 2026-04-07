@@ -764,6 +764,45 @@ Managed top up will:
 - call provider top up endpoint
 - optionally sync profile state and/or usage right after top up for faster UI updates
 
+Top-up error contract (applies to both direct and managed routes):
+
+- `POST /api/v1/esim-access/topup`
+- `POST /api/v1/esim-access/topup/managed`
+
+On failure, backend always returns JSON with:
+
+- `success` (always `false`)
+- `errorCode` (provider code when available, otherwise normalized backend code)
+- `message` (stable user-facing summary)
+- `providerMessage` (raw provider/upstream message when available)
+- `requestId` and `traceId` (same value for tracing)
+
+Example business validation error (invalid `esimTranNo`, package mismatch, expired/revoked state):
+
+```json
+{
+  "success": false,
+  "errorCode": "ESIM_TOPUP_INVALID_REQUEST",
+  "message": "Top-up request is invalid for the target eSIM or package.",
+  "providerMessage": "Invalid esimTranNo for selected package",
+  "requestId": "f5ea0f7f-20df-4690-a79d-db79b8fc65d6",
+  "traceId": "f5ea0f7f-20df-4690-a79d-db79b8fc65d6"
+}
+```
+
+Example upstream/provider outage error:
+
+```json
+{
+  "success": false,
+  "errorCode": "ESIM_PROVIDER_UNREACHABLE",
+  "message": "Top-up provider request failed.",
+  "providerMessage": "All connection attempts failed",
+  "requestId": "9a9d94ab-f5cc-4ec3-a0de-c31d2f570e4f",
+  "traceId": "9a9d94ab-f5cc-4ec3-a0de-c31d2f570e4f"
+}
+```
+
 ### Webhook setup and receiver
 
 Configure provider webhook URL:

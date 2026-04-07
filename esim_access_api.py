@@ -12,6 +12,7 @@ from typing import Any, Callable, Generic, TypeVar
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 from fastapi import Depends, FastAPI
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from supabase_store import SupabaseStore
@@ -23,7 +24,9 @@ class ESimAccessError(Exception):
 
 
 class ESimAccessHTTPError(ESimAccessError):
-    pass
+    def __init__(self, message: str, *, request_id: str | None = None) -> None:
+        self.request_id = request_id
+        super().__init__(message)
 
 
 class ESimAccessAPIError(ESimAccessError):
@@ -33,14 +36,106 @@ class ESimAccessAPIError(ESimAccessError):
         error_code: str | None,
         error_message: str | None,
         status_code: int | None = None,
+        provider_message: str | None = None,
+        request_id: str | None = None,
     ) -> None:
         self.error_code = error_code
         self.error_message = error_message
         self.status_code = status_code
+        self.provider_message = provider_message or error_message
+        self.request_id = request_id
         message = f"eSIM Access API error {error_code or 'unknown'}"
         if error_message:
             message = f"{message}: {error_message}"
         super().__init__(message)
+
+
+_TOPUP_INVALID_HINTS = (
+    "invalid esimtranno",
+    "invalid esim tran no",
+    "invalid esim tran",
+    "invalid iccid",
+    "invalid package",
+    "package mismatch",
+    "does not match",
+    "not found",
+    "not exist",
+)
+_TOPUP_CONFLICT_HINTS = (
+    "already expired",
+    "already revoked",
+    "already canceled",
+    "already cancelled",
+    "already suspended",
+    "expired",
+    "revoked",
+)
+
+
+def _normalize_provider_business_status(*, upstream_status: int | None, provider_message: str | None) -> int:
+    if upstream_status is not None and 400 <= upstream_status < 500:
+        return upstream_status
+    message = (provider_message or "").strip().lower()
+    if any(token in message for token in _TOPUP_INVALID_HINTS):
+        return 422
+    if any(token in message for token in _TOPUP_CONFLICT_HINTS):
+        return 409
+    return 502
+
+
+def build_topup_error_response(exc: Exception) -> JSONResponse:
+    if isinstance(exc, ESimAccessAPIError):
+        provider_message = exc.provider_message or exc.error_message or str(exc)
+        status_code = _normalize_provider_business_status(
+            upstream_status=exc.status_code,
+            provider_message=provider_message,
+        )
+        trace_id = exc.request_id or str(uuid.uuid4())
+        if status_code >= 500:
+            error_code = exc.error_code or "ESIM_PROVIDER_UPSTREAM_ERROR"
+            message = "Top-up provider request failed."
+        elif status_code == 409:
+            error_code = exc.error_code or "ESIM_TOPUP_STATE_CONFLICT"
+            message = "Top-up request conflicts with current eSIM state."
+        else:
+            error_code = exc.error_code or "ESIM_TOPUP_INVALID_REQUEST"
+            message = "Top-up request is invalid for the target eSIM or package."
+        return JSONResponse(
+            status_code=status_code,
+            content={
+                "success": False,
+                "errorCode": error_code,
+                "message": message,
+                "providerMessage": provider_message,
+                "requestId": trace_id,
+                "traceId": trace_id,
+            },
+        )
+    if isinstance(exc, ESimAccessHTTPError):
+        trace_id = exc.request_id or str(uuid.uuid4())
+        return JSONResponse(
+            status_code=502,
+            content={
+                "success": False,
+                "errorCode": "ESIM_PROVIDER_UNREACHABLE",
+                "message": "Top-up provider request failed.",
+                "providerMessage": str(exc),
+                "requestId": trace_id,
+                "traceId": trace_id,
+            },
+        )
+    trace_id = str(uuid.uuid4())
+    return JSONResponse(
+        status_code=500,
+        content={
+            "success": False,
+            "errorCode": "INTERNAL_ERROR",
+            "message": "Top-up request failed unexpectedly.",
+            "providerMessage": str(exc),
+            "requestId": trace_id,
+            "traceId": trace_id,
+        },
+    )
 
 
 def compute_signature(
@@ -390,10 +485,12 @@ class ESimAccessAPI:
             separators=(",", ":"),
             ensure_ascii=False,
         )
+        request_id = str(uuid.uuid4())
         headers = build_auth_headers(
             access_code=self.access_code,
             secret_key=self.secret_key,
             request_body=body,
+            request_id=request_id,
         )
         if body:
             headers["Content-Type"] = "application/json"
@@ -401,11 +498,14 @@ class ESimAccessAPI:
         try:
             response = await self.client.post(path, content=body, headers=headers)
         except httpx.HTTPError as exc:
-            raise ESimAccessHTTPError(str(exc)) from exc
+            raise ESimAccessHTTPError(str(exc), request_id=request_id) from exc
         try:
             parsed = response_model.model_validate(response.json())
         except Exception as exc:
-            raise ESimAccessHTTPError(f"Invalid provider response: {response.text}") from exc
+            raise ESimAccessHTTPError(
+                f"Invalid provider response: {response.text}",
+                request_id=request_id,
+            ) from exc
         error_code = getattr(parsed, "error_code", None)
         has_error = error_code not in (None, "", "0", 0)
         if response.status_code >= 400 or not parsed.success or has_error:
@@ -413,6 +513,8 @@ class ESimAccessAPI:
                 error_code=str(error_code) if error_code is not None else None,
                 error_message=parsed.error_msg,
                 status_code=response.status_code,
+                provider_message=parsed.error_msg,
+                request_id=request_id,
             )
         return parsed
 
@@ -668,22 +770,28 @@ def register_esim_access_routes(
     ) -> ESimAccessResponse[BalanceResult]:
         return await provider.balance_query()
 
-    @app.post("/api/v1/esim-access/topups")
-    @app.post("/api/v1/esim-access/topup")
+    @app.post("/api/v1/esim-access/topups", response_model=None)
+    @app.post("/api/v1/esim-access/topup", response_model=None)
     async def top_up(
         payload: TopUpRequest,
         provider: ESimAccessAPI = Depends(get_provider),
-    ) -> ESimAccessResponse[TopUpResult]:
-        return await provider.top_up(payload)
+    ) -> Any:
+        try:
+            return await provider.top_up(payload)
+        except Exception as exc:
+            return build_topup_error_response(exc)
 
-    @app.post("/api/v1/esim-access/topups/managed")
-    @app.post("/api/v1/esim-access/topup/managed")
+    @app.post("/api/v1/esim-access/topups/managed", response_model=None)
+    @app.post("/api/v1/esim-access/topup/managed", response_model=None)
     async def top_up_managed(
         payload: ManagedTopUpPayload,
         provider: ESimAccessAPI = Depends(get_provider),
         db: Session = Depends(get_db),
-    ) -> dict[str, Any]:
-        provider_response = await provider.top_up(payload.provider_request)
+    ) -> Any:
+        try:
+            provider_response = await provider.top_up(payload.provider_request)
+        except Exception as exc:
+            return build_topup_error_response(exc)
         profiles_synced = 0
         usage_records_synced = 0
         if payload.sync_after_topup:
