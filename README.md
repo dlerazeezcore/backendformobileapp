@@ -346,12 +346,6 @@ ESIM_ACCESS_ACCESS_CODE=your_access_code
 ESIM_ACCESS_SECRET_KEY=your_secret_key
 FIB_PAYMENT_CLIENT_ID=your_fib_client_id
 FIB_PAYMENT_CLIENT_SECRET=your_fib_client_secret
-FIB_PAYMENT_BASE_URL=https://fib.prod.fib.iq
-FIB_PAYMENT_TIMEOUT_SECONDS=30
-FIB_PAYMENT_RATE_LIMIT_PER_SECOND=8
-FIB_PAYMENT_STATUS_CALLBACK_URL=https://YOUR-KOYEB-DOMAIN/api/v1/fib-payments/webhooks/events
-FIB_PAYMENT_REDIRECT_URI=tulip://payment/result
-FIB_PAYMENT_WEBHOOK_SECRET=replace_with_optional_shared_secret
 DATABASE_URL=postgresql://USER:PASSWORD@HOST:PORT/DATABASE
 AUTH_SECRET_KEY=replace_with_a_long_random_secret
 AUTH_TOKEN_TTL_SECONDS=86400
@@ -361,8 +355,12 @@ Notes:
 
 - `DATABASE_URL` may be plain `postgresql://...`; the backend normalizes it to SQLAlchemy `psycopg`
 - for Supabase, prefer the pooler connection string when the direct host is not reachable
-- set `FIB_PAYMENT_BASE_URL=https://fib.prod.fib.iq` for live mode and `https://fib.stage.fib.iq` for testing
 - if `FIB_PAYMENT_CLIENT_ID` and `FIB_PAYMENT_CLIENT_SECRET` are missing, FIB routes return `503` (integration disabled)
+- FIB runtime defaults are hardcoded in [app.py](/Users/laveencompany/Desktop/backendformobileapp/app.py):
+  - `FIB_PAYMENT_BASE_URL = "https://fib.prod.fib.iq"`
+  - `FIB_PAYMENT_TIMEOUT_SECONDS = 30`
+  - `FIB_PAYMENT_RATE_LIMIT_PER_SECOND = 8`
+  - callback URL and redirect URI defaults
 - never put real secrets in this README
 
 Example Supabase pooler shape:
@@ -855,7 +853,7 @@ The backend uses FIB OAuth2 `client_credentials` internally and caches bearer to
 - stage: `https://fib.stage.fib.iq`
 - production: `https://fib.prod.fib.iq`
 
-Set the target through `FIB_PAYMENT_BASE_URL`.
+Current backend default target is hardcoded to production in [app.py](/Users/laveencompany/Desktop/backendformobileapp/app.py) as `FIB_PAYMENT_BASE_URL`.
 
 ### Backend FIB routes
 
@@ -901,7 +899,7 @@ Receive payment status callbacks from FIB:
 Important behavior:
 
 - `statusCallbackUrl` and `redirectUri` are optional in request payload
-- if missing, backend will auto-fill them from env vars:
+- if missing, backend auto-fills them from hardcoded defaults in [app.py](/Users/laveencompany/Desktop/backendformobileapp/app.py):
   - `FIB_PAYMENT_STATUS_CALLBACK_URL`
   - `FIB_PAYMENT_REDIRECT_URI`
 
@@ -930,7 +928,7 @@ FIB callback payload includes:
 
 Backend callback endpoint returns `202 Accepted` on success.
 
-If `FIB_PAYMENT_WEBHOOK_SECRET` is set, backend expects header:
+If `FIB_PAYMENT_WEBHOOK_SECRET` constant is set in [app.py](/Users/laveencompany/Desktop/backendformobileapp/app.py), backend expects header:
 
 - `X-FIB-WEBHOOK-SECRET: <secret>`
 

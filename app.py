@@ -13,8 +13,6 @@ from config import (
     DEFAULT_ESIM_ACCESS_BASE_URL,
     DEFAULT_ESIM_ACCESS_RATE_LIMIT_PER_SECOND,
     DEFAULT_ESIM_ACCESS_TIMEOUT_SECONDS,
-    DEFAULT_FIB_PAYMENT_RATE_LIMIT_PER_SECOND,
-    DEFAULT_FIB_PAYMENT_TIMEOUT_SECONDS,
     Settings,
     get_settings,
 )
@@ -50,6 +48,14 @@ CORS_ALLOWED_ORIGINS = [
 CORS_ALLOWED_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 CORS_ALLOWED_HEADERS = ["Authorization", "Content-Type", "Accept", "Origin", "X-Requested-With"]
 CORS_ALLOW_ORIGIN_REGEX = r"^https://([a-zA-Z0-9-]+\.)?figma\.site$"
+FIB_PAYMENT_BASE_URL = "https://fib.prod.fib.iq"
+FIB_PAYMENT_TIMEOUT_SECONDS = 30.0
+FIB_PAYMENT_RATE_LIMIT_PER_SECOND = 8.0
+FIB_PAYMENT_STATUS_CALLBACK_URL = "https://mean-lettie-corevia-0bd7cc91.koyeb.app/api/v1/fib-payments/webhooks/events"
+FIB_PAYMENT_REDIRECT_URI = "tulip://payment/result"
+# Optional hardcoded shared secret for webhook header validation.
+# Keep as None to disable shared-secret checks.
+FIB_PAYMENT_WEBHOOK_SECRET: str | None = None
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -69,12 +75,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.fib_payment_api = FIBPaymentAPI(
                 client_id=cfg.fib_payment_client_id,
                 client_secret=cfg.fib_payment_client_secret,
-                base_url=cfg.fib_payment_base_url,
-                timeout=cfg.fib_payment_timeout_seconds or DEFAULT_FIB_PAYMENT_TIMEOUT_SECONDS,
-                rate_limit_per_second=cfg.fib_payment_rate_limit_per_second or DEFAULT_FIB_PAYMENT_RATE_LIMIT_PER_SECOND,
-                default_status_callback_url=cfg.fib_payment_status_callback_url,
-                default_redirect_uri=cfg.fib_payment_redirect_uri,
-                webhook_secret=cfg.fib_payment_webhook_secret,
+                base_url=FIB_PAYMENT_BASE_URL,
+                timeout=FIB_PAYMENT_TIMEOUT_SECONDS,
+                rate_limit_per_second=FIB_PAYMENT_RATE_LIMIT_PER_SECOND,
+                default_status_callback_url=FIB_PAYMENT_STATUS_CALLBACK_URL,
+                default_redirect_uri=FIB_PAYMENT_REDIRECT_URI,
+                webhook_secret=FIB_PAYMENT_WEBHOOK_SECRET,
             )
         yield
         await app.state.esim_access_api.close()
