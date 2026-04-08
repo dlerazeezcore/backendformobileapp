@@ -406,6 +406,21 @@ class PushNotificationRoutesTest(unittest.TestCase):
         self.assertEqual(payload.get("activeAdminTokens"), 0)
         self.assertEqual(payload.get("eligibleTokensForRequestedAudience"), 0)
 
+    def test_legacy_admin_send_alias_route(self) -> None:
+        response = self.client.post(
+            "/api/esim-app/push/admin/send",
+            json={
+                "title": "Legacy route test",
+                "body": "No admin tokens yet",
+                "audience": "admins",
+            },
+            headers=self.admin_headers,
+        )
+        self.assertEqual(response.status_code, 422)
+        payload = response.json()
+        self.assertEqual(payload.get("errorCode"), "NO_ELIGIBLE_PUSH_TOKENS")
+        self.assertEqual(payload.get("requestedAudience"), "admins")
+
     def test_admin_send_with_audience_loyalty(self) -> None:
         self.client.post(
             "/api/v1/push-notifications/devices/register",

@@ -555,6 +555,7 @@ User token/device routes:
 Admin delivery routes:
 
 - `POST /api/v1/admin/push-notifications/send`
+- `POST /api/esim-app/push/admin/send` (legacy alias, same behavior)
 - `GET /api/v1/admin/push-notifications`
 - `GET /api/v1/admin/push-notifications/summary`
 - `GET /api/v1/admin/push-notifications/diagnostics` (temporary diagnostics endpoint)

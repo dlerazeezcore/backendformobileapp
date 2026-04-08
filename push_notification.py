@@ -374,6 +374,7 @@ def register_push_notification_routes(
             "pagination": {"limit": limit, "offset": offset, "count": len(rows)},
         }
 
+    @app.post("/api/esim-app/push/admin/send", response_model=None)
     @app.post("/api/v1/admin/push-notifications/send", response_model=None)
     async def send_push_notification(
         payload: SendPushNotificationPayload,
