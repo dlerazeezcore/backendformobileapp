@@ -154,7 +154,50 @@ class PublicUserSignupTest(unittest.TestCase):
             )
             self.assertEqual(response.status_code, 422)
 
+    def test_authenticated_user_can_self_delete(self) -> None:
+        with TestClient(create_app()) as client:
+            signup_response = client.post(
+                "/api/v1/auth/user/signup",
+                json={
+                    "phone": "+9647700000199",
+                    "name": "Delete Me",
+                    "password": "StrongPass123",
+                },
+            )
+            self.assertEqual(signup_response.status_code, 200)
+            access_token = signup_response.json()["accessToken"]
+
+            delete_response = client.delete(
+                "/api/v1/auth/me",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            self.assertEqual(delete_response.status_code, 200)
+            delete_payload = delete_response.json()
+            self.assertTrue(delete_payload.get("deleted"))
+            self.assertEqual(delete_payload.get("status"), "deleted")
+            self.assertEqual(delete_payload.get("id"), delete_payload.get("userId"))
+
+            delete_alias_response = client.post(
+                "/api/v1/auth/user/delete",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            self.assertEqual(delete_alias_response.status_code, 200)
+            self.assertTrue(delete_alias_response.json().get("deleted"))
+
+            delete_unversioned_alias = client.delete(
+                "/auth/me",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            self.assertEqual(delete_unversioned_alias.status_code, 200)
+            self.assertEqual(delete_unversioned_alias.json().get("status"), "deleted")
+
+        with self.session_factory() as session:
+            row = session.scalar(select(AppUser).where(AppUser.phone == "+9647700000199"))
+            self.assertIsNotNone(row)
+            assert row is not None
+            self.assertEqual(row.status, "deleted")
+            self.assertIsNotNone(row.deleted_at)
+
 
 if __name__ == "__main__":
     unittest.main()
-
