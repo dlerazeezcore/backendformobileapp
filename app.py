@@ -54,6 +54,7 @@ FIB_PAYMENT_TIMEOUT_SECONDS = 30.0
 FIB_PAYMENT_RATE_LIMIT_PER_SECOND = 8.0
 FIB_PAYMENT_STATUS_CALLBACK_URL = "https://mean-lettie-corevia-0bd7cc91.koyeb.app/api/v1/payments/fib/webhook"
 FIB_PAYMENT_REDIRECT_URI = "tulip://payment/result"
+PUSH_NOTIFICATION_DEFAULT_CHANNEL_ID = "general"
 # Optional hardcoded fallback when env var is not set.
 FIB_PAYMENT_WEBHOOK_SECRET: str | None = None
 
@@ -85,7 +86,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.push_notification_service = PushNotificationService(
             service_account_file=cfg.firebase_service_account_file,
             service_account_json=cfg.firebase_service_account_json,
-            default_channel_id=cfg.push_notification_default_channel_id,
+            default_channel_id=cfg.push_notification_default_channel_id or PUSH_NOTIFICATION_DEFAULT_CHANNEL_ID,
         )
         yield
         await app.state.esim_access_api.close()
