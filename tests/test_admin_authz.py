@@ -98,6 +98,23 @@ class AdminAuthorizationTest(unittest.TestCase):
             detail = response.json().get("detail", {})
             self.assertEqual(detail.get("code"), "AUTH_SCOPE_FORBIDDEN")
 
+    def test_users_list_with_user_token_returns_only_self(self) -> None:
+        token = create_access_token(
+            subject_id="22222222-2222-2222-2222-222222222222",
+            phone="+9647700000002",
+            subject_type="user",
+            secret_key="test-auth-secret",
+            ttl_seconds=3600,
+        )
+        with TestClient(create_app()) as client:
+            response = client.get("/api/v1/admin/users", headers={"Authorization": f"Bearer {token}"})
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertEqual(len(payload.get("users", [])), 1)
+            user_row = payload["users"][0]
+            self.assertEqual(user_row.get("id"), "22222222-2222-2222-2222-222222222222")
+            self.assertEqual(user_row.get("id"), user_row.get("userId"))
+
 
 if __name__ == "__main__":
     unittest.main()

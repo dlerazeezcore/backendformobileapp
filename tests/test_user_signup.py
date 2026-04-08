@@ -181,8 +181,15 @@ class PublicUserSignupTest(unittest.TestCase):
                 "/api/v1/auth/user/delete",
                 headers={"Authorization": f"Bearer {access_token}"},
             )
-            self.assertEqual(delete_alias_response.status_code, 403)
-            self.assertEqual(delete_alias_response.json().get("detail", {}).get("code"), "AUTH_SUBJECT_INACTIVE")
+            self.assertEqual(delete_alias_response.status_code, 200)
+            self.assertTrue(delete_alias_response.json().get("deleted"))
+
+            delete_unversioned_alias = client.delete(
+                "/auth/me",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            self.assertEqual(delete_unversioned_alias.status_code, 200)
+            self.assertEqual(delete_unversioned_alias.json().get("status"), "deleted")
 
         with self.session_factory() as session:
             row = session.scalar(select(AppUser).where(AppUser.phone == "+9647700000199"))

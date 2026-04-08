@@ -327,6 +327,7 @@ def register_auth_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         }
 
     @app.get("/api/v1/auth/me")
+    @app.get("/auth/me")
     async def auth_me(
         token: str = Depends(require_bearer_token),
         db: Session = Depends(get_db),
@@ -367,13 +368,36 @@ def register_auth_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         }
 
     @app.delete("/api/v1/auth/me")
+    @app.delete("/auth/me")
     @app.post("/api/v1/auth/user/delete")
+    @app.post("/auth/user/delete")
     async def delete_authenticated_user(
         claims: dict[str, Any] = Depends(get_token_claims),
         db: Session = Depends(get_db),
     ) -> dict[str, Any]:
-        user_row = require_active_subject(db, claims=claims, subject_type="user")
-        assert isinstance(user_row, AppUser)
+        token_subject_type = claims.get("typ")
+        subject_id = claims.get("sub")
+        if token_subject_type != "user":
+            raise _api_error(
+                status.HTTP_403_FORBIDDEN,
+                "AUTH_SCOPE_FORBIDDEN",
+                "Token subject is not allowed for this endpoint",
+            )
+        if not isinstance(subject_id, str):
+            raise _api_error(status.HTTP_401_UNAUTHORIZED, "AUTH_INVALID_SUBJECT", "Invalid auth subject")
+        user_row = db.scalar(select(AppUser).where(AppUser.id == subject_id))
+        if user_row is None:
+            raise _api_error(status.HTTP_401_UNAUTHORIZED, "AUTH_SUBJECT_NOT_FOUND", "Auth subject not found")
+        if user_row.blocked_at is not None:
+            raise _api_error(status.HTTP_403_FORBIDDEN, "AUTH_SUBJECT_INACTIVE", "Inactive account")
+        if user_row.deleted_at is not None or user_row.status == "deleted":
+            return {
+                "deleted": True,
+                "id": user_row.id,
+                "userId": user_row.id,
+                "status": "deleted",
+                "deletedAt": user_row.deleted_at,
+            }
         user_row.status = "deleted"
         user_row.deleted_at = utcnow()
         user_row.updated_at = utcnow()
