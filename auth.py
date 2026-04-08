@@ -377,35 +377,66 @@ def register_auth_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
     ) -> dict[str, Any]:
         token_subject_type = claims.get("typ")
         subject_id = claims.get("sub")
-        if token_subject_type != "user":
-            raise _api_error(
-                status.HTTP_403_FORBIDDEN,
-                "AUTH_SCOPE_FORBIDDEN",
-                "Token subject is not allowed for this endpoint",
-            )
         if not isinstance(subject_id, str):
             raise _api_error(status.HTTP_401_UNAUTHORIZED, "AUTH_INVALID_SUBJECT", "Invalid auth subject")
-        user_row = db.scalar(select(AppUser).where(AppUser.id == subject_id))
-        if user_row is None:
-            raise _api_error(status.HTTP_401_UNAUTHORIZED, "AUTH_SUBJECT_NOT_FOUND", "Auth subject not found")
-        if user_row.blocked_at is not None:
-            raise _api_error(status.HTTP_403_FORBIDDEN, "AUTH_SUBJECT_INACTIVE", "Inactive account")
-        if user_row.deleted_at is not None or user_row.status == "deleted":
+        if token_subject_type == "user":
+            user_row = db.scalar(select(AppUser).where(AppUser.id == subject_id))
+            if user_row is None:
+                raise _api_error(status.HTTP_401_UNAUTHORIZED, "AUTH_SUBJECT_NOT_FOUND", "Auth subject not found")
+            if user_row.blocked_at is not None:
+                raise _api_error(status.HTTP_403_FORBIDDEN, "AUTH_SUBJECT_INACTIVE", "Inactive account")
+            if user_row.deleted_at is not None or user_row.status == "deleted":
+                return {
+                    "deleted": True,
+                    "id": user_row.id,
+                    "userId": user_row.id,
+                    "status": "deleted",
+                    "deletedAt": user_row.deleted_at,
+                    "subjectType": "user",
+                }
+            user_row.status = "deleted"
+            user_row.deleted_at = utcnow()
+            user_row.updated_at = utcnow()
+            db.commit()
             return {
                 "deleted": True,
                 "id": user_row.id,
                 "userId": user_row.id,
-                "status": "deleted",
+                "status": user_row.status,
                 "deletedAt": user_row.deleted_at,
+                "subjectType": "user",
             }
-        user_row.status = "deleted"
-        user_row.deleted_at = utcnow()
-        user_row.updated_at = utcnow()
-        db.commit()
-        return {
-            "deleted": True,
-            "id": user_row.id,
-            "userId": user_row.id,
-            "status": user_row.status,
-            "deletedAt": user_row.deleted_at,
-        }
+
+        if token_subject_type == "admin":
+            admin_row = db.scalar(select(AdminUser).where(AdminUser.id == subject_id))
+            if admin_row is None:
+                raise _api_error(status.HTTP_401_UNAUTHORIZED, "AUTH_SUBJECT_NOT_FOUND", "Auth subject not found")
+            if admin_row.blocked_at is not None:
+                raise _api_error(status.HTTP_403_FORBIDDEN, "AUTH_SUBJECT_INACTIVE", "Inactive account")
+            if admin_row.deleted_at is not None or admin_row.status == "deleted":
+                return {
+                    "deleted": True,
+                    "id": admin_row.id,
+                    "adminUserId": admin_row.id,
+                    "status": "deleted",
+                    "deletedAt": admin_row.deleted_at,
+                    "subjectType": "admin",
+                }
+            admin_row.status = "deleted"
+            admin_row.deleted_at = utcnow()
+            admin_row.updated_at = utcnow()
+            db.commit()
+            return {
+                "deleted": True,
+                "id": admin_row.id,
+                "adminUserId": admin_row.id,
+                "status": admin_row.status,
+                "deletedAt": admin_row.deleted_at,
+                "subjectType": "admin",
+            }
+
+        raise _api_error(
+            status.HTTP_403_FORBIDDEN,
+            "AUTH_SCOPE_FORBIDDEN",
+            "Token subject is not allowed for this endpoint",
+        )
