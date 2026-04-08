@@ -597,6 +597,8 @@ Admin delivery routes:
 
 - `POST /api/v1/auth/admin/login`
 - `POST /api/v1/auth/user/login`
+- `POST /api/v1/auth/user/signup` (public, no auth)
+- `POST /api/v1/auth/user/register` (public alias, same behavior)
 - `GET /api/v1/auth/me`
 
 Compatibility behavior:
@@ -702,6 +704,46 @@ Example response:
   "password": "UserPass123"
 }
 ```
+
+### User signup (public)
+
+`POST /api/v1/auth/user/signup`
+
+Alias:
+
+- `POST /api/v1/auth/user/register`
+
+Request:
+
+```json
+{
+  "phone": "+9647700000000",
+  "name": "New User",
+  "password": "UserPass123"
+}
+```
+
+Response:
+
+```json
+{
+  "accessToken": "eyJ...",
+  "tokenType": "bearer",
+  "expiresIn": 86400,
+  "userId": "uuid",
+  "id": "uuid",
+  "phone": "+9647700000000",
+  "name": "New User",
+  "subjectType": "user"
+}
+```
+
+Validation and conflict behavior:
+
+- returns `422` for invalid input (for example invalid phone format, short password, short name)
+- returns `409` when phone already exists in `app_users`
+- returns `409` when phone belongs to an admin account
+- no bearer token is required for signup/register routes
 
 ### Current authenticated user
 

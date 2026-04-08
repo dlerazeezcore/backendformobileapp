@@ -11,10 +11,11 @@ from typing import Any, Callable
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from config import get_settings
-from phone_utils import phone_lookup_candidates
+from phone_utils import normalize_phone, phone_lookup_candidates
 from supabase_store import AdminUser, AppUser, utcnow
 
 
@@ -22,6 +23,12 @@ class LoginPayload(BaseModel):
     phone: str
     password: str = Field(min_length=8)
     otp_code: str | None = Field(default=None, alias="otpCode")
+
+
+class SignupPayload(BaseModel):
+    phone: str
+    name: str = Field(min_length=2, max_length=255)
+    password: str = Field(min_length=8)
 
 
 class LogoutPayload(BaseModel):
@@ -203,6 +210,22 @@ def _issue_token(row: AppUser | AdminUser, *, subject_type: str) -> dict[str, An
     return response.model_dump(by_alias=True, exclude_none=True)
 
 
+def _normalize_and_validate_signup_phone(phone: str) -> str:
+    normalized = normalize_phone(phone)
+    if not normalized.startswith("+"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Phone must be in international format (for example +9647xxxxxxxxx).",
+        )
+    digits = normalized[1:]
+    if not digits.isdigit() or len(digits) < 8:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Phone number format is invalid.",
+        )
+    return normalized
+
+
 def register_auth_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
     @app.post("/api/v1/auth/admin/login")
     async def admin_login(payload: LoginPayload, db: Session = Depends(get_db)) -> dict[str, Any]:
@@ -229,6 +252,64 @@ def register_auth_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
             return _issue_token(admin_row, subject_type="admin")
 
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid phone or password")
+
+    @app.post("/api/v1/auth/user/register")
+    @app.post("/api/v1/auth/user/signup")
+    async def user_signup(payload: SignupPayload, db: Session = Depends(get_db)) -> dict[str, Any]:
+        normalized_phone = _normalize_and_validate_signup_phone(payload.phone)
+        normalized_name = str(payload.name or "").strip()
+        if len(normalized_name) < 2:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="Name must be at least 2 characters.",
+            )
+
+        existing_user = _lookup_user_by_phone(db, normalized_phone)
+        if existing_user is not None:
+            if _is_row_active(existing_user):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="User account already exists for this phone. Please log in.",
+                )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="User account exists but is not active. Please contact support.",
+            )
+
+        existing_admin = _lookup_admin_by_phone(db, normalized_phone)
+        if existing_admin is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This phone is already used by an admin account.",
+            )
+
+        user_row = AppUser(
+            phone=normalized_phone,
+            name=normalized_name,
+            status="active",
+            password_hash=hash_password(payload.password),
+            last_login_at=utcnow(),
+        )
+        db.add(user_row)
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="User account already exists for this phone. Please log in.",
+            ) from exc
+        db.refresh(user_row)
+
+        token_payload = _issue_token(user_row, subject_type="user")
+        return {
+            **token_payload,
+            "userId": user_row.id,
+            "id": user_row.id,
+            "phone": user_row.phone,
+            "name": user_row.name,
+            "subjectType": "user",
+        }
 
     @app.get("/api/v1/auth/me")
     async def auth_me(
