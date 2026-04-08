@@ -42,6 +42,16 @@ class TokenResponse(BaseModel):
     refresh_token: str | None = Field(default=None, alias="refreshToken")
 
 
+def _api_error(status_code: int, code: str, message: str) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail={
+            "code": code,
+            "message": message,
+        },
+    )
+
+
 def _urlsafe_b64encode(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
@@ -106,27 +116,27 @@ def create_access_token(
 def decode_access_token(token: str, *, secret_key: str) -> dict[str, Any]:
     parts = token.split(".")
     if len(parts) != 3:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+        raise _api_error(status.HTTP_401_UNAUTHORIZED, "AUTH_INVALID_TOKEN", "Invalid token")
     header_segment, payload_segment, signature_segment = parts
     signing_input = f"{header_segment}.{payload_segment}".encode("ascii")
     expected_signature = hmac.new(secret_key.encode("utf-8"), signing_input, hashlib.sha256).digest()
     try:
         provided_signature = _urlsafe_b64decode(signature_segment)
     except Exception as exc:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token signature") from exc
+        raise _api_error(status.HTTP_401_UNAUTHORIZED, "AUTH_INVALID_TOKEN_SIGNATURE", "Invalid token signature") from exc
     if not hmac.compare_digest(provided_signature, expected_signature):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token signature")
+        raise _api_error(status.HTTP_401_UNAUTHORIZED, "AUTH_INVALID_TOKEN_SIGNATURE", "Invalid token signature")
     try:
         payload = json.loads(_urlsafe_b64decode(payload_segment).decode("utf-8"))
     except Exception as exc:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token payload") from exc
+        raise _api_error(status.HTTP_401_UNAUTHORIZED, "AUTH_INVALID_TOKEN_PAYLOAD", "Invalid token payload") from exc
     if not isinstance(payload, dict):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token payload")
+        raise _api_error(status.HTTP_401_UNAUTHORIZED, "AUTH_INVALID_TOKEN_PAYLOAD", "Invalid token payload")
     exp = payload.get("exp")
     if not isinstance(exp, int) or exp <= int(time.time()):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired")
+        raise _api_error(status.HTTP_401_UNAUTHORIZED, "AUTH_TOKEN_EXPIRED", "Token expired")
     if payload.get("typ") not in {"admin", "user"}:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token type")
+        raise _api_error(status.HTTP_401_UNAUTHORIZED, "AUTH_INVALID_TOKEN_TYPE", "Invalid token type")
     return payload
 
 
@@ -142,9 +152,10 @@ def extract_bearer_token(authorization: str | None) -> str | None:
 def require_bearer_token(authorization: str | None = Header(default=None)) -> str:
     token = extract_bearer_token(authorization)
     if token is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing or invalid bearer token",
+        raise _api_error(
+            status.HTTP_401_UNAUTHORIZED,
+            "AUTH_MISSING_BEARER_TOKEN",
+            "Missing or invalid bearer token",
         )
     return token
 
@@ -167,19 +178,23 @@ def require_active_subject(
     token_subject_type = claims.get("typ")
     subject_id = claims.get("sub")
     if subject_type is not None and token_subject_type != subject_type:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+        raise _api_error(
+            status.HTTP_403_FORBIDDEN,
+            "AUTH_SCOPE_FORBIDDEN",
+            "Token subject is not allowed for this endpoint",
+        )
     if not isinstance(subject_id, str) or not isinstance(token_subject_type, str):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid auth subject")
+        raise _api_error(status.HTTP_401_UNAUTHORIZED, "AUTH_INVALID_SUBJECT", "Invalid auth subject")
     if token_subject_type == "admin":
         row = db.scalar(select(AdminUser).where(AdminUser.id == subject_id))
     elif token_subject_type == "user":
         row = db.scalar(select(AppUser).where(AppUser.id == subject_id))
     else:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid auth token type")
+        raise _api_error(status.HTTP_401_UNAUTHORIZED, "AUTH_INVALID_TOKEN_TYPE", "Invalid auth token type")
     if row is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Auth subject not found")
+        raise _api_error(status.HTTP_401_UNAUTHORIZED, "AUTH_SUBJECT_NOT_FOUND", "Auth subject not found")
     if not _is_row_active(row):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Inactive account")
+        raise _api_error(status.HTTP_403_FORBIDDEN, "AUTH_SUBJECT_INACTIVE", "Inactive account")
     return row
 
 
@@ -312,6 +327,7 @@ def register_auth_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         }
 
     @app.get("/api/v1/auth/me")
+    @app.get("/auth/me")
     async def auth_me(
         token: str = Depends(require_bearer_token),
         db: Session = Depends(get_db),
@@ -323,7 +339,7 @@ def register_auth_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         if subject_type == "admin":
             row = db.scalar(select(AdminUser).where(AdminUser.id == subject_id))
             if row is None:
-                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Auth subject not found")
+                raise _api_error(status.HTTP_401_UNAUTHORIZED, "AUTH_SUBJECT_NOT_FOUND", "Auth subject not found")
             return {
                 "subjectType": "admin",
                 "id": row.id,
@@ -341,7 +357,7 @@ def register_auth_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
             }
         row = db.scalar(select(AppUser).where(AppUser.id == subject_id))
         if row is None:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Auth subject not found")
+            raise _api_error(status.HTTP_401_UNAUTHORIZED, "AUTH_SUBJECT_NOT_FOUND", "Auth subject not found")
         return {
             "subjectType": "user",
             "id": row.id,
@@ -349,4 +365,47 @@ def register_auth_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
             "name": row.name,
             "status": row.status,
             "isLoyalty": row.is_loyalty,
+        }
+
+    @app.delete("/api/v1/auth/me")
+    @app.delete("/auth/me")
+    @app.post("/api/v1/auth/user/delete")
+    @app.post("/auth/user/delete")
+    async def delete_authenticated_user(
+        claims: dict[str, Any] = Depends(get_token_claims),
+        db: Session = Depends(get_db),
+    ) -> dict[str, Any]:
+        token_subject_type = claims.get("typ")
+        subject_id = claims.get("sub")
+        if token_subject_type != "user":
+            raise _api_error(
+                status.HTTP_403_FORBIDDEN,
+                "AUTH_SCOPE_FORBIDDEN",
+                "Token subject is not allowed for this endpoint",
+            )
+        if not isinstance(subject_id, str):
+            raise _api_error(status.HTTP_401_UNAUTHORIZED, "AUTH_INVALID_SUBJECT", "Invalid auth subject")
+        user_row = db.scalar(select(AppUser).where(AppUser.id == subject_id))
+        if user_row is None:
+            raise _api_error(status.HTTP_401_UNAUTHORIZED, "AUTH_SUBJECT_NOT_FOUND", "Auth subject not found")
+        if user_row.blocked_at is not None:
+            raise _api_error(status.HTTP_403_FORBIDDEN, "AUTH_SUBJECT_INACTIVE", "Inactive account")
+        if user_row.deleted_at is not None or user_row.status == "deleted":
+            return {
+                "deleted": True,
+                "id": user_row.id,
+                "userId": user_row.id,
+                "status": "deleted",
+                "deletedAt": user_row.deleted_at,
+            }
+        user_row.status = "deleted"
+        user_row.deleted_at = utcnow()
+        user_row.updated_at = utcnow()
+        db.commit()
+        return {
+            "deleted": True,
+            "id": user_row.id,
+            "userId": user_row.id,
+            "status": user_row.status,
+            "deletedAt": user_row.deleted_at,
         }

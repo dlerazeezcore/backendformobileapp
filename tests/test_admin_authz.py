@@ -10,7 +10,7 @@ from sqlalchemy.orm import sessionmaker
 
 from auth import create_access_token, hash_password
 from config import get_settings
-from supabase_store import AdminUser, Base, normalize_database_url
+from supabase_store import AdminUser, AppUser, Base, normalize_database_url
 from app import create_app
 
 
@@ -48,6 +48,14 @@ class AdminAuthorizationTest(unittest.TestCase):
                     password_hash=hash_password("StrongPass123"),
                 )
             )
+            session.add(
+                AppUser(
+                    id="22222222-2222-2222-2222-222222222222",
+                    phone="+9647700000002",
+                    name="Standard User",
+                    status="active",
+                )
+            )
             session.commit()
         engine.dispose()
 
@@ -72,7 +80,40 @@ class AdminAuthorizationTest(unittest.TestCase):
         with TestClient(create_app()) as client:
             response = client.get("/api/v1/admin/users", headers={"Authorization": f"Bearer {token}"})
             self.assertEqual(response.status_code, 200)
-            self.assertIn("users", response.json())
+            payload = response.json()
+            self.assertIn("users", payload)
+            self.assertEqual(payload["users"][0].get("id"), payload["users"][0].get("userId"))
+
+    def test_user_delete_rejects_admin_token_with_scope_error(self) -> None:
+        token = create_access_token(
+            subject_id="11111111-1111-1111-1111-111111111111",
+            phone="+9647700000001",
+            subject_type="admin",
+            secret_key="test-auth-secret",
+            ttl_seconds=3600,
+        )
+        with TestClient(create_app()) as client:
+            response = client.delete("/api/v1/auth/me", headers={"Authorization": f"Bearer {token}"})
+            self.assertEqual(response.status_code, 403)
+            detail = response.json().get("detail", {})
+            self.assertEqual(detail.get("code"), "AUTH_SCOPE_FORBIDDEN")
+
+    def test_users_list_with_user_token_returns_only_self(self) -> None:
+        token = create_access_token(
+            subject_id="22222222-2222-2222-2222-222222222222",
+            phone="+9647700000002",
+            subject_type="user",
+            secret_key="test-auth-secret",
+            ttl_seconds=3600,
+        )
+        with TestClient(create_app()) as client:
+            response = client.get("/api/v1/admin/users", headers={"Authorization": f"Bearer {token}"})
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertEqual(len(payload.get("users", [])), 1)
+            user_row = payload["users"][0]
+            self.assertEqual(user_row.get("id"), "22222222-2222-2222-2222-222222222222")
+            self.assertEqual(user_row.get("id"), user_row.get("userId"))
 
 
 if __name__ == "__main__":

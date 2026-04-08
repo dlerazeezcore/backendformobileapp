@@ -5,6 +5,7 @@ from typing import Any, Callable
 
 from fastapi import Depends, FastAPI, Query
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from auth import get_token_claims, hash_password, require_active_subject
@@ -52,6 +53,14 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         assert isinstance(row, AdminUser)
         return row
 
+    async def _require_active_actor(
+        claims: dict[str, Any] = Depends(get_token_claims),
+        db: Session = Depends(get_db),
+    ) -> AdminUser | AppUser:
+        row = require_active_subject(db, claims=claims)
+        assert isinstance(row, (AdminUser, AppUser))
+        return row
+
     @app.post("/api/v1/admin/users")
     async def save_user(
         payload: UserPayload,
@@ -72,10 +81,28 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         db: Session = Depends(get_db),
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
-        _: AdminUser = Depends(_require_admin_actor),
+        actor: AdminUser | AppUser = Depends(_require_active_actor),
     ) -> dict[str, Any]:
-        rows = SupabaseStore(db).list_rows(AppUser, exclude={"password_hash"}, limit=limit, offset=offset)
-        return {"users": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
+        store = SupabaseStore(db)
+        if isinstance(actor, AdminUser):
+            rows = store.list_rows(AppUser, exclude={"password_hash"}, limit=limit, offset=offset)
+        else:
+            own_row = db.scalar(select(AppUser).where(AppUser.id == actor.id))
+            filtered: list[dict[str, Any]] = []
+            if own_row is not None:
+                filtered.append(
+                    {
+                        column.name: getattr(own_row, column.name)
+                        for column in own_row.__table__.columns
+                        if column.name != "password_hash"
+                    }
+                )
+            rows = filtered[offset : offset + max(1, min(limit, 500))]
+        normalized_rows = []
+        for row in rows:
+            user_id = row.get("id")
+            normalized_rows.append({**row, "userId": user_id})
+        return {"users": normalized_rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
 
     @app.post("/api/v1/admin/admin-users")
     async def save_admin_user(
