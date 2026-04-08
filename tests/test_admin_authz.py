@@ -84,7 +84,7 @@ class AdminAuthorizationTest(unittest.TestCase):
             self.assertIn("users", payload)
             self.assertEqual(payload["users"][0].get("id"), payload["users"][0].get("userId"))
 
-    def test_user_delete_rejects_admin_token_with_scope_error(self) -> None:
+    def test_user_delete_allows_admin_token_for_self_delete(self) -> None:
         token = create_access_token(
             subject_id="11111111-1111-1111-1111-111111111111",
             phone="+9647700000001",
@@ -94,9 +94,34 @@ class AdminAuthorizationTest(unittest.TestCase):
         )
         with TestClient(create_app()) as client:
             response = client.delete("/api/v1/auth/me", headers={"Authorization": f"Bearer {token}"})
-            self.assertEqual(response.status_code, 403)
-            detail = response.json().get("detail", {})
-            self.assertEqual(detail.get("code"), "AUTH_SCOPE_FORBIDDEN")
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertTrue(payload.get("deleted"))
+            self.assertEqual(payload.get("subjectType"), "admin")
+
+    def test_users_save_with_user_token_updates_only_self(self) -> None:
+        token = create_access_token(
+            subject_id="22222222-2222-2222-2222-222222222222",
+            phone="+9647700000002",
+            subject_type="user",
+            secret_key="test-auth-secret",
+            ttl_seconds=3600,
+        )
+        with TestClient(create_app()) as client:
+            response = client.post(
+                "/api/v1/admin/users",
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "phone": "+9647700000002",
+                    "name": "Updated Name",
+                    "email": "updated@example.com",
+                    "status": "active",
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertEqual(payload["user"]["id"], "22222222-2222-2222-2222-222222222222")
+            self.assertEqual(payload["user"]["name"], "Updated Name")
 
     def test_users_list_with_user_token_returns_only_self(self) -> None:
         token = create_access_token(
