@@ -11,6 +11,8 @@ from sqlalchemy.orm import Session
 from auth import get_token_claims, require_active_subject
 from supabase_store import AdminUser, AppUser, PushDevice, PushNotification, SupabaseStore, utcnow
 
+ALLOWED_PUSH_AUDIENCES = {"all", "authenticated", "loyalty", "active_esim"}
+
 try:
     import firebase_admin
     from firebase_admin import credentials, messaging
@@ -176,6 +178,7 @@ class SendPushNotificationPayload(Model):
     title: str = Field(min_length=1, max_length=255)
     body: str = Field(min_length=1, max_length=2000)
     data: dict[str, Any] = Field(default_factory=dict)
+    audience: str | None = None
     user_ids: list[str] = Field(default_factory=list, alias="userIds")
     tokens: list[str] = Field(default_factory=list)
     send_to_all_active: bool = Field(default=False, alias="sendToAllActive")
@@ -185,9 +188,16 @@ class SendPushNotificationPayload(Model):
 
     @model_validator(mode="after")
     def validate_targets(self) -> "SendPushNotificationPayload":
-        has_any_target = bool(self.send_to_all_active or self.user_ids or self.tokens)
+        normalized_audience = str(self.audience or "").strip().lower()
+        if normalized_audience:
+            if normalized_audience not in ALLOWED_PUSH_AUDIENCES:
+                raise ValueError("audience must be one of: all, authenticated, loyalty, active_esim")
+            self.audience = normalized_audience
+        has_any_target = bool(self.send_to_all_active or self.user_ids or self.tokens or normalized_audience)
         if not has_any_target:
-            raise ValueError("Provide at least one target: userIds, tokens, or sendToAllActive=true")
+            raise ValueError(
+                "Provide at least one target: audience, userIds, tokens, or sendToAllActive=true"
+            )
         return self
 
 
@@ -229,6 +239,20 @@ def _serialize_push_notification(row: PushNotification) -> dict[str, Any]:
         "sentAt": row.sent_at,
         "createdAt": row.created_at,
         "updatedAt": row.updated_at,
+    }
+
+def _serialize_last_campaign(row: PushNotification | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return {
+        "id": row.id,
+        "title": row.title,
+        "status": row.status,
+        "successCount": row.success_count,
+        "failureCount": row.failure_count,
+        "invalidTokenCount": row.invalid_token_count,
+        "sentAt": row.sent_at,
+        "createdAt": row.created_at,
     }
 
 
@@ -325,18 +349,37 @@ def register_push_notification_routes(
         store = SupabaseStore(db)
         requested_user_ids = [str(item).strip() for item in payload.user_ids if str(item).strip()]
         direct_tokens = [str(item).strip() for item in payload.tokens if str(item).strip()]
-        store_tokens: list[str] = []
+        audience = str(payload.audience or "").strip().lower()
+        if payload.send_to_all_active and not audience:
+            audience = "all"
+
+        audience_tokens: list[str] = []
+        audience_user_ids: list[str] = []
         recipient_scope = "direct_tokens"
-        if payload.send_to_all_active:
-            recipient_scope = "all_active_users"
-            store_tokens.extend(store.list_push_tokens(active_only=True))
-        elif requested_user_ids:
+        if audience:
+            audience_tokens, audience_user_ids = store.list_push_tokens_for_audience(
+                audience=audience,
+                limit=20000,
+            )
+            recipient_scope = f"audience:{audience}"
+
+        store_tokens: list[str] = []
+        if requested_user_ids:
             recipient_scope = "users"
             store_tokens.extend(store.list_push_tokens(user_ids=requested_user_ids, active_only=True))
+        if requested_user_ids and audience:
+            recipient_scope = "mixed"
         if requested_user_ids and direct_tokens:
             recipient_scope = "mixed"
+        if direct_tokens and audience:
+            recipient_scope = "mixed"
 
-        deduped_tokens = PushNotificationService._normalize_tokens([*direct_tokens, *store_tokens])
+        deduped_tokens = PushNotificationService._normalize_tokens(
+            [*direct_tokens, *audience_tokens, *store_tokens]
+        )
+        merged_target_user_ids = PushNotificationService._normalize_tokens(
+            [*audience_user_ids, *requested_user_ids]
+        )
         if not deduped_tokens:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -351,9 +394,14 @@ def register_push_notification_routes(
             channel_id=payload.channel_id or provider.default_channel_id,
             image_url=payload.image,
             sent_by_admin_id=admin_user.id,
-            target_user_ids=requested_user_ids,
+            target_user_ids=merged_target_user_ids,
             data_payload=payload.data,
-            provider_response={"requestedTokens": len(deduped_tokens)},
+            provider_response={
+                "requestedTokens": len(deduped_tokens),
+                "audience": audience or None,
+                "requestedUserIds": requested_user_ids,
+                "audienceUserIdsCount": len(audience_user_ids),
+            },
             status="queued",
         )
         db.flush()
@@ -365,7 +413,11 @@ def register_push_notification_routes(
                 success_count=len(deduped_tokens),
                 failure_count=0,
                 invalid_tokens=[],
-                provider_response={"dryRun": True, "requestedTokens": len(deduped_tokens)},
+                provider_response={
+                    "dryRun": True,
+                    "requestedTokens": len(deduped_tokens),
+                    "audience": audience or None,
+                },
             )
             db.commit()
             db.refresh(notification)
@@ -453,4 +505,23 @@ def register_push_notification_routes(
         return {
             "notifications": [_serialize_push_notification(item) for item in rows],
             "pagination": {"limit": limit, "offset": offset, "count": len(rows)},
+        }
+
+    @app.get("/api/v1/admin/push-notifications/summary")
+    async def get_push_notifications_summary(
+        provider: PushNotificationService = Depends(get_push_provider),
+        db: Session = Depends(get_db),
+        _: AdminUser = Depends(_require_admin_sender),
+    ) -> dict[str, Any]:
+        summary = SupabaseStore(db).get_push_notification_summary()
+        return {
+            "providerConfigured": provider.is_configured(),
+            "totalDevices": summary["totalDevices"],
+            "enabledDevices": summary["enabledDevices"],
+            "authenticatedDevices": summary["authenticatedDevices"],
+            "loyaltyDevices": summary["loyaltyDevices"],
+            "activeEsimDevices": summary["activeEsimDevices"],
+            "iosDevices": summary["iosDevices"],
+            "androidDevices": summary["androidDevices"],
+            "lastCampaign": _serialize_last_campaign(summary["lastCampaign"]),
         }

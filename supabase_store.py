@@ -21,6 +21,7 @@ from sqlalchemy import (
     UniqueConstraint,
     Uuid,
     create_engine,
+    func,
     or_,
     select,
 )
@@ -1049,6 +1050,147 @@ class SupabaseStore:
             seen.add(token)
             unique_tokens.append(token)
         return unique_tokens
+
+    def list_push_user_ids_for_audience(
+        self,
+        *,
+        audience: str,
+        limit: int = 20000,
+    ) -> list[str]:
+        normalized_audience = str(audience or "").strip().lower()
+        effective_limit = max(1, min(limit, 50000))
+        if normalized_audience not in {"authenticated", "loyalty", "active_esim"}:
+            return []
+
+        active_user_filters = [
+            AppUser.status == "active",
+            AppUser.deleted_at.is_(None),
+            AppUser.blocked_at.is_(None),
+        ]
+        query = select(AppUser.id).where(*active_user_filters)
+        if normalized_audience == "loyalty":
+            query = query.where(AppUser.is_loyalty.is_(True))
+        elif normalized_audience == "active_esim":
+            active_profile_statuses = {"active", "installed", "suspended"}
+            query = (
+                query.join(ESimProfile, ESimProfile.user_id == AppUser.id)
+                .where(
+                    or_(
+                        func.lower(ESimProfile.app_status).in_(active_profile_statuses),
+                        and_(
+                            ESimProfile.installed.is_(True),
+                            ESimProfile.canceled_at.is_(None),
+                            ESimProfile.refunded_at.is_(None),
+                            ESimProfile.revoked_at.is_(None),
+                        ),
+                    ),
+                    or_(ESimProfile.expires_at.is_(None), ESimProfile.expires_at > utcnow()),
+                )
+                .distinct()
+            )
+        user_ids = self.session.scalars(query.limit(effective_limit)).all()
+        return [str(item) for item in user_ids if str(item).strip()]
+
+    def list_push_tokens_for_audience(
+        self,
+        *,
+        audience: str,
+        limit: int = 10000,
+    ) -> tuple[list[str], list[str]]:
+        normalized_audience = str(audience or "").strip().lower()
+        if normalized_audience == "all":
+            return self.list_push_tokens(active_only=True, limit=limit), []
+        user_ids = self.list_push_user_ids_for_audience(audience=normalized_audience, limit=limit * 2)
+        tokens = self.list_push_tokens(user_ids=user_ids, active_only=True, limit=limit)
+        return tokens, user_ids
+
+    def get_push_notification_summary(self) -> dict[str, Any]:
+        active_user_filters = [
+            AppUser.status == "active",
+            AppUser.deleted_at.is_(None),
+            AppUser.blocked_at.is_(None),
+        ]
+        total_devices = int(
+            self.session.scalar(select(func.count(PushDevice.id)))
+            or 0
+        )
+        enabled_devices = int(
+            self.session.scalar(select(func.count(PushDevice.id)).where(PushDevice.active.is_(True)))
+            or 0
+        )
+        authenticated_devices = int(
+            self.session.scalar(
+                select(func.count(PushDevice.id))
+                .select_from(PushDevice)
+                .join(AppUser, PushDevice.user_id == AppUser.id)
+                .where(PushDevice.active.is_(True), *active_user_filters)
+            )
+            or 0
+        )
+        loyalty_devices = int(
+            self.session.scalar(
+                select(func.count(PushDevice.id))
+                .select_from(PushDevice)
+                .join(AppUser, PushDevice.user_id == AppUser.id)
+                .where(PushDevice.active.is_(True), *active_user_filters, AppUser.is_loyalty.is_(True))
+            )
+            or 0
+        )
+        active_profile_statuses = {"active", "installed", "suspended"}
+        active_esim_devices = int(
+            self.session.scalar(
+                select(func.count(func.distinct(PushDevice.id)))
+                .select_from(PushDevice)
+                .join(AppUser, PushDevice.user_id == AppUser.id)
+                .join(ESimProfile, ESimProfile.user_id == AppUser.id)
+                .where(
+                    PushDevice.active.is_(True),
+                    *active_user_filters,
+                    or_(
+                        func.lower(ESimProfile.app_status).in_(active_profile_statuses),
+                        and_(
+                            ESimProfile.installed.is_(True),
+                            ESimProfile.canceled_at.is_(None),
+                            ESimProfile.refunded_at.is_(None),
+                            ESimProfile.revoked_at.is_(None),
+                        ),
+                    ),
+                    or_(ESimProfile.expires_at.is_(None), ESimProfile.expires_at > utcnow()),
+                )
+            )
+            or 0
+        )
+        ios_devices = int(
+            self.session.scalar(
+                select(func.count(PushDevice.id)).where(
+                    PushDevice.active.is_(True),
+                    PushDevice.platform == "ios",
+                )
+            )
+            or 0
+        )
+        android_devices = int(
+            self.session.scalar(
+                select(func.count(PushDevice.id)).where(
+                    PushDevice.active.is_(True),
+                    PushDevice.platform == "android",
+                )
+            )
+            or 0
+        )
+        last_campaign = self.session.scalar(
+            select(PushNotification).order_by(PushNotification.created_at.desc()).limit(1)
+        )
+        return {
+            "totalDevices": total_devices,
+            "enabledDevices": enabled_devices,
+            "authenticatedDevices": authenticated_devices,
+            "loyaltyDevices": loyalty_devices,
+            "activeEsimDevices": active_esim_devices,
+            "iosDevices": ios_devices,
+            "androidDevices": android_devices,
+            "lastCampaign": last_campaign,
+        }
 
     def create_push_notification(
         self,

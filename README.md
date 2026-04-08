@@ -556,6 +556,7 @@ Admin delivery routes:
 
 - `POST /api/v1/admin/push-notifications/send`
 - `GET /api/v1/admin/push-notifications`
+- `GET /api/v1/admin/push-notifications/summary`
 
 ### Admin routes
 
@@ -954,6 +955,7 @@ Payload can include either `token`, `deviceId`, or both:
 {
   "title": "Order Update",
   "body": "Your eSIM is now active.",
+  "audience": "active_esim",
   "data": {
     "type": "order_status",
     "orderId": "123"
@@ -969,9 +971,14 @@ Payload can include either `token`, `deviceId`, or both:
 
 Targeting rules:
 
-- set `sendToAllActive=true` to broadcast all active tokens
-- set `userIds` to target specific users
-- set `tokens` for direct token targeting
+- `audience` is optional and supports:
+- `all`: all active push devices (same behavior as `sendToAllActive=true`)
+- `authenticated`: active devices owned by active authenticated app users
+- `loyalty`: active devices owned by active users with `is_loyalty=true`
+- `active_esim`: active devices owned by active users with at least one active/installed/suspended eSIM profile
+- set `sendToAllActive=true` for backward-compatible full broadcast behavior
+- set `userIds` to target specific users (can be combined with `audience`)
+- set `tokens` for direct token targeting (can be combined with `audience` and/or `userIds`)
 - route rejects request when no eligible tokens are found
 
 Delivery behavior:
@@ -980,9 +987,44 @@ Delivery behavior:
 - each send creates one `push_notifications` row with status:
 - `queued`, `dry_run`, `sent`, `partial`, or `failed`
 
+Send response schema includes:
+
+```json
+{
+  "notification": {
+    "id": "uuid",
+    "recipientScope": "audience:active_esim",
+    "status": "sent"
+  },
+  "delivery": {
+    "requestedTokens": 42,
+    "successCount": 41,
+    "failureCount": 1,
+    "invalidTokenCount": 1,
+    "invalidTokens": ["..."]
+  }
+}
+```
+
 ### Admin list delivery logs
 
 - `GET /api/v1/admin/push-notifications?limit=100&offset=0`
+
+### Admin push audience summary
+
+- `GET /api/v1/admin/push-notifications/summary`
+
+Response includes:
+
+- `providerConfigured`
+- `totalDevices`
+- `enabledDevices`
+- `authenticatedDevices`
+- `loyaltyDevices`
+- `activeEsimDevices`
+- `iosDevices`
+- `androidDevices`
+- `lastCampaign` (or `null` when no campaign yet)
 
 ### Frontend integration sequence
 

@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from auth import create_access_token
 from config import get_settings
 from push_notification import PushNotificationService, register_push_notification_routes
-from supabase_store import AdminUser, AppUser, Base, PushDevice, PushNotification
+from supabase_store import AdminUser, AppUser, Base, ESimProfile, PushDevice, PushNotification, SupabaseStore
 
 
 class _FakePushProvider(PushNotificationService):
@@ -94,6 +94,9 @@ class PushNotificationRoutesTest(unittest.TestCase):
         self.client = TestClient(app)
 
         self.user_id = str(uuid.uuid4())
+        self.loyalty_user_id = str(uuid.uuid4())
+        self.active_esim_user_id = str(uuid.uuid4())
+        self.blocked_user_id = str(uuid.uuid4())
         self.admin_id = str(uuid.uuid4())
         self.limited_admin_id = str(uuid.uuid4())
         with self.session_factory() as session:
@@ -103,6 +106,38 @@ class PushNotificationRoutesTest(unittest.TestCase):
                     phone="+9647700000100",
                     name="Push User",
                     status="active",
+                )
+            )
+            session.add(
+                AppUser(
+                    id=self.loyalty_user_id,
+                    phone="+9647700000103",
+                    name="Loyalty User",
+                    status="active",
+                    is_loyalty=True,
+                )
+            )
+            session.add(
+                AppUser(
+                    id=self.active_esim_user_id,
+                    phone="+9647700000104",
+                    name="eSIM User",
+                    status="active",
+                )
+            )
+            session.add(
+                AppUser(
+                    id=self.blocked_user_id,
+                    phone="+9647700000105",
+                    name="Blocked User",
+                    status="blocked",
+                )
+            )
+            session.add(
+                ESimProfile(
+                    user_id=self.active_esim_user_id,
+                    app_status="ACTIVE",
+                    installed=True,
                 )
             )
             session.add(
@@ -125,6 +160,12 @@ class PushNotificationRoutesTest(unittest.TestCase):
                     can_send_push=False,
                 )
             )
+            SupabaseStore(session).upsert_push_device(
+                user_id=self.blocked_user_id,
+                token="blocked-token",
+                platform="android",
+                device_id="blocked-device",
+            )
             session.commit()
 
         self.user_headers = {
@@ -143,6 +184,26 @@ class PushNotificationRoutesTest(unittest.TestCase):
                 subject_id=self.admin_id,
                 phone="+9647700000101",
                 subject_type="admin",
+                secret_key="test-auth-secret",
+                ttl_seconds=3600,
+            )
+        }
+        self.loyalty_user_headers = {
+            "Authorization": "Bearer "
+            + create_access_token(
+                subject_id=self.loyalty_user_id,
+                phone="+9647700000103",
+                subject_type="user",
+                secret_key="test-auth-secret",
+                ttl_seconds=3600,
+            )
+        }
+        self.active_esim_user_headers = {
+            "Authorization": "Bearer "
+            + create_access_token(
+                subject_id=self.active_esim_user_id,
+                phone="+9647700000104",
+                subject_type="user",
                 secret_key="test-auth-secret",
                 ttl_seconds=3600,
             )
@@ -210,6 +271,58 @@ class PushNotificationRoutesTest(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 422)
 
+    def test_admin_send_with_audience_loyalty(self) -> None:
+        self.client.post(
+            "/api/v1/push-notifications/devices/register",
+            json={"token": "normal-token", "platform": "android"},
+            headers=self.user_headers,
+        )
+        self.client.post(
+            "/api/v1/push-notifications/devices/register",
+            json={"token": "loyalty-token", "platform": "ios"},
+            headers=self.loyalty_user_headers,
+        )
+        response = self.client.post(
+            "/api/v1/admin/push-notifications/send",
+            json={
+                "title": "Loyalty Offer",
+                "body": "Special offer for loyalty users.",
+                "audience": "loyalty",
+            },
+            headers=self.admin_headers,
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["delivery"]["requestedTokens"], 1)
+        self.assertEqual(payload["delivery"]["successCount"], 1)
+        self.assertEqual(payload["notification"]["recipientScope"], "audience:loyalty")
+
+    def test_admin_send_with_audience_active_esim(self) -> None:
+        self.client.post(
+            "/api/v1/push-notifications/devices/register",
+            json={"token": "normal-token", "platform": "android"},
+            headers=self.user_headers,
+        )
+        self.client.post(
+            "/api/v1/push-notifications/devices/register",
+            json={"token": "esim-token", "platform": "android"},
+            headers=self.active_esim_user_headers,
+        )
+        response = self.client.post(
+            "/api/v1/admin/push-notifications/send",
+            json={
+                "title": "eSIM Alert",
+                "body": "Usage reminder for active eSIM users.",
+                "audience": "active_esim",
+            },
+            headers=self.admin_headers,
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["delivery"]["requestedTokens"], 1)
+        self.assertEqual(payload["delivery"]["successCount"], 1)
+        self.assertEqual(payload["notification"]["recipientScope"], "audience:active_esim")
+
     def test_admin_send_records_delivery_and_deactivates_invalid_tokens(self) -> None:
         self.client.post(
             "/api/v1/push-notifications/devices/register",
@@ -257,6 +370,59 @@ class PushNotificationRoutesTest(unittest.TestCase):
             headers=self.limited_admin_headers,
         )
         self.assertEqual(response.status_code, 403)
+
+    def test_admin_push_summary_endpoint(self) -> None:
+        self.client.post(
+            "/api/v1/push-notifications/devices/register",
+            json={"token": "token-user", "platform": "android"},
+            headers=self.user_headers,
+        )
+        self.client.post(
+            "/api/v1/push-notifications/devices/register",
+            json={"token": "token-loyalty", "platform": "ios"},
+            headers=self.loyalty_user_headers,
+        )
+        self.client.post(
+            "/api/v1/push-notifications/devices/register",
+            json={"token": "token-esim", "platform": "android"},
+            headers=self.active_esim_user_headers,
+        )
+
+        summary_before = self.client.get(
+            "/api/v1/admin/push-notifications/summary",
+            headers=self.admin_headers,
+        )
+        self.assertEqual(summary_before.status_code, 200)
+        before_payload = summary_before.json()
+        self.assertEqual(before_payload["providerConfigured"], True)
+        self.assertEqual(before_payload["totalDevices"], 4)
+        self.assertEqual(before_payload["enabledDevices"], 4)
+        self.assertEqual(before_payload["authenticatedDevices"], 3)
+        self.assertEqual(before_payload["loyaltyDevices"], 1)
+        self.assertEqual(before_payload["activeEsimDevices"], 1)
+        self.assertEqual(before_payload["iosDevices"], 1)
+        self.assertEqual(before_payload["androidDevices"], 3)
+        self.assertIsNone(before_payload["lastCampaign"])
+
+        send_response = self.client.post(
+            "/api/v1/admin/push-notifications/send",
+            json={
+                "title": "Broadcast",
+                "body": "Hello all active tokens.",
+                "sendToAllActive": True,
+            },
+            headers=self.admin_headers,
+        )
+        self.assertEqual(send_response.status_code, 200)
+
+        summary_after = self.client.get(
+            "/api/v1/admin/push-notifications/summary",
+            headers=self.admin_headers,
+        )
+        self.assertEqual(summary_after.status_code, 200)
+        after_payload = summary_after.json()
+        self.assertIsNotNone(after_payload["lastCampaign"])
+        self.assertEqual(after_payload["lastCampaign"]["title"], "Broadcast")
 
 
 if __name__ == "__main__":
