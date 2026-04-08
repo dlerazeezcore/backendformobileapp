@@ -396,6 +396,12 @@ class PushNotificationRoutesTest(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload.get("errorCode"), "NO_ELIGIBLE_PUSH_TOKENS")
         self.assertEqual(payload.get("requestedAudience"), "admins")
+        self.assertEqual(payload.get("requestedUserIdsCount"), 0)
+        self.assertEqual(payload.get("requestedTokensCount"), 0)
+        self.assertEqual(payload.get("matchedAudienceUserIdsCount"), 0)
+        self.assertEqual(payload.get("matchedAudienceTokensCount"), 0)
+        self.assertEqual(payload.get("matchedDirectUserTokensCount"), 0)
+        self.assertEqual(payload.get("totalDedupedTokens"), 0)
         self.assertEqual(payload.get("activeUserTokens"), 1)
         self.assertEqual(payload.get("activeAdminTokens"), 0)
         self.assertEqual(payload.get("eligibleTokensForRequestedAudience"), 0)
@@ -552,6 +558,41 @@ class PushNotificationRoutesTest(unittest.TestCase):
         after_payload = summary_after.json()
         self.assertIsNotNone(after_payload["lastCampaign"])
         self.assertEqual(after_payload["lastCampaign"]["title"], "Broadcast")
+
+    def test_admin_push_diagnostics_endpoint(self) -> None:
+        self.client.post(
+            "/api/v1/push-notifications/devices/register",
+            json={"token": "token-user", "platform": "android"},
+            headers=self.user_headers,
+        )
+        self.client.post(
+            "/api/v1/push-notifications/devices/register",
+            json={"token": "token-admin", "platform": "ios"},
+            headers=self.admin_headers,
+        )
+        response = self.client.get(
+            "/api/v1/admin/push-notifications/diagnostics",
+            headers=self.admin_headers,
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertIn("totalPushDevices", payload)
+        self.assertIn("activePushDevices", payload)
+        self.assertIn("activePushDevicesWithToken", payload)
+        self.assertIn("activePushDevicesByPlatform", payload)
+        self.assertIn("activePushDevicesWithUserId", payload)
+        self.assertIn("activePushDevicesWithoutUserId", payload)
+        self.assertIn("sampleLatestDevices", payload)
+        self.assertTrue(isinstance(payload["sampleLatestDevices"], list))
+        self.assertLessEqual(len(payload["sampleLatestDevices"]), 10)
+        if payload["sampleLatestDevices"]:
+            sample = payload["sampleLatestDevices"][0]
+            self.assertIn("id", sample)
+            self.assertIn("platform", sample)
+            self.assertIn("active", sample)
+            self.assertIn("tokenPrefix", sample)
+            self.assertIn("userId", sample)
+            self.assertIn("updatedAt", sample)
 
 
 if __name__ == "__main__":

@@ -423,6 +423,12 @@ def register_push_notification_routes(
                     "errorCode": "NO_ELIGIBLE_PUSH_TOKENS",
                     "message": "No eligible push tokens found for the selected targets.",
                     "requestedAudience": audience or None,
+                    "requestedUserIdsCount": len(requested_user_ids),
+                    "requestedTokensCount": len(direct_tokens),
+                    "matchedAudienceUserIdsCount": len(audience_user_ids),
+                    "matchedAudienceTokensCount": len(audience_tokens),
+                    "matchedDirectUserTokensCount": len(store_tokens),
+                    "totalDedupedTokens": len(deduped_tokens),
                     "activeUserTokens": store.count_active_push_tokens(subject_type="user"),
                     "activeAdminTokens": store.count_active_push_tokens(subject_type="admin"),
                     "eligibleTokensForRequestedAudience": len(deduped_tokens),
@@ -568,3 +574,10 @@ def register_push_notification_routes(
             "androidDevices": summary["androidDevices"],
             "lastCampaign": _serialize_last_campaign(summary["lastCampaign"]),
         }
+
+    @app.get("/api/v1/admin/push-notifications/diagnostics")
+    async def get_push_notifications_diagnostics(
+        db: Session = Depends(get_db),
+        _: AdminUser = Depends(_require_admin_sender),
+    ) -> dict[str, Any]:
+        return SupabaseStore(db).get_push_devices_diagnostics(sample_limit=10)

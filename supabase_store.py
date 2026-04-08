@@ -1289,6 +1289,95 @@ class SupabaseStore:
             "lastCampaign": last_campaign,
         }
 
+    @staticmethod
+    def _token_prefix(token: str, *, size: int = 8) -> str:
+        clean = str(token or "").strip()
+        if not clean:
+            return ""
+        prefix = clean[:size]
+        if len(clean) <= size:
+            return prefix
+        return f"{prefix}..."
+
+    def get_push_devices_diagnostics(self, *, sample_limit: int = 10) -> dict[str, Any]:
+        limit = max(1, min(sample_limit, 50))
+        total_push_devices = int(self.session.scalar(select(func.count(PushDevice.id))) or 0)
+        active_push_devices = int(
+            self.session.scalar(select(func.count(PushDevice.id)).where(PushDevice.active.is_(True))) or 0
+        )
+        active_push_devices_with_token = int(
+            self.session.scalar(
+                select(func.count(PushDevice.id)).where(
+                    PushDevice.active.is_(True),
+                    PushDevice.token.is_not(None),
+                    PushDevice.token != "",
+                )
+            )
+            or 0
+        )
+        active_ios_devices = int(
+            self.session.scalar(
+                select(func.count(PushDevice.id)).where(
+                    PushDevice.active.is_(True),
+                    PushDevice.platform == "ios",
+                )
+            )
+            or 0
+        )
+        active_android_devices = int(
+            self.session.scalar(
+                select(func.count(PushDevice.id)).where(
+                    PushDevice.active.is_(True),
+                    PushDevice.platform == "android",
+                )
+            )
+            or 0
+        )
+        active_with_user_id = int(
+            self.session.scalar(
+                select(func.count(PushDevice.id)).where(
+                    PushDevice.active.is_(True),
+                    PushDevice.user_id.is_not(None),
+                )
+            )
+            or 0
+        )
+        active_without_user_id = int(
+            self.session.scalar(
+                select(func.count(PushDevice.id)).where(
+                    PushDevice.active.is_(True),
+                    PushDevice.user_id.is_(None),
+                )
+            )
+            or 0
+        )
+        latest_rows = self.session.scalars(
+            select(PushDevice).order_by(PushDevice.updated_at.desc()).limit(limit)
+        ).all()
+        sample_latest_devices = [
+            {
+                "id": row.id,
+                "platform": row.platform,
+                "active": row.active,
+                "tokenPrefix": self._token_prefix(row.token),
+                "userId": row.user_id,
+                "updatedAt": row.updated_at,
+            }
+            for row in latest_rows
+        ]
+        return {
+            "totalPushDevices": total_push_devices,
+            "activePushDevices": active_push_devices,
+            "activePushDevicesWithToken": active_push_devices_with_token,
+            "activePushDevicesByPlatform": {
+                "ios": active_ios_devices,
+                "android": active_android_devices,
+            },
+            "activePushDevicesWithUserId": active_with_user_id,
+            "activePushDevicesWithoutUserId": active_without_user_id,
+            "sampleLatestDevices": sample_latest_devices,
+        }
+
     def create_push_notification(
         self,
         *,

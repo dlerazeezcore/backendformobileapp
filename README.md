@@ -557,6 +557,7 @@ Admin delivery routes:
 - `POST /api/v1/admin/push-notifications/send`
 - `GET /api/v1/admin/push-notifications`
 - `GET /api/v1/admin/push-notifications/summary`
+- `GET /api/v1/admin/push-notifications/diagnostics` (temporary diagnostics endpoint)
 
 ### Admin routes
 
@@ -1022,6 +1023,12 @@ No eligible audience response (`422`) includes diagnostics:
   "errorCode": "NO_ELIGIBLE_PUSH_TOKENS",
   "message": "No eligible push tokens found for the selected targets.",
   "requestedAudience": "admins",
+  "requestedUserIdsCount": 0,
+  "requestedTokensCount": 0,
+  "matchedAudienceUserIdsCount": 0,
+  "matchedAudienceTokensCount": 0,
+  "matchedDirectUserTokensCount": 0,
+  "totalDedupedTokens": 0,
   "activeUserTokens": 12,
   "activeAdminTokens": 0,
   "eligibleTokensForRequestedAudience": 0
@@ -1047,6 +1054,20 @@ Response includes:
 - `iosDevices`
 - `androidDevices`
 - `lastCampaign` (or `null` when no campaign yet)
+
+### Admin push diagnostics (temporary)
+
+- `GET /api/v1/admin/push-notifications/diagnostics`
+
+Returns:
+
+- `totalPushDevices`
+- `activePushDevices`
+- `activePushDevicesWithToken`
+- `activePushDevicesByPlatform` (`ios`, `android`)
+- `activePushDevicesWithUserId`
+- `activePushDevicesWithoutUserId`
+- `sampleLatestDevices` (last 10 devices with: `id`, `platform`, `active`, `tokenPrefix`, `userId`, `updatedAt`)
 
 ### Frontend integration sequence
 
