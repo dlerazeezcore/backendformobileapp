@@ -32,6 +32,7 @@ These must stay separate long term.
 - FastAPI as the HTTP backend
 - eSIM Access as the current provider integration
 - FIB payment gateway integration for payment create/status/cancel/refund
+- Firebase Cloud Messaging (FCM) integration for push notification delivery and device token lifecycle
 
 Not in scope yet:
 
@@ -77,6 +78,7 @@ Main runtime files:
 - [auth.py](/Users/laveencompany/Desktop/backendformobileapp/auth.py): login endpoints, password hashing helpers, and bearer-token helpers
 - [esim_access_api.py](/Users/laveencompany/Desktop/backendformobileapp/esim_access_api.py): all eSIM Access code, including provider client, request/response models, and eSIM routes
 - [fib_payment_api.py](/Users/laveencompany/Desktop/backendformobileapp/fib_payment_api.py): FIB payment client, models, webhook receiver route, and payment routes
+- [push_notification.py](/Users/laveencompany/Desktop/backendformobileapp/push_notification.py): push provider service, device registration routes, and admin send/list routes
 - [supabase_store.py](/Users/laveencompany/Desktop/backendformobileapp/supabase_store.py): SQLAlchemy models, persistence logic, pricing engine, sync logic
 
 Database migration files:
@@ -100,6 +102,7 @@ Current root-level split:
 - `admin.py`: admin operational, pricing, and reporting routes
 - `esim_access_api.py`: all provider-facing and managed eSIM logic
 - `fib_payment_api.py`: FIB provider-facing payment and callback logic
+- `push_notification.py`: push provider-facing delivery and token lifecycle logic
 - `config.py`, `dependencies.py`: shared application plumbing
 
 For now, keep these files in the project root and do not create subfolders unless the code volume clearly justifies it.
@@ -115,9 +118,11 @@ The backend is split into 4 layers:
    - admin routes in `admin.py`
    - eSIM routes in `esim_access_api.py`
    - FIB payment routes in `fib_payment_api.py`
+   - push notification routes in `push_notification.py`
 2. Provider layer
    - eSIM Access integration in `esim_access_api.py`
    - FIB payment integration in `fib_payment_api.py`
+   - Firebase push integration in `push_notification.py`
 3. Data layer
    - database models and business persistence in `supabase_store.py`
 4. Shared app plumbing
@@ -131,6 +136,7 @@ The backend is split into 4 layers:
 - initialize database access
 - initialize the eSIM provider client
 - initialize the FIB payment provider client (if env vars are configured)
+- initialize the push notification provider client
 - register route groups
 - define the health route
 - define global exception handlers
@@ -262,6 +268,16 @@ Application timestamps are managed in GMT+3 (Baghdad local time) for backend-gen
 
 - filtered request/response snapshots for debugging and traceability
 
+`push_devices`
+
+- app-user device token registry for FCM delivery
+- tracks `active` state and `last_seen_at` to keep targeting clean
+
+`push_notifications`
+
+- admin push send audit log and delivery summary
+- stores per-send counts for success, failure, and invalid tokens
+
 ## Pricing Design
 
 This backend is built so future admin changes do not alter old transactions.
@@ -347,6 +363,9 @@ ESIM_ACCESS_SECRET_KEY=your_secret_key
 FIB_PAYMENT_CLIENT_ID=your_fib_client_id
 FIB_PAYMENT_CLIENT_SECRET=your_fib_client_secret
 FIB_PAYMENT_WEBHOOK_SECRET=optional_webhook_secret
+FIREBASE_SERVICE_ACCOUNT_FILE=/absolute/path/to/firebase-service-account.json
+FIREBASE_SERVICE_ACCOUNT_JSON={"type":"service_account","project_id":"..."}
+PUSH_NOTIFICATION_DEFAULT_CHANNEL_ID=general
 DATABASE_URL=postgresql://USER:PASSWORD@HOST:PORT/DATABASE
 AUTH_SECRET_KEY=replace_with_a_long_random_secret
 AUTH_TOKEN_TTL_SECONDS=86400
@@ -358,6 +377,9 @@ Notes:
 - for Supabase, prefer the pooler connection string when the direct host is not reachable
 - if `FIB_PAYMENT_CLIENT_ID` and `FIB_PAYMENT_CLIENT_SECRET` are missing, FIB routes return `503` (integration disabled)
 - `FIB_PAYMENT_WEBHOOK_SECRET` is optional; set it when you want signed webhook validation
+- push notifications require either `FIREBASE_SERVICE_ACCOUNT_FILE` or `FIREBASE_SERVICE_ACCOUNT_JSON`
+- keep only one Firebase credential source set in production to avoid ambiguity
+- `PUSH_NOTIFICATION_DEFAULT_CHANNEL_ID` controls Android notification channel fallback (default `general`)
 - FIB runtime defaults are hardcoded in [app.py](/Users/laveencompany/Desktop/backendformobileapp/app.py):
   - `FIB_PAYMENT_BASE_URL = "https://fib.prod.fib.iq"`
   - `FIB_PAYMENT_TIMEOUT_SECONDS = 30`
@@ -522,6 +544,19 @@ These are the routes frontend should mainly use.
 - `POST /api/v1/esim-access/profiles/unsuspend/managed`
 - `POST /api/v1/esim-access/profiles/revoke/managed`
 
+### Push notification routes
+
+User token/device routes:
+
+- `POST /api/v1/push-notifications/devices/register`
+- `POST /api/v1/push-notifications/devices/unregister`
+- `GET /api/v1/push-notifications/devices`
+
+Admin delivery routes:
+
+- `POST /api/v1/admin/push-notifications/send`
+- `GET /api/v1/admin/push-notifications`
+
 ### Admin routes
 
 - All `/api/v1/admin/*` routes now require an authenticated **admin** bearer token.
@@ -572,15 +607,16 @@ Frontend should prefer the managed routes, not the raw passthrough routes.
 Recommended frontend usage:
 
 1. admin creates pricing rules, discount rules, exchange rates, and featured countries
-2. app queries package list from backend
-3. app creates payment attempt (FIB checkout or loyalty flow)
-4. backend receives webhook callbacks and app polls payment status when needed
-5. app submits managed order request after payment success
-6. backend calls eSIM Access
-7. backend saves user, customer order, order item, pricing snapshot, and lifecycle event
-8. backend links booking to payment attempt for reconciliation
-9. backend later syncs profile state and usage
-10. admin UI reads orders, order items, payment attempts, provider events, profiles, and lifecycle history
+2. app logs in and registers its push token/device with backend
+3. app queries package list from backend
+4. app creates payment attempt (FIB checkout or loyalty flow)
+5. backend receives webhook callbacks and app polls payment status when needed
+6. app submits managed order request after payment success
+7. backend calls eSIM Access
+8. backend saves user, customer order, order item, pricing snapshot, and lifecycle event
+9. backend links booking to payment attempt for reconciliation
+10. backend later syncs profile state and usage
+11. admin UI reads orders, order items, payment attempts, provider events, profiles, lifecycle history, and push delivery logs
 
 ### Create or update an app user
 
@@ -856,6 +892,106 @@ Receive webhook events from provider:
 
 - `POST /api/v1/esim-access/webhooks/events`
 - `POST /api/v1/esim-access/webhook/events` (alias)
+
+## Push Notification Integration
+
+Push delivery is implemented in:
+
+- [push_notification.py](/Users/laveencompany/Desktop/backendformobileapp/push_notification.py)
+
+Persistence is implemented in:
+
+- `push_devices` table: user device token lifecycle
+- `push_notifications` table: admin send request + delivery summary log
+
+### Authentication and authorization rules
+
+- app users must be authenticated to register/list/unregister their own tokens
+- admin send/list routes require admin authentication
+- admin sender must have `canSendPush = true` (or role `super_admin` / `owner`)
+
+### User device registration contract
+
+`POST /api/v1/push-notifications/devices/register`
+
+```json
+{
+  "token": "firebase_device_token",
+  "platform": "android",
+  "deviceId": "optional-device-id",
+  "appVersion": "1.0.0",
+  "locale": "en",
+  "timezone": "Asia/Baghdad",
+  "customFields": {
+    "buildNumber": "100"
+  }
+}
+```
+
+Rules:
+
+- `platform` must be one of `ios`, `android`, `web`
+- same token can be re-registered and will update the existing row
+- registration marks token as active and refreshes `lastSeenAt`
+
+### User device unregister contract
+
+`POST /api/v1/push-notifications/devices/unregister`
+
+Payload can include either `token`, `deviceId`, or both:
+
+```json
+{
+  "token": "firebase_device_token"
+}
+```
+
+### Admin send contract
+
+`POST /api/v1/admin/push-notifications/send`
+
+```json
+{
+  "title": "Order Update",
+  "body": "Your eSIM is now active.",
+  "data": {
+    "type": "order_status",
+    "orderId": "123"
+  },
+  "userIds": ["app-user-uuid"],
+  "tokens": [],
+  "sendToAllActive": false,
+  "channelId": "general",
+  "image": "https://example.com/banner.png",
+  "dryRun": false
+}
+```
+
+Targeting rules:
+
+- set `sendToAllActive=true` to broadcast all active tokens
+- set `userIds` to target specific users
+- set `tokens` for direct token targeting
+- route rejects request when no eligible tokens are found
+
+Delivery behavior:
+
+- invalid/unregistered FCM tokens are auto-marked inactive in `push_devices`
+- each send creates one `push_notifications` row with status:
+- `queued`, `dry_run`, `sent`, `partial`, or `failed`
+
+### Admin list delivery logs
+
+- `GET /api/v1/admin/push-notifications?limit=100&offset=0`
+
+### Frontend integration sequence
+
+1. user logs in and stores bearer token
+2. app gets FCM token from device OS
+3. app calls `POST /api/v1/push-notifications/devices/register`
+4. on logout or token rotation, app calls `POST /api/v1/push-notifications/devices/unregister` for old token
+5. admin panel sends campaign/transactional notification via admin send route
+6. frontend can read admin logs route to display delivery summary
 
 ## FIB Payment Integration
 

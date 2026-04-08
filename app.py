@@ -16,7 +16,7 @@ from config import (
     Settings,
     get_settings,
 )
-from dependencies import get_db, get_fib_provider, get_provider
+from dependencies import get_db, get_fib_provider, get_provider, get_push_provider
 from esim_access_api import (
     ESimAccessAPI,
     ESimAccessAPIError,
@@ -29,6 +29,7 @@ from fib_payment_api import (
     FIBPaymentHTTPError,
     register_fib_payment_routes,
 )
+from push_notification import PushNotificationService, register_push_notification_routes
 from supabase_store import create_database
 from users import register_user_routes
 
@@ -81,6 +82,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 default_redirect_uri=FIB_PAYMENT_REDIRECT_URI,
                 webhook_secret=cfg.fib_payment_webhook_secret or FIB_PAYMENT_WEBHOOK_SECRET,
             )
+        app.state.push_notification_service = PushNotificationService(
+            service_account_file=cfg.firebase_service_account_file,
+            service_account_json=cfg.firebase_service_account_json,
+            default_channel_id=cfg.push_notification_default_channel_id,
+        )
         yield
         await app.state.esim_access_api.close()
         if app.state.fib_payment_api is not None:
@@ -148,6 +154,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     register_auth_routes(app, get_db)
     register_esim_access_routes(app, get_db, get_provider)
     register_fib_payment_routes(app, get_fib_provider, get_db)
+    register_push_notification_routes(app, get_push_provider, get_db)
     register_admin_routes(app, get_db)
 
     return app

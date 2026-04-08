@@ -116,6 +116,7 @@ class AppUser(TimeMixin, Base):
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     customer_orders: Mapped[list["CustomerOrder"]] = relationship(back_populates="user")
     profiles: Mapped[list["ESimProfile"]] = relationship(back_populates="user")
+    push_devices: Mapped[list["PushDevice"]] = relationship(back_populates="user")
 
 
 class AdminUser(TimeMixin, Base):
@@ -138,6 +139,60 @@ class AdminUser(TimeMixin, Base):
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     custom_fields: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     payment_attempts: Mapped[list["PaymentAttempt"]] = relationship(back_populates="admin_user")
+    push_notifications: Mapped[list["PushNotification"]] = relationship(back_populates="sent_by_admin")
+
+
+class PushDevice(TimeMixin, Base):
+    __tablename__ = "push_devices"
+    __table_args__ = (
+        Index("ix_push_devices_user_active", "user_id", "active"),
+        Index("ix_push_devices_last_seen", "last_seen_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[str] = mapped_column(Uuid(as_uuid=False), ForeignKey("app_users.id", ondelete="CASCADE"), index=True)
+    token: Mapped[str] = mapped_column(String(512), unique=True)
+    platform: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    device_id: Mapped[str | None] = mapped_column(String(255), index=True)
+    app_version: Mapped[str | None] = mapped_column(String(64))
+    locale: Mapped[str | None] = mapped_column(String(32))
+    timezone_name: Mapped[str | None] = mapped_column(String(64))
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    custom_fields: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    user: Mapped[AppUser] = relationship(back_populates="push_devices")
+
+
+class PushNotification(TimeMixin, Base):
+    __tablename__ = "push_notifications"
+    __table_args__ = (
+        Index("ix_push_notifications_status_created", "status", "created_at"),
+        Index("ix_push_notifications_sender_created", "sent_by_admin_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(Uuid(as_uuid=False), primary_key=True, default=lambda: str(uuid.uuid4()))
+    recipient_scope: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    data_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    target_user_ids: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    channel_id: Mapped[str] = mapped_column(String(64), default="general", nullable=False)
+    image_url: Mapped[str | None] = mapped_column(Text)
+    provider: Mapped[str] = mapped_column(String(64), default="firebase_fcm", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="queued", nullable=False, index=True)
+    success_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    failure_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    invalid_token_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    invalid_tokens: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    provider_response: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    sent_by_admin_id: Mapped[str | None] = mapped_column(
+        Uuid(as_uuid=False),
+        ForeignKey("admin_users.id", ondelete="SET NULL"),
+        index=True,
+    )
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    sent_by_admin: Mapped[AdminUser | None] = relationship(back_populates="push_notifications")
 
 class ProviderFieldRule(TimeMixin, Base):
     __tablename__ = "provider_field_rules"
@@ -886,6 +941,190 @@ class SupabaseStore:
             event.payment_attempt_id = payment_attempt_id
         self.session.flush()
         return event
+
+    def upsert_push_device(
+        self,
+        *,
+        user_id: str,
+        token: str,
+        platform: str,
+        device_id: str | None = None,
+        app_version: str | None = None,
+        locale: str | None = None,
+        timezone_name: str | None = None,
+        custom_fields: dict[str, Any] | None = None,
+    ) -> PushDevice:
+        normalized_token = str(token or "").strip()
+        if not normalized_token:
+            raise ValueError("Push token is required.")
+        normalized_platform = str(platform or "").strip().lower()
+        if normalized_platform not in {"ios", "android", "web"}:
+            raise ValueError("Push platform must be one of: ios, android, web.")
+
+        row = self.session.scalar(select(PushDevice).where(PushDevice.token == normalized_token))
+        if row is None:
+            row = PushDevice(token=normalized_token, user_id=user_id, platform=normalized_platform)
+            self.session.add(row)
+        row.user_id = user_id
+        row.token = normalized_token
+        row.platform = normalized_platform
+        row.device_id = str(device_id or "").strip() or None
+        row.app_version = str(app_version or "").strip() or None
+        row.locale = str(locale or "").strip() or None
+        row.timezone_name = str(timezone_name or "").strip() or None
+        row.active = True
+        row.last_seen_at = utcnow()
+        row.custom_fields = custom_fields or {}
+        self.session.flush()
+        return row
+
+    def deactivate_push_devices(
+        self,
+        *,
+        user_id: str,
+        token: str | None = None,
+        device_id: str | None = None,
+    ) -> int:
+        filters = [PushDevice.user_id == user_id, PushDevice.active.is_(True)]
+        if token:
+            filters.append(PushDevice.token == str(token).strip())
+        if device_id:
+            filters.append(PushDevice.device_id == str(device_id).strip())
+        rows = self.session.scalars(select(PushDevice).where(*filters)).all()
+        for row in rows:
+            row.active = False
+            row.last_seen_at = utcnow()
+        self.session.flush()
+        return len(rows)
+
+    def deactivate_push_devices_by_tokens(self, tokens: list[str]) -> int:
+        normalized = [str(item).strip() for item in tokens if str(item or "").strip()]
+        if not normalized:
+            return 0
+        rows = self.session.scalars(select(PushDevice).where(PushDevice.token.in_(normalized))).all()
+        for row in rows:
+            row.active = False
+            row.last_seen_at = utcnow()
+        self.session.flush()
+        return len(rows)
+
+    def list_push_devices_for_user(
+        self,
+        *,
+        user_id: str,
+        active_only: bool = True,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[PushDevice]:
+        effective_limit = max(1, min(limit, 500))
+        effective_offset = max(0, offset)
+        query = select(PushDevice).where(PushDevice.user_id == user_id)
+        if active_only:
+            query = query.where(PushDevice.active.is_(True))
+        return self.session.scalars(
+            query.order_by(PushDevice.updated_at.desc()).offset(effective_offset).limit(effective_limit)
+        ).all()
+
+    def list_push_tokens(
+        self,
+        *,
+        user_ids: list[str] | None = None,
+        active_only: bool = True,
+        limit: int = 10000,
+    ) -> list[str]:
+        effective_limit = max(1, min(limit, 20000))
+        query = select(PushDevice.token)
+        if active_only:
+            query = query.where(PushDevice.active.is_(True))
+        if user_ids:
+            cleaned_user_ids = [str(item).strip() for item in user_ids if str(item).strip()]
+            if cleaned_user_ids:
+                query = query.where(PushDevice.user_id.in_(cleaned_user_ids))
+        tokens = self.session.scalars(query.limit(effective_limit)).all()
+        unique_tokens: list[str] = []
+        seen: set[str] = set()
+        for token in tokens:
+            if token in seen:
+                continue
+            seen.add(token)
+            unique_tokens.append(token)
+        return unique_tokens
+
+    def create_push_notification(
+        self,
+        *,
+        recipient_scope: str,
+        title: str,
+        body: str,
+        provider: str,
+        channel_id: str,
+        image_url: str | None = None,
+        sent_by_admin_id: str | None = None,
+        target_user_ids: list[str] | None = None,
+        data_payload: dict[str, Any] | None = None,
+        provider_response: dict[str, Any] | None = None,
+        status: str = "queued",
+    ) -> PushNotification:
+        row = PushNotification(
+            recipient_scope=str(recipient_scope or "").strip() or "direct_tokens",
+            title=str(title or "").strip(),
+            body=str(body or "").strip(),
+            provider=str(provider or "").strip() or "firebase_fcm",
+            channel_id=str(channel_id or "").strip() or "general",
+            image_url=str(image_url or "").strip() or None,
+            sent_by_admin_id=sent_by_admin_id,
+            target_user_ids=target_user_ids or [],
+            data_payload=data_payload or {},
+            provider_response=provider_response or {},
+            status=str(status or "").strip() or "queued",
+        )
+        self.session.add(row)
+        self.session.flush()
+        return row
+
+    def finalize_push_notification(
+        self,
+        *,
+        row: PushNotification,
+        status: str,
+        success_count: int | None = None,
+        failure_count: int | None = None,
+        invalid_tokens: list[str] | None = None,
+        provider_response: dict[str, Any] | None = None,
+        error_message: str | None = None,
+        sent_at: datetime | None = None,
+    ) -> PushNotification:
+        row.status = str(status or "").strip() or row.status
+        if success_count is not None:
+            row.success_count = max(int(success_count), 0)
+        if failure_count is not None:
+            row.failure_count = max(int(failure_count), 0)
+        if invalid_tokens is not None:
+            unique_invalid: list[str] = []
+            seen: set[str] = set()
+            for token in invalid_tokens:
+                value = str(token or "").strip()
+                if not value or value in seen:
+                    continue
+                seen.add(value)
+                unique_invalid.append(value)
+            row.invalid_tokens = unique_invalid
+            row.invalid_token_count = len(unique_invalid)
+        if provider_response is not None:
+            row.provider_response = provider_response
+        if error_message is not None:
+            row.error_message = error_message
+        if sent_at is not None:
+            row.sent_at = sent_at
+        self.session.flush()
+        return row
+
+    def list_push_notifications(self, *, limit: int = 100, offset: int = 0) -> list[PushNotification]:
+        effective_limit = max(1, min(limit, 500))
+        effective_offset = max(0, offset)
+        return self.session.scalars(
+            select(PushNotification).order_by(PushNotification.created_at.desc()).offset(effective_offset).limit(effective_limit)
+        ).all()
 
     def ensure_admin_user(
         self,
