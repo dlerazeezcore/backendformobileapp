@@ -75,7 +75,11 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         _: AdminUser = Depends(_require_admin_actor),
     ) -> dict[str, Any]:
         rows = SupabaseStore(db).list_rows(AppUser, exclude={"password_hash"}, limit=limit, offset=offset)
-        return {"users": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
+        normalized_rows = []
+        for row in rows:
+            user_id = row.get("id")
+            normalized_rows.append({**row, "userId": user_id})
+        return {"users": normalized_rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
 
     @app.post("/api/v1/admin/admin-users")
     async def save_admin_user(
