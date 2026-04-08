@@ -907,7 +907,11 @@ Persistence is implemented in:
 
 ### Authentication and authorization rules
 
-- app users must be authenticated to register/list/unregister their own tokens
+- app users and admin users can authenticate and call:
+- `POST /api/v1/push-notifications/devices/register`
+- `POST /api/v1/push-notifications/devices/unregister`
+- backend stores token owner type in `push_devices.custom_fields.subjectType` (`user` or `admin`)
+- `GET /api/v1/push-notifications/devices` remains user-scoped (app user token)
 - admin send/list routes require admin authentication
 - admin sender must have `canSendPush = true` (or role `super_admin` / `owner`)
 
@@ -980,6 +984,8 @@ Targeting rules:
 - set `userIds` to target specific users (can be combined with `audience`)
 - set `tokens` for direct token targeting (can be combined with `audience` and/or `userIds`)
 - route rejects request when no eligible tokens are found
+- push delivery is token-based, so users can receive notifications whether they are currently logged in or not logged in, as long as their device token is still active/valid
+- user-based campaigns (for example birthday notifications) should use `userIds` targeting from admin panel after selecting matching users
 
 Delivery behavior:
 

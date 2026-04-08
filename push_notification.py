@@ -202,9 +202,14 @@ class SendPushNotificationPayload(Model):
 
 
 def _serialize_push_device(row: PushDevice) -> dict[str, Any]:
+    subject_type = "user"
+    if isinstance(row.custom_fields, dict):
+        subject_type = str(row.custom_fields.get("subjectType") or "user").strip().lower() or "user"
     return {
         "id": row.id,
         "userId": row.user_id,
+        "adminUserId": row.admin_user_id,
+        "subjectType": subject_type,
         "token": row.token,
         "platform": row.platform,
         "deviceId": row.device_id,
@@ -269,6 +274,17 @@ def register_push_notification_routes(
         assert isinstance(row, AppUser)
         return row
 
+    async def _require_push_device_actor(
+        claims: dict[str, Any] = Depends(get_token_claims),
+        db: Session = Depends(get_db),
+    ) -> tuple[str, AppUser | AdminUser]:
+        row = require_active_subject(db, claims=claims)
+        assert isinstance(row, (AppUser, AdminUser))
+        subject_type = str(claims.get("typ") or "").strip().lower()
+        if subject_type not in {"user", "admin"}:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unsupported auth subject type")
+        return subject_type, row
+
     async def _require_admin_sender(
         claims: dict[str, Any] = Depends(get_token_claims),
         db: Session = Depends(get_db),
@@ -283,19 +299,25 @@ def register_push_notification_routes(
     async def register_push_device(
         payload: RegisterPushDevicePayload,
         db: Session = Depends(get_db),
-        user: AppUser = Depends(_require_user_actor),
+        actor: tuple[str, AppUser | AdminUser] = Depends(_require_push_device_actor),
     ) -> dict[str, Any]:
         store = SupabaseStore(db)
+        subject_type, subject_row = actor
+        user_id = subject_row.id if isinstance(subject_row, AppUser) else None
+        admin_user_id = subject_row.id if isinstance(subject_row, AdminUser) else None
+        custom_fields = dict(payload.custom_fields or {})
+        custom_fields["subjectType"] = subject_type
         try:
             row = store.upsert_push_device(
-                user_id=user.id,
+                user_id=user_id,
+                admin_user_id=admin_user_id,
                 token=payload.token,
                 platform=payload.platform,
                 device_id=payload.device_id,
                 app_version=payload.app_version,
                 locale=payload.locale,
                 timezone_name=payload.timezone_name,
-                custom_fields=payload.custom_fields,
+                custom_fields=custom_fields,
             )
         except ValueError as exc:
             raise HTTPException(
@@ -310,13 +332,23 @@ def register_push_notification_routes(
     async def unregister_push_device(
         payload: UnregisterPushDevicePayload,
         db: Session = Depends(get_db),
-        user: AppUser = Depends(_require_user_actor),
+        actor: tuple[str, AppUser | AdminUser] = Depends(_require_push_device_actor),
     ) -> dict[str, Any]:
-        affected = SupabaseStore(db).deactivate_push_devices(
-            user_id=user.id,
-            token=payload.token,
-            device_id=payload.device_id,
-        )
+        _, subject_row = actor
+        user_id = subject_row.id if isinstance(subject_row, AppUser) else None
+        admin_user_id = subject_row.id if isinstance(subject_row, AdminUser) else None
+        try:
+            affected = SupabaseStore(db).deactivate_push_devices(
+                user_id=user_id,
+                admin_user_id=admin_user_id,
+                token=payload.token,
+                device_id=payload.device_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=str(exc),
+            ) from exc
         db.commit()
         return {"updated": affected}
 

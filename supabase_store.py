@@ -117,7 +117,7 @@ class AppUser(TimeMixin, Base):
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     customer_orders: Mapped[list["CustomerOrder"]] = relationship(back_populates="user")
     profiles: Mapped[list["ESimProfile"]] = relationship(back_populates="user")
-    push_devices: Mapped[list["PushDevice"]] = relationship(back_populates="user")
+    push_devices: Mapped[list["PushDevice"]] = relationship(back_populates="user", foreign_keys="PushDevice.user_id")
 
 
 class AdminUser(TimeMixin, Base):
@@ -141,17 +141,37 @@ class AdminUser(TimeMixin, Base):
     custom_fields: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     payment_attempts: Mapped[list["PaymentAttempt"]] = relationship(back_populates="admin_user")
     push_notifications: Mapped[list["PushNotification"]] = relationship(back_populates="sent_by_admin")
+    push_devices: Mapped[list["PushDevice"]] = relationship(
+        back_populates="admin_user",
+        foreign_keys="PushDevice.admin_user_id",
+    )
 
 
 class PushDevice(TimeMixin, Base):
     __tablename__ = "push_devices"
     __table_args__ = (
+        CheckConstraint(
+            "(user_id IS NOT NULL AND admin_user_id IS NULL) OR (user_id IS NULL AND admin_user_id IS NOT NULL)",
+            name="ck_push_devices_has_owner",
+        ),
         Index("ix_push_devices_user_active", "user_id", "active"),
+        Index("ix_push_devices_admin_active", "admin_user_id", "active"),
         Index("ix_push_devices_last_seen", "last_seen_at"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[str] = mapped_column(Uuid(as_uuid=False), ForeignKey("app_users.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[str | None] = mapped_column(
+        Uuid(as_uuid=False),
+        ForeignKey("app_users.id", ondelete="CASCADE"),
+        index=True,
+        nullable=True,
+    )
+    admin_user_id: Mapped[str | None] = mapped_column(
+        Uuid(as_uuid=False),
+        ForeignKey("admin_users.id", ondelete="CASCADE"),
+        index=True,
+        nullable=True,
+    )
     token: Mapped[str] = mapped_column(String(512), unique=True)
     platform: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
     device_id: Mapped[str | None] = mapped_column(String(255), index=True)
@@ -161,7 +181,8 @@ class PushDevice(TimeMixin, Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     custom_fields: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
-    user: Mapped[AppUser] = relationship(back_populates="push_devices")
+    user: Mapped[AppUser | None] = relationship(back_populates="push_devices", foreign_keys=[user_id])
+    admin_user: Mapped[AdminUser | None] = relationship(back_populates="push_devices", foreign_keys=[admin_user_id])
 
 
 class PushNotification(TimeMixin, Base):
@@ -946,7 +967,8 @@ class SupabaseStore:
     def upsert_push_device(
         self,
         *,
-        user_id: str,
+        user_id: str | None = None,
+        admin_user_id: str | None = None,
         token: str,
         platform: str,
         device_id: str | None = None,
@@ -955,6 +977,10 @@ class SupabaseStore:
         timezone_name: str | None = None,
         custom_fields: dict[str, Any] | None = None,
     ) -> PushDevice:
+        has_user_owner = bool(user_id)
+        has_admin_owner = bool(admin_user_id)
+        if has_user_owner == has_admin_owner:
+            raise ValueError("Push device must be owned by exactly one subject (user or admin).")
         normalized_token = str(token or "").strip()
         if not normalized_token:
             raise ValueError("Push token is required.")
@@ -964,9 +990,10 @@ class SupabaseStore:
 
         row = self.session.scalar(select(PushDevice).where(PushDevice.token == normalized_token))
         if row is None:
-            row = PushDevice(token=normalized_token, user_id=user_id, platform=normalized_platform)
+            row = PushDevice(token=normalized_token, platform=normalized_platform)
             self.session.add(row)
         row.user_id = user_id
+        row.admin_user_id = admin_user_id
         row.token = normalized_token
         row.platform = normalized_platform
         row.device_id = str(device_id or "").strip() or None
@@ -982,11 +1009,20 @@ class SupabaseStore:
     def deactivate_push_devices(
         self,
         *,
-        user_id: str,
+        user_id: str | None = None,
+        admin_user_id: str | None = None,
         token: str | None = None,
         device_id: str | None = None,
     ) -> int:
-        filters = [PushDevice.user_id == user_id, PushDevice.active.is_(True)]
+        has_user_owner = bool(user_id)
+        has_admin_owner = bool(admin_user_id)
+        if has_user_owner == has_admin_owner:
+            raise ValueError("Push device deactivation requires exactly one subject owner.")
+        filters = [PushDevice.active.is_(True)]
+        if user_id is not None:
+            filters.append(PushDevice.user_id == user_id)
+        if admin_user_id is not None:
+            filters.append(PushDevice.admin_user_id == admin_user_id)
         if token:
             filters.append(PushDevice.token == str(token).strip())
         if device_id:
@@ -1031,20 +1067,24 @@ class SupabaseStore:
         *,
         user_ids: list[str] | None = None,
         active_only: bool = True,
+        include_admin: bool = False,
         limit: int = 10000,
     ) -> list[str]:
         effective_limit = max(1, min(limit, 20000))
-        query = select(PushDevice.token)
+        query = select(PushDevice)
         if active_only:
             query = query.where(PushDevice.active.is_(True))
+        if not include_admin:
+            query = query.where(PushDevice.user_id.is_not(None))
         if user_ids:
             cleaned_user_ids = [str(item).strip() for item in user_ids if str(item).strip()]
             if cleaned_user_ids:
                 query = query.where(PushDevice.user_id.in_(cleaned_user_ids))
-        tokens = self.session.scalars(query.limit(effective_limit)).all()
+        rows = self.session.scalars(query.limit(effective_limit)).all()
         unique_tokens: list[str] = []
         seen: set[str] = set()
-        for token in tokens:
+        for row in rows:
+            token = row.token
             if token in seen:
                 continue
             seen.add(token)

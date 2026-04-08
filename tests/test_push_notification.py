@@ -271,6 +271,64 @@ class PushNotificationRoutesTest(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 422)
 
+    def test_admin_token_register_and_unregister_push_device(self) -> None:
+        register_response = self.client.post(
+            "/api/v1/push-notifications/devices/register",
+            json={
+                "token": "admin-token-1",
+                "platform": "ios",
+                "deviceId": "admin-device-1",
+            },
+            headers=self.admin_headers,
+        )
+        self.assertEqual(register_response.status_code, 200)
+        device_payload = register_response.json()["device"]
+        self.assertEqual(device_payload["token"], "admin-token-1")
+        self.assertEqual(device_payload["customFields"]["subjectType"], "admin")
+
+        unregister_response = self.client.post(
+            "/api/v1/push-notifications/devices/unregister",
+            json={"token": "admin-token-1"},
+            headers=self.admin_headers,
+        )
+        self.assertEqual(unregister_response.status_code, 200)
+        self.assertEqual(unregister_response.json().get("updated"), 1)
+
+        with self.session_factory() as session:
+            row = session.scalar(select(PushDevice).where(PushDevice.token == "admin-token-1"))
+            self.assertIsNotNone(row)
+            assert row is not None
+            self.assertEqual(row.active, False)
+            self.assertEqual(row.admin_user_id, self.admin_id)
+            self.assertIsNone(row.user_id)
+
+    def test_send_to_all_active_excludes_admin_registered_devices(self) -> None:
+        self.client.post(
+            "/api/v1/push-notifications/devices/register",
+            json={"token": "user-token-only", "platform": "android"},
+            headers=self.user_headers,
+        )
+        self.client.post(
+            "/api/v1/push-notifications/devices/register",
+            json={"token": "admin-token-only", "platform": "ios"},
+            headers=self.admin_headers,
+        )
+        response = self.client.post(
+            "/api/v1/admin/push-notifications/send",
+            json={
+                "title": "All active users",
+                "body": "User audience only.",
+                "sendToAllActive": True,
+            },
+            headers=self.admin_headers,
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        # Baseline test fixture already has one active blocked-user token.
+        # Expect exactly 2 user-owned tokens (blocked + newly registered), not admin token.
+        self.assertEqual(payload["delivery"]["requestedTokens"], 2)
+        self.assertEqual(payload["delivery"]["successCount"], 2)
+
     def test_admin_send_with_audience_loyalty(self) -> None:
         self.client.post(
             "/api/v1/push-notifications/devices/register",
