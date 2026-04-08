@@ -14,6 +14,7 @@ from config import get_settings
 from supabase_store import AdminUser, AppUser, PushDevice, PushNotification, SupabaseStore, utcnow
 
 ALLOWED_PUSH_AUDIENCES = {"all", "authenticated", "loyalty", "active_esim", "admins", "all_devices"}
+ALLOWED_APP_UPDATE_AUDIENCES = {"all", "authenticated", "loyalty", "active_esim", "all_devices"}
 
 try:
     import firebase_admin
@@ -202,6 +203,38 @@ class SendPushNotificationPayload(Model):
             raise ValueError(
                 "Provide at least one target: audience, userIds, tokens, or sendToAllActive=true"
             )
+        return self
+
+
+class SendAppUpdateNotificationPayload(Model):
+    app_store_url: str = Field(alias="appStoreUrl", min_length=1)
+    play_store_url: str = Field(alias="playStoreUrl", min_length=1)
+    title: str = Field(default="Update Available", min_length=1, max_length=255)
+    body: str = Field(
+        default="A new version is available. Please update to continue with the best experience.",
+        min_length=1,
+        max_length=2000,
+    )
+    audience: str = Field(default="all")
+    data: dict[str, Any] = Field(default_factory=dict)
+    channel_id: str | None = Field(default=None, alias="channelId")
+    image: str | None = None
+    dry_run: bool = Field(default=False, alias="dryRun")
+
+    @model_validator(mode="after")
+    def validate_payload(self) -> "SendAppUpdateNotificationPayload":
+        normalized_audience = str(self.audience or "").strip().lower()
+        if normalized_audience not in ALLOWED_APP_UPDATE_AUDIENCES:
+            raise ValueError("audience must be one of: all, authenticated, loyalty, active_esim, all_devices")
+        self.audience = normalized_audience
+        app_store_url = str(self.app_store_url or "").strip()
+        play_store_url = str(self.play_store_url or "").strip()
+        if not app_store_url.lower().startswith(("https://", "http://")):
+            raise ValueError("appStoreUrl must be a valid URL.")
+        if not play_store_url.lower().startswith(("https://", "http://")):
+            raise ValueError("playStoreUrl must be a valid URL.")
+        self.app_store_url = app_store_url
+        self.play_store_url = play_store_url
         return self
 
 
@@ -554,6 +587,39 @@ def register_push_notification_routes(
                 "invalidTokens": invalid_tokens,
             },
         }
+
+    @app.post("/api/esim-app/push/admin/send-app-update", response_model=None)
+    @app.post("/api/v1/admin/push-notifications/send-app-update", response_model=None)
+    async def send_app_update_notification(
+        payload: SendAppUpdateNotificationPayload,
+        provider: PushNotificationService = Depends(get_push_provider),
+        db: Session = Depends(get_db),
+        admin_user: AdminUser = Depends(_require_admin_sender),
+    ) -> Any:
+        merged_data = dict(payload.data or {})
+        merged_data.update(
+            {
+                "type": "app_update",
+                "action": "open_store_update",
+                "appStoreUrl": payload.app_store_url,
+                "playStoreUrl": payload.play_store_url,
+            }
+        )
+        send_payload = SendPushNotificationPayload(
+            title=payload.title,
+            body=payload.body,
+            data=merged_data,
+            audience=payload.audience,
+            channel_id=payload.channel_id,
+            image=payload.image,
+            dry_run=payload.dry_run,
+        )
+        return await send_push_notification(
+            payload=send_payload,
+            provider=provider,
+            db=db,
+            admin_user=admin_user,
+        )
 
     @app.get("/api/v1/admin/push-notifications")
     async def list_push_notifications(

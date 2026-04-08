@@ -555,7 +555,9 @@ User token/device routes:
 Admin delivery routes:
 
 - `POST /api/v1/admin/push-notifications/send`
+- `POST /api/v1/admin/push-notifications/send-app-update` (ready-made app update campaign)
 - `POST /api/esim-app/push/admin/send` (legacy alias, same behavior)
+- `POST /api/esim-app/push/admin/send-app-update` (legacy alias, same behavior)
 - `GET /api/v1/admin/push-notifications`
 - `GET /api/v1/admin/push-notifications/summary`
 - `GET /api/v1/admin/push-notifications/diagnostics` (temporary diagnostics endpoint)
@@ -995,6 +997,37 @@ Targeting rules:
 - route rejects request when no eligible tokens are found
 - push delivery is token-based, so users can receive notifications whether they are currently logged in or not logged in, as long as their device token is still active/valid
 - user-based campaigns (for example birthday notifications) should use `userIds` targeting from admin panel after selecting matching users
+
+### Admin app update send contract (ready campaign)
+
+`POST /api/v1/admin/push-notifications/send-app-update`
+
+```json
+{
+  "title": "Update Available",
+  "body": "A new version is available. Please update now.",
+  "appStoreUrl": "https://apps.apple.com/app/id123456789",
+  "playStoreUrl": "https://play.google.com/store/apps/details?id=com.example.app",
+  "audience": "all",
+  "dryRun": false
+}
+```
+
+Behavior:
+
+- backend injects structured data payload:
+- `type = app_update`
+- `action = open_store_update`
+- `appStoreUrl`
+- `playStoreUrl`
+- use this endpoint for one-click admin panel "update app" campaigns
+- supported audiences for this endpoint: `all`, `authenticated`, `loyalty`, `active_esim`, `all_devices`
+
+Frontend tap handling requirement:
+
+- on push-tap, if `data.type == app_update`, open:
+- `appStoreUrl` for iOS
+- `playStoreUrl` for Android
 
 Delivery behavior:
 

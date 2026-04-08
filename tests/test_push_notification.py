@@ -433,6 +433,36 @@ class PushNotificationRoutesTest(unittest.TestCase):
         self.assertEqual(payload["delivery"]["successCount"], 3)
         self.assertEqual(payload["notification"]["recipientScope"], "audience:all_devices")
 
+    def test_admin_send_app_update_notification(self) -> None:
+        self.client.post(
+            "/api/v1/push-notifications/devices/register",
+            json={"token": "anon-token-update", "platform": "ios"},
+        )
+        response = self.client.post(
+            "/api/v1/admin/push-notifications/send-app-update",
+            json={
+                "title": "Update Tulip",
+                "body": "A new update is available.",
+                "appStoreUrl": "https://apps.apple.com/app/id000000000",
+                "playStoreUrl": "https://play.google.com/store/apps/details?id=com.tulip.app",
+                "audience": "all",
+            },
+            headers=self.admin_headers,
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertGreaterEqual(payload["delivery"]["requestedTokens"], 1)
+        self.assertEqual(payload["notification"]["recipientScope"], "audience:all")
+        self.assertEqual(len(self.provider.sent_payloads), 1)
+        sent_data = self.provider.sent_payloads[0]["data"]
+        self.assertEqual(sent_data.get("type"), "app_update")
+        self.assertEqual(sent_data.get("action"), "open_store_update")
+        self.assertEqual(sent_data.get("appStoreUrl"), "https://apps.apple.com/app/id000000000")
+        self.assertEqual(
+            sent_data.get("playStoreUrl"),
+            "https://play.google.com/store/apps/details?id=com.tulip.app",
+        )
+
     def test_no_eligible_tokens_returns_diagnostics(self) -> None:
         response = self.client.post(
             "/api/v1/admin/push-notifications/send",
