@@ -976,10 +976,12 @@ Payload can include either `token`, `deviceId`, or both:
 Targeting rules:
 
 - `audience` is optional and supports:
-- `all`: all active push devices (same behavior as `sendToAllActive=true`)
+- `all`: active **user-owned** push devices only (same behavior as `sendToAllActive=true`)
 - `authenticated`: active devices owned by active authenticated app users
 - `loyalty`: active devices owned by active users with `is_loyalty=true`
 - `active_esim`: active devices owned by active users with at least one active/installed/suspended eSIM profile
+- `admins`: active **admin-owned** push devices only (testing/ops audience)
+- `all_devices`: active user-owned + admin-owned push devices
 - set `sendToAllActive=true` for backward-compatible full broadcast behavior
 - set `userIds` to target specific users (can be combined with `audience`)
 - set `tokens` for direct token targeting (can be combined with `audience` and/or `userIds`)
@@ -1009,6 +1011,20 @@ Send response schema includes:
     "invalidTokenCount": 1,
     "invalidTokens": ["..."]
   }
+}
+```
+
+No eligible audience response (`422`) includes diagnostics:
+
+```json
+{
+  "success": false,
+  "errorCode": "NO_ELIGIBLE_PUSH_TOKENS",
+  "message": "No eligible push tokens found for the selected targets.",
+  "requestedAudience": "admins",
+  "activeUserTokens": 12,
+  "activeAdminTokens": 0,
+  "eligibleTokensForRequestedAudience": 0
 }
 ```
 

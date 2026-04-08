@@ -329,6 +329,77 @@ class PushNotificationRoutesTest(unittest.TestCase):
         self.assertEqual(payload["delivery"]["requestedTokens"], 2)
         self.assertEqual(payload["delivery"]["successCount"], 2)
 
+    def test_admin_send_with_audience_admins(self) -> None:
+        self.client.post(
+            "/api/v1/push-notifications/devices/register",
+            json={"token": "admin-token-only", "platform": "ios"},
+            headers=self.admin_headers,
+        )
+        self.client.post(
+            "/api/v1/push-notifications/devices/register",
+            json={"token": "user-token-only", "platform": "android"},
+            headers=self.user_headers,
+        )
+        response = self.client.post(
+            "/api/v1/admin/push-notifications/send",
+            json={
+                "title": "Admin test",
+                "body": "Admin-only audience delivery.",
+                "audience": "admins",
+            },
+            headers=self.admin_headers,
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["delivery"]["requestedTokens"], 1)
+        self.assertEqual(payload["delivery"]["successCount"], 1)
+        self.assertEqual(payload["notification"]["recipientScope"], "audience:admins")
+
+    def test_admin_send_with_audience_all_devices(self) -> None:
+        self.client.post(
+            "/api/v1/push-notifications/devices/register",
+            json={"token": "admin-token-only", "platform": "ios"},
+            headers=self.admin_headers,
+        )
+        self.client.post(
+            "/api/v1/push-notifications/devices/register",
+            json={"token": "user-token-only", "platform": "android"},
+            headers=self.user_headers,
+        )
+        response = self.client.post(
+            "/api/v1/admin/push-notifications/send",
+            json={
+                "title": "All devices test",
+                "body": "Both admin and user devices.",
+                "audience": "all_devices",
+            },
+            headers=self.admin_headers,
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        # Baseline includes blocked-user token + user-token-only + admin-token-only.
+        self.assertEqual(payload["delivery"]["requestedTokens"], 3)
+        self.assertEqual(payload["delivery"]["successCount"], 3)
+        self.assertEqual(payload["notification"]["recipientScope"], "audience:all_devices")
+
+    def test_no_eligible_tokens_returns_diagnostics(self) -> None:
+        response = self.client.post(
+            "/api/v1/admin/push-notifications/send",
+            json={
+                "title": "Admin dry",
+                "body": "No admin tokens yet.",
+                "audience": "admins",
+            },
+            headers=self.admin_headers,
+        )
+        self.assertEqual(response.status_code, 422)
+        payload = response.json()
+        self.assertEqual(payload.get("errorCode"), "NO_ELIGIBLE_PUSH_TOKENS")
+        self.assertEqual(payload.get("requestedAudience"), "admins")
+        self.assertEqual(payload.get("activeUserTokens"), 1)
+        self.assertEqual(payload.get("activeAdminTokens"), 0)
+        self.assertEqual(payload.get("eligibleTokensForRequestedAudience"), 0)
+
     def test_admin_send_with_audience_loyalty(self) -> None:
         self.client.post(
             "/api/v1/push-notifications/devices/register",

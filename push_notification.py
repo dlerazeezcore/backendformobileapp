@@ -5,13 +5,14 @@ from functools import lru_cache
 from typing import Any, Callable, Iterable
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.orm import Session
 
 from auth import get_token_claims, require_active_subject
 from supabase_store import AdminUser, AppUser, PushDevice, PushNotification, SupabaseStore, utcnow
 
-ALLOWED_PUSH_AUDIENCES = {"all", "authenticated", "loyalty", "active_esim"}
+ALLOWED_PUSH_AUDIENCES = {"all", "authenticated", "loyalty", "active_esim", "admins", "all_devices"}
 
 try:
     import firebase_admin
@@ -191,7 +192,9 @@ class SendPushNotificationPayload(Model):
         normalized_audience = str(self.audience or "").strip().lower()
         if normalized_audience:
             if normalized_audience not in ALLOWED_PUSH_AUDIENCES:
-                raise ValueError("audience must be one of: all, authenticated, loyalty, active_esim")
+                raise ValueError(
+                    "audience must be one of: all, authenticated, loyalty, active_esim, admins, all_devices"
+                )
             self.audience = normalized_audience
         has_any_target = bool(self.send_to_all_active or self.user_ids or self.tokens or normalized_audience)
         if not has_any_target:
@@ -413,9 +416,17 @@ def register_push_notification_routes(
             [*audience_user_ids, *requested_user_ids]
         )
         if not deduped_tokens:
-            raise HTTPException(
+            return JSONResponse(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail="No eligible push tokens found for the selected targets.",
+                content={
+                    "success": False,
+                    "errorCode": "NO_ELIGIBLE_PUSH_TOKENS",
+                    "message": "No eligible push tokens found for the selected targets.",
+                    "requestedAudience": audience or None,
+                    "activeUserTokens": store.count_active_push_tokens(subject_type="user"),
+                    "activeAdminTokens": store.count_active_push_tokens(subject_type="admin"),
+                    "eligibleTokensForRequestedAudience": len(deduped_tokens),
+                },
             )
 
         notification = store.create_push_notification(

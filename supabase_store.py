@@ -1091,6 +1091,59 @@ class SupabaseStore:
             unique_tokens.append(token)
         return unique_tokens
 
+    def list_admin_push_tokens(
+        self,
+        *,
+        active_only: bool = True,
+        limit: int = 10000,
+    ) -> list[str]:
+        effective_limit = max(1, min(limit, 20000))
+        query = select(PushDevice).where(PushDevice.admin_user_id.is_not(None))
+        if active_only:
+            query = query.where(PushDevice.active.is_(True))
+        rows = self.session.scalars(query.limit(effective_limit)).all()
+        unique_tokens: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            token = row.token
+            if token in seen:
+                continue
+            seen.add(token)
+            unique_tokens.append(token)
+        return unique_tokens
+
+    def list_all_push_tokens(
+        self,
+        *,
+        active_only: bool = True,
+        limit: int = 10000,
+    ) -> list[str]:
+        effective_limit = max(1, min(limit, 20000))
+        query = select(PushDevice)
+        if active_only:
+            query = query.where(PushDevice.active.is_(True))
+        rows = self.session.scalars(query.limit(effective_limit)).all()
+        unique_tokens: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            token = row.token
+            if token in seen:
+                continue
+            seen.add(token)
+            unique_tokens.append(token)
+        return unique_tokens
+
+    def count_active_push_tokens(self, *, subject_type: str) -> int:
+        normalized_subject_type = str(subject_type or "").strip().lower()
+        query = select(func.count(PushDevice.id)).where(PushDevice.active.is_(True))
+        if normalized_subject_type == "user":
+            query = query.where(PushDevice.user_id.is_not(None))
+        elif normalized_subject_type == "admin":
+            query = query.where(PushDevice.admin_user_id.is_not(None))
+        else:
+            raise ValueError("subject_type must be either 'user' or 'admin'")
+        return int(self.session.scalar(query) or 0)
+
     def list_push_user_ids_for_audience(
         self,
         *,
@@ -1140,6 +1193,10 @@ class SupabaseStore:
         normalized_audience = str(audience or "").strip().lower()
         if normalized_audience == "all":
             return self.list_push_tokens(active_only=True, limit=limit), []
+        if normalized_audience == "admins":
+            return self.list_admin_push_tokens(active_only=True, limit=limit), []
+        if normalized_audience == "all_devices":
+            return self.list_all_push_tokens(active_only=True, limit=limit), []
         user_ids = self.list_push_user_ids_for_audience(audience=normalized_audience, limit=limit * 2)
         tokens = self.list_push_tokens(user_ids=user_ids, active_only=True, limit=limit)
         return tokens, user_ids
