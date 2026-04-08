@@ -904,7 +904,7 @@ Push delivery is implemented in:
 
 Persistence is implemented in:
 
-- `push_devices` table: user device token lifecycle
+- `push_devices` table: user/admin/anonymous device token lifecycle
 - `push_notifications` table: admin send request + delivery summary log
 
 ### Authentication and authorization rules
@@ -912,7 +912,8 @@ Persistence is implemented in:
 - app users and admin users can authenticate and call:
 - `POST /api/v1/push-notifications/devices/register`
 - `POST /api/v1/push-notifications/devices/unregister`
-- backend stores token owner type in `push_devices.custom_fields.subjectType` (`user` or `admin`)
+- register/unregister also support no bearer token (anonymous device mode)
+- backend stores token owner type in `push_devices.custom_fields.subjectType` (`anonymous`, `user`, or `admin`)
 - `GET /api/v1/push-notifications/devices` remains user-scoped (app user token)
 - admin send/list routes require admin authentication
 - admin sender must have `canSendPush = true` (or role `super_admin` / `owner`)
@@ -940,6 +941,10 @@ Rules:
 - `platform` must be one of `ios`, `android`, `web`
 - same token can be re-registered and will update the existing row
 - registration marks token as active and refreshes `lastSeenAt`
+- bearer token is optional:
+- with app-user token: device is linked to `user_id`
+- with admin token: device is linked to `admin_user_id`
+- without token: device is saved as anonymous (eligible for non-admin broadcasts)
 
 ### User device unregister contract
 
@@ -978,12 +983,12 @@ Payload can include either `token`, `deviceId`, or both:
 Targeting rules:
 
 - `audience` is optional and supports:
-- `all`: active **user-owned** push devices only (same behavior as `sendToAllActive=true`)
+- `all`: active non-admin devices (`user` + `anonymous`) (same behavior as `sendToAllActive=true`)
 - `authenticated`: active devices owned by active authenticated app users
 - `loyalty`: active devices owned by active users with `is_loyalty=true`
 - `active_esim`: active devices owned by active users with at least one active/installed/suspended eSIM profile
 - `admins`: active **admin-owned** push devices only (testing/ops audience)
-- `all_devices`: active user-owned + admin-owned push devices
+- `all_devices`: active `user` + `anonymous` + `admin` devices
 - set `sendToAllActive=true` for backward-compatible full broadcast behavior
 - set `userIds` to target specific users (can be combined with `audience`)
 - set `tokens` for direct token targeting (can be combined with `audience` and/or `userIds`)
@@ -1072,10 +1077,10 @@ Returns:
 
 ### Frontend integration sequence
 
-1. user logs in and stores bearer token
-2. app gets FCM token from device OS
-3. app calls `POST /api/v1/push-notifications/devices/register`
-4. on logout or token rotation, app calls `POST /api/v1/push-notifications/devices/unregister` for old token
+1. app gets FCM token from device OS
+2. app calls `POST /api/v1/push-notifications/devices/register`
+3. include bearer token when available; anonymous register is supported when not logged in
+4. on token rotation, app calls `POST /api/v1/push-notifications/devices/unregister` for old token
 5. admin panel sends campaign/transactional notification via admin send route
 6. frontend can read admin logs route to display delivery summary
 

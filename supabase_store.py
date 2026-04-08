@@ -151,7 +151,9 @@ class PushDevice(TimeMixin, Base):
     __tablename__ = "push_devices"
     __table_args__ = (
         CheckConstraint(
-            "(user_id IS NOT NULL AND admin_user_id IS NULL) OR (user_id IS NULL AND admin_user_id IS NOT NULL)",
+            "(user_id IS NOT NULL AND admin_user_id IS NULL) OR "
+            "(user_id IS NULL AND admin_user_id IS NOT NULL) OR "
+            "(user_id IS NULL AND admin_user_id IS NULL)",
             name="ck_push_devices_has_owner",
         ),
         Index("ix_push_devices_user_active", "user_id", "active"),
@@ -979,8 +981,8 @@ class SupabaseStore:
     ) -> PushDevice:
         has_user_owner = bool(user_id)
         has_admin_owner = bool(admin_user_id)
-        if has_user_owner == has_admin_owner:
-            raise ValueError("Push device must be owned by exactly one subject (user or admin).")
+        if has_user_owner and has_admin_owner:
+            raise ValueError("Push device cannot be owned by both user and admin.")
         normalized_token = str(token or "").strip()
         if not normalized_token:
             raise ValueError("Push token is required.")
@@ -1016,13 +1018,39 @@ class SupabaseStore:
     ) -> int:
         has_user_owner = bool(user_id)
         has_admin_owner = bool(admin_user_id)
-        if has_user_owner == has_admin_owner:
+        if not has_user_owner and not has_admin_owner:
+            raise ValueError("Push device deactivation requires at least one subject owner.")
+        if has_user_owner and has_admin_owner:
             raise ValueError("Push device deactivation requires exactly one subject owner.")
         filters = [PushDevice.active.is_(True)]
         if user_id is not None:
             filters.append(PushDevice.user_id == user_id)
         if admin_user_id is not None:
             filters.append(PushDevice.admin_user_id == admin_user_id)
+        if token:
+            filters.append(PushDevice.token == str(token).strip())
+        if device_id:
+            filters.append(PushDevice.device_id == str(device_id).strip())
+        rows = self.session.scalars(select(PushDevice).where(*filters)).all()
+        for row in rows:
+            row.active = False
+            row.last_seen_at = utcnow()
+        self.session.flush()
+        return len(rows)
+
+    def deactivate_push_devices_public(
+        self,
+        *,
+        token: str | None = None,
+        device_id: str | None = None,
+    ) -> int:
+        if not token and not device_id:
+            raise ValueError("Either token or deviceId is required")
+        filters = [
+            PushDevice.active.is_(True),
+            PushDevice.user_id.is_(None),
+            PushDevice.admin_user_id.is_(None),
+        ]
         if token:
             filters.append(PushDevice.token == str(token).strip())
         if device_id:
@@ -1099,6 +1127,27 @@ class SupabaseStore:
     ) -> list[str]:
         effective_limit = max(1, min(limit, 20000))
         query = select(PushDevice).where(PushDevice.admin_user_id.is_not(None))
+        if active_only:
+            query = query.where(PushDevice.active.is_(True))
+        rows = self.session.scalars(query.limit(effective_limit)).all()
+        unique_tokens: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            token = row.token
+            if token in seen:
+                continue
+            seen.add(token)
+            unique_tokens.append(token)
+        return unique_tokens
+
+    def list_non_admin_push_tokens(
+        self,
+        *,
+        active_only: bool = True,
+        limit: int = 10000,
+    ) -> list[str]:
+        effective_limit = max(1, min(limit, 20000))
+        query = select(PushDevice).where(PushDevice.admin_user_id.is_(None))
         if active_only:
             query = query.where(PushDevice.active.is_(True))
         rows = self.session.scalars(query.limit(effective_limit)).all()
@@ -1192,7 +1241,7 @@ class SupabaseStore:
     ) -> tuple[list[str], list[str]]:
         normalized_audience = str(audience or "").strip().lower()
         if normalized_audience == "all":
-            return self.list_push_tokens(active_only=True, limit=limit), []
+            return self.list_non_admin_push_tokens(active_only=True, limit=limit), []
         if normalized_audience == "admins":
             return self.list_admin_push_tokens(active_only=True, limit=limit), []
         if normalized_audience == "all_devices":

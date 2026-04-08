@@ -302,6 +302,37 @@ class PushNotificationRoutesTest(unittest.TestCase):
             self.assertEqual(row.admin_user_id, self.admin_id)
             self.assertIsNone(row.user_id)
 
+    def test_anonymous_register_and_unregister_push_device(self) -> None:
+        register_response = self.client.post(
+            "/api/v1/push-notifications/devices/register",
+            json={
+                "token": "anon-token-1",
+                "platform": "android",
+                "deviceId": "anon-device-1",
+            },
+        )
+        self.assertEqual(register_response.status_code, 200)
+        device_payload = register_response.json()["device"]
+        self.assertEqual(device_payload["token"], "anon-token-1")
+        self.assertEqual(device_payload["customFields"]["subjectType"], "anonymous")
+        self.assertIsNone(device_payload["userId"])
+        self.assertIsNone(device_payload["adminUserId"])
+
+        unregister_response = self.client.post(
+            "/api/v1/push-notifications/devices/unregister",
+            json={"token": "anon-token-1"},
+        )
+        self.assertEqual(unregister_response.status_code, 200)
+        self.assertEqual(unregister_response.json().get("updated"), 1)
+
+        with self.session_factory() as session:
+            row = session.scalar(select(PushDevice).where(PushDevice.token == "anon-token-1"))
+            self.assertIsNotNone(row)
+            assert row is not None
+            self.assertEqual(row.active, False)
+            self.assertIsNone(row.user_id)
+            self.assertIsNone(row.admin_user_id)
+
     def test_send_to_all_active_excludes_admin_registered_devices(self) -> None:
         self.client.post(
             "/api/v1/push-notifications/devices/register",
@@ -326,6 +357,26 @@ class PushNotificationRoutesTest(unittest.TestCase):
         payload = response.json()
         # Baseline test fixture already has one active blocked-user token.
         # Expect exactly 2 user-owned tokens (blocked + newly registered), not admin token.
+        self.assertEqual(payload["delivery"]["requestedTokens"], 2)
+        self.assertEqual(payload["delivery"]["successCount"], 2)
+
+    def test_send_to_all_active_includes_anonymous_devices(self) -> None:
+        self.client.post(
+            "/api/v1/push-notifications/devices/register",
+            json={"token": "anon-token-only", "platform": "android"},
+        )
+        response = self.client.post(
+            "/api/v1/admin/push-notifications/send",
+            json={
+                "title": "All active users",
+                "body": "Includes anonymous devices.",
+                "sendToAllActive": True,
+            },
+            headers=self.admin_headers,
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        # Baseline includes blocked-user token + anonymous token.
         self.assertEqual(payload["delivery"]["requestedTokens"], 2)
         self.assertEqual(payload["delivery"]["successCount"], 2)
 

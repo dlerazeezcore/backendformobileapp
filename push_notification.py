@@ -4,12 +4,13 @@ import json
 from functools import lru_cache
 from typing import Any, Callable, Iterable
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.orm import Session
 
-from auth import get_token_claims, require_active_subject
+from auth import decode_access_token, extract_bearer_token, get_token_claims, require_active_subject
+from config import get_settings
 from supabase_store import AdminUser, AppUser, PushDevice, PushNotification, SupabaseStore, utcnow
 
 ALLOWED_PUSH_AUDIENCES = {"all", "authenticated", "loyalty", "active_esim", "admins", "all_devices"}
@@ -277,10 +278,15 @@ def register_push_notification_routes(
         assert isinstance(row, AppUser)
         return row
 
-    async def _require_push_device_actor(
-        claims: dict[str, Any] = Depends(get_token_claims),
-        db: Session = Depends(get_db),
-    ) -> tuple[str, AppUser | AdminUser]:
+    def _resolve_optional_push_actor(
+        *,
+        db: Session,
+        authorization: str | None,
+    ) -> tuple[str, AppUser | AdminUser | None]:
+        token = extract_bearer_token(authorization)
+        if token is None:
+            return "anonymous", None
+        claims = decode_access_token(token, secret_key=get_settings().auth_secret_key)
         row = require_active_subject(db, claims=claims)
         assert isinstance(row, (AppUser, AdminUser))
         subject_type = str(claims.get("typ") or "").strip().lower()
@@ -302,9 +308,10 @@ def register_push_notification_routes(
     async def register_push_device(
         payload: RegisterPushDevicePayload,
         db: Session = Depends(get_db),
-        actor: tuple[str, AppUser | AdminUser] = Depends(_require_push_device_actor),
+        authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
         store = SupabaseStore(db)
+        actor = _resolve_optional_push_actor(db=db, authorization=authorization)
         subject_type, subject_row = actor
         user_id = subject_row.id if isinstance(subject_row, AppUser) else None
         admin_user_id = subject_row.id if isinstance(subject_row, AdminUser) else None
@@ -335,18 +342,22 @@ def register_push_notification_routes(
     async def unregister_push_device(
         payload: UnregisterPushDevicePayload,
         db: Session = Depends(get_db),
-        actor: tuple[str, AppUser | AdminUser] = Depends(_require_push_device_actor),
+        authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
-        _, subject_row = actor
+        _, subject_row = _resolve_optional_push_actor(db=db, authorization=authorization)
         user_id = subject_row.id if isinstance(subject_row, AppUser) else None
         admin_user_id = subject_row.id if isinstance(subject_row, AdminUser) else None
         try:
-            affected = SupabaseStore(db).deactivate_push_devices(
-                user_id=user_id,
-                admin_user_id=admin_user_id,
-                token=payload.token,
-                device_id=payload.device_id,
-            )
+            store = SupabaseStore(db)
+            if subject_row is None:
+                affected = store.deactivate_push_devices_public(token=payload.token, device_id=payload.device_id)
+            else:
+                affected = store.deactivate_push_devices(
+                    user_id=user_id,
+                    admin_user_id=admin_user_id,
+                    token=payload.token,
+                    device_id=payload.device_id,
+                )
         except ValueError as exc:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
