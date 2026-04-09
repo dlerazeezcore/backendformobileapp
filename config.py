@@ -27,6 +27,8 @@ class Settings(BaseSettings):
     database_url: str = Field(default="sqlite:///./esim_access.db", alias="DATABASE_URL")
     auth_secret_key: str = Field(default=DEFAULT_AUTH_SECRET_KEY, alias="AUTH_SECRET_KEY")
     auth_token_ttl_seconds: int = Field(default=DEFAULT_AUTH_TOKEN_TTL_SECONDS, alias="AUTH_TOKEN_TTL_SECONDS")
+    telegram_support_bot_token: str | None = Field(default=None, alias="TELEGRAM_SUPPORT_BOT_TOKEN")
+    telegram_support_webhook_secret: str | None = Field(default=None, alias="TELEGRAM_SUPPORT_WEBHOOK_SECRET")
 
 
 @lru_cache
