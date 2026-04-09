@@ -30,6 +30,7 @@ from fib_payment_api import (
     register_fib_payment_routes,
 )
 from push_notification import PushNotificationService, register_push_notification_routes
+from telegram_support import register_telegram_support_routes
 from supabase_store import create_database
 from users import register_user_routes
 
@@ -156,6 +157,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     register_esim_access_routes(app, get_db, get_provider)
     register_fib_payment_routes(app, get_fib_provider, get_db)
     register_push_notification_routes(app, get_push_provider, get_db)
+    register_telegram_support_routes(app, get_db, get_push_provider)
     register_admin_routes(app, get_db)
 
     return app

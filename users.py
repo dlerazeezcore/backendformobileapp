@@ -3,13 +3,14 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Callable
 
-from fastapi import Depends, FastAPI, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from auth import get_token_claims, hash_password, require_active_subject
-from supabase_store import AdminUser, AppUser, SupabaseStore
+from phone_utils import phone_lookup_candidates
+from supabase_store import AdminUser, AppUser, SupabaseStore, utcnow
 
 
 class UserPayload(BaseModel):
@@ -65,13 +66,39 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
     async def save_user(
         payload: UserPayload,
         db: Session = Depends(get_db),
-        _: AdminUser = Depends(_require_admin_actor),
+        actor: AdminUser | AppUser = Depends(_require_active_actor),
     ) -> dict[str, Any]:
         data = payload.model_dump(by_alias=False)
         password = data.pop("password", None)
         if password is not None:
             data["password_hash"] = hash_password(password)
-        user = SupabaseStore(db).ensure_user(**data)
+
+        if isinstance(actor, AppUser):
+            actor_row = db.scalar(select(AppUser).where(AppUser.id == actor.id))
+            if actor_row is None:
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Auth subject not found")
+            requested_phone = str(data.get("phone") or "").strip()
+            if actor_row.phone not in phone_lookup_candidates(requested_phone):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="You can only update your own user profile.",
+                )
+
+            actor_row.name = data.get("name") or actor_row.name
+            actor_row.email = data.get("email")
+            if "password_hash" in data:
+                actor_row.password_hash = data["password_hash"]
+
+            requested_status = str(data.get("status") or "").strip().lower()
+            if requested_status == "deleted":
+                actor_row.status = "deleted"
+                actor_row.deleted_at = actor_row.deleted_at or utcnow()
+
+            actor_row.updated_at = utcnow()
+            user = actor_row
+        else:
+            user = SupabaseStore(db).ensure_user(**data)
+
         db.commit()
         db.refresh(user)
         return {"user": {"id": user.id, "phone": user.phone, "name": user.name, "status": user.status}}
