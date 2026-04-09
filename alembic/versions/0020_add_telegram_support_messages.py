@@ -1,6 +1,6 @@
 """add telegram support messages table
 
-Revision ID: 0020_add_telegram_support_messages
+Revision ID: 0020_tg_support_msgs
 Revises: 0019_push_allow_anonymous
 Create Date: 2026-04-09 00:00:00
 """
@@ -11,7 +11,7 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "0020_add_telegram_support_messages"
+revision = "0020_tg_support_msgs"
 down_revision = "0019_push_allow_anonymous"
 branch_labels = None
 depends_on = None
