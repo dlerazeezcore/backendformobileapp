@@ -56,6 +56,14 @@ class AdminAuthorizationTest(unittest.TestCase):
                     status="active",
                 )
             )
+            session.add(
+                AppUser(
+                    id="33333333-3333-3333-3333-333333333333",
+                    phone="+9647701234567",
+                    name="Alice Example",
+                    status="active",
+                )
+            )
             session.commit()
         engine.dispose()
 
@@ -139,6 +147,86 @@ class AdminAuthorizationTest(unittest.TestCase):
             user_row = payload["users"][0]
             self.assertEqual(user_row.get("id"), "22222222-2222-2222-2222-222222222222")
             self.assertEqual(user_row.get("id"), user_row.get("userId"))
+
+    def test_admin_users_contract_has_stable_flags(self) -> None:
+        token = create_access_token(
+            subject_id="11111111-1111-1111-1111-111111111111",
+            phone="+9647700000001",
+            subject_type="admin",
+            secret_key="test-auth-secret",
+            ttl_seconds=3600,
+        )
+        with TestClient(create_app()) as client:
+            response = client.get("/api/v1/admin/users?limit=20&offset=0", headers={"Authorization": f"Bearer {token}"})
+            self.assertEqual(response.status_code, 200)
+            rows = response.json().get("users", [])
+            self.assertGreaterEqual(len(rows), 2)
+            row = rows[0]
+            for key in ("id", "name", "phone", "status", "isBlocked", "isLoyalty", "updatedAt"):
+                self.assertIn(key, row)
+            self.assertIsInstance(row.get("isBlocked"), bool)
+            self.assertIsInstance(row.get("isLoyalty"), bool)
+
+    def test_admin_users_search_supports_name_and_phone_prefix(self) -> None:
+        token = create_access_token(
+            subject_id="11111111-1111-1111-1111-111111111111",
+            phone="+9647700000001",
+            subject_type="admin",
+            secret_key="test-auth-secret",
+            ttl_seconds=3600,
+        )
+        with TestClient(create_app()) as client:
+            by_name = client.get(
+                "/api/v1/admin/users?search=alice&limit=20&offset=0",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            self.assertEqual(by_name.status_code, 200)
+            name_rows = by_name.json().get("users", [])
+            self.assertEqual(len(name_rows), 1)
+            self.assertEqual(name_rows[0]["name"], "Alice Example")
+
+            by_phone = client.get(
+                "/api/v1/admin/users?search=+964770123&limit=20&offset=0",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            self.assertEqual(by_phone.status_code, 200)
+            phone_rows = by_phone.json().get("users", [])
+            self.assertEqual(len(phone_rows), 1)
+            self.assertEqual(phone_rows[0]["phone"], "+9647701234567")
+
+    def test_admin_users_post_mutation_read_is_immediate(self) -> None:
+        token = create_access_token(
+            subject_id="11111111-1111-1111-1111-111111111111",
+            phone="+9647700000001",
+            subject_type="admin",
+            secret_key="test-auth-secret",
+            ttl_seconds=3600,
+        )
+        with TestClient(create_app()) as client:
+            update = client.post(
+                "/api/v1/admin/users",
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "phone": "+9647701234567",
+                    "name": "Alice Example",
+                    "status": "blocked",
+                    "isLoyalty": True,
+                    "blockedAt": "2026-04-10T10:00:00Z",
+                },
+            )
+            self.assertEqual(update.status_code, 200)
+
+            read_back = client.get(
+                "/api/v1/admin/users?search=+964770123&limit=20&offset=0",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            self.assertEqual(read_back.status_code, 200)
+            rows = read_back.json().get("users", [])
+            self.assertEqual(len(rows), 1)
+            row = rows[0]
+            self.assertEqual(row["status"], "blocked")
+            self.assertTrue(row["isBlocked"])
+            self.assertTrue(row["isLoyalty"])
 
     def test_admin_users_list_includes_stable_status_flags(self) -> None:
         token = create_access_token(

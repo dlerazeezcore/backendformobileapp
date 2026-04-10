@@ -659,6 +659,22 @@ Example payload:
 
 Use `GET /api/v1/admin/users` to list B2C app users.
 
+`GET /api/v1/admin/users` stable row contract (all rows):
+
+- `id`
+- `name`
+- `phone`
+- `status`
+- `isBlocked` (boolean)
+- `isLoyalty` (boolean)
+- `updatedAt`
+
+Optional query params:
+
+- `search` (matches phone prefix and case-insensitive name)
+- `limit` (default 100, max 500)
+- `offset` (default 0)
+
 ### Create or update an admin user
 
 `POST /api/v1/admin/admin-users`
@@ -1506,6 +1522,7 @@ Example:
   - `totalDataMb`
   - `usedDataMb`
   - `remainingDataMb`
+- `dataUnit` is always `"MB"` for these canonical fields.
 
 Example:
 

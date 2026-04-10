@@ -116,16 +116,16 @@ class UserScopedReadsTest(unittest.TestCase):
                         iccid="ICCID-USER1",
                         app_status="ACTIVE",
                         installed=True,
-                        total_data_mb=1024,
-                        used_data_mb=250,
-                        remaining_data_mb=774,
+                        total_data_mb=100352,
+                        used_data_mb=2048,
+                        remaining_data_mb=98304,
                         validity_days=30,
                         installed_at=now,
                         activated_at=now,
                         expires_at=now,
                         activation_code="ACT-USER1",
                         install_url="https://install.example/1",
-                        custom_fields={"source": "test"},
+                        custom_fields={"source": "test", "usageUnit": "KB"},
                     ),
                     ESimProfile(
                         order_item_id=item_2.id,
@@ -188,6 +188,10 @@ class UserScopedReadsTest(unittest.TestCase):
             self.assertEqual(profile["iccid"], "ICCID-USER1")
             self.assertEqual(profile["countryCode"], "IQ")
             self.assertEqual(profile["countryName"], "Iraq")
+            self.assertEqual(profile["totalDataMb"], 98)
+            self.assertEqual(profile["usedDataMb"], 2)
+            self.assertEqual(profile["remainingDataMb"], 96)
+            self.assertEqual(profile["dataUnit"], "MB")
 
     def test_profiles_my_supports_filters(self) -> None:
         token = self._token(

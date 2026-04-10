@@ -288,6 +288,38 @@ def _to_bool(value: Any, *, default: bool) -> bool:
 
 
 def _serialize_profile(row: ESimProfile, *, now: datetime) -> dict[str, Any]:
+    custom_fields = row.custom_fields or {}
+    usage_unit_hint = str(
+        custom_fields.get("dataUnit")
+        or custom_fields.get("usageUnit")
+        or custom_fields.get("volumeUnit")
+        or ""
+    ).strip().lower()
+
+    def _normalize_mb(raw_value: int | None) -> int | None:
+        if raw_value is None:
+            return None
+        value = int(raw_value)
+        if value < 0:
+            return 0
+        if "byte" in usage_unit_hint:
+            return max(int(round(value / (1024 * 1024))), 0)
+        if "kb" in usage_unit_hint or "kib" in usage_unit_hint:
+            return max(int(round(value / 1024)), 0)
+        if "mb" in usage_unit_hint or "mib" in usage_unit_hint:
+            return value
+        # Legacy/provider ambiguity fallback:
+        # if values are very large they are typically KB in provider payloads.
+        if value > 5000:
+            return max(int(round(value / 1024)), 0)
+        return value
+
+    total_data_mb = _normalize_mb(row.total_data_mb)
+    used_data_mb = _normalize_mb(row.used_data_mb)
+    remaining_data_mb = _normalize_mb(row.remaining_data_mb)
+    if remaining_data_mb is None and total_data_mb is not None and used_data_mb is not None:
+        remaining_data_mb = max(total_data_mb - used_data_mb, 0)
+
     status_value = _normalize_status(row.app_status or row.provider_status)
     days_left: int | None = None
     if row.expires_at is not None:
@@ -308,14 +340,15 @@ def _serialize_profile(row: ESimProfile, *, now: datetime) -> dict[str, Any]:
         "installedAt": _to_utc_z(row.installed_at),
         "activatedAt": _to_utc_z(row.activated_at),
         "expiresAt": _to_utc_z(row.expires_at),
-        "totalDataMb": row.total_data_mb,
-        "usedDataMb": row.used_data_mb,
-        "remainingDataMb": row.remaining_data_mb,
+        "totalDataMb": total_data_mb,
+        "usedDataMb": used_data_mb,
+        "remainingDataMb": remaining_data_mb,
+        "dataUnit": "MB",
         "daysLeft": days_left,
         "activationCode": row.activation_code,
         "installUrl": row.install_url,
         "esimTranNo": row.esim_tran_no,
-        "customFields": row.custom_fields or {},
+        "customFields": custom_fields,
     }
 
 

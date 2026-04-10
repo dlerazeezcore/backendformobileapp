@@ -5,7 +5,7 @@ from typing import Any, Callable
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from auth import get_token_claims, hash_password, require_active_subject
@@ -108,11 +108,36 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         db: Session = Depends(get_db),
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
+        search: str | None = Query(default=None),
         actor: AdminUser | AppUser = Depends(_require_active_actor),
     ) -> dict[str, Any]:
-        store = SupabaseStore(db)
         if isinstance(actor, AdminUser):
-            rows = store.list_rows(AppUser, exclude={"password_hash"}, limit=limit, offset=offset)
+            query = select(AppUser).order_by(AppUser.updated_at.desc(), AppUser.created_at.desc())
+            normalized_search = str(search or "").strip()
+            if normalized_search:
+                compact = normalized_search.replace(" ", "").replace("-", "")
+                phone_candidates = {compact}
+                if compact and not compact.startswith("+"):
+                    phone_candidates.add(f"+{compact}")
+                phone_prefix_filters = [AppUser.phone.like(f"{candidate}%") for candidate in phone_candidates if candidate]
+                query = query.where(
+                    or_(
+                        AppUser.name.ilike(f"%{normalized_search}%"),
+                        *phone_prefix_filters,
+                    )
+                )
+            rows_orm = db.scalars(
+                query.offset(max(0, offset)).limit(max(1, min(limit, 500)))
+            ).all()
+            rows = []
+            for user_row in rows_orm:
+                rows.append(
+                    {
+                        column.name: getattr(user_row, column.name)
+                        for column in user_row.__table__.columns
+                        if column.name != "password_hash"
+                    }
+                )
         else:
             own_row = db.scalar(select(AppUser).where(AppUser.id == actor.id))
             filtered: list[dict[str, Any]] = []
@@ -128,7 +153,19 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         normalized_rows = []
         for row in rows:
             user_id = row.get("id")
-            normalized_rows.append({**row, "userId": user_id})
+            status_value = str(row.get("status") or "active")
+            blocked_at = row.get("blocked_at")
+            is_blocked = status_value == "blocked" or blocked_at is not None
+            normalized_rows.append(
+                {
+                    **row,
+                    "userId": user_id,
+                    "status": status_value,
+                    "isBlocked": bool(is_blocked),
+                    "isLoyalty": bool(row.get("is_loyalty", False)),
+                    "updatedAt": row.get("updated_at"),
+                }
+            )
         return {"users": normalized_rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
 
     @app.post("/api/v1/admin/admin-users")
