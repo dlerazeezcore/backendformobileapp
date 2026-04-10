@@ -17,6 +17,7 @@ from phone_utils import phone_lookup_candidates
 from supabase_store import AdminUser, AppUser, PushDevice, TelegramSupportMessage, utcnow
 
 TELEGRAM_SUPPORT_CHAT_ID = -5169340336
+TELEGRAM_SUPPORT_PUBLIC_BASE_URL = "https://mean-lettie-corevia-0bd7cc91.koyeb.app/"
 USER_ID_PATTERN = re.compile(r"User ID:\s*([0-9a-fA-F-]{36})")
 PHONE_PATTERN = re.compile(r"Phone:\s*(\+?[0-9][0-9\s\-]{6,})")
 
@@ -48,9 +49,11 @@ async def _telegram_send_message(*, bot_token: str, chat_id: int, text: str, rep
 def _render_user_message_for_telegram(*, actor: AppUser, text: str) -> str:
     return (
         "📩 Support message\n"
+        f"User ID: {actor.id}\n"
         f"Phone: {actor.phone}\n"
         f"Name: {actor.name}\n"
-        "\n"
+        f"Thread: user:{actor.id}\n"
+        f"App URL: {TELEGRAM_SUPPORT_PUBLIC_BASE_URL}\n\n"
         f"{text.strip()}"
     )
 
