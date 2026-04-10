@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from auth import get_token_claims, require_active_subject
 from config import get_settings
 from push_notification import PushNotificationService
-from supabase_store import AppUser, PushDevice, TelegramSupportMessage, utcnow
+from supabase_store import AdminUser, AppUser, PushDevice, TelegramSupportMessage, utcnow
 
 TELEGRAM_SUPPORT_CHAT_ID = -5169340336
 TELEGRAM_SUPPORT_PUBLIC_BASE_URL = "https://mean-lettie-corevia-0bd7cc91.koyeb.app/"
@@ -76,6 +76,12 @@ def register_telegram_support_routes(
         assert isinstance(row, AppUser)
         return row
 
+    async def _require_active_actor(
+        claims: dict[str, Any] = Depends(get_token_claims),
+        db: Session = Depends(get_db),
+    ) -> AppUser | AdminUser:
+        return require_active_subject(db, claims=claims)
+
     @app.post("/api/v1/support/telegram/messages")
     async def send_support_message(
         payload: SupportMessagePayload,
@@ -127,21 +133,23 @@ def register_telegram_support_routes(
     @app.get("/api/v1/support/telegram/messages")
     async def list_my_support_messages(
         db: Session = Depends(get_db),
-        actor: AppUser = Depends(_require_user_actor),
+        actor: AppUser | AdminUser = Depends(_require_active_actor),
         limit: int = Query(default=50, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
+        user_id: str | None = Query(default=None, alias="userId"),
     ) -> dict[str, Any]:
-        rows = db.scalars(
-            select(TelegramSupportMessage)
-            .where(TelegramSupportMessage.user_id == actor.id)
-            .order_by(TelegramSupportMessage.created_at.desc())
-            .offset(offset)
-            .limit(limit)
-        ).all()
+        query = select(TelegramSupportMessage).order_by(TelegramSupportMessage.created_at.desc())
+        if isinstance(actor, AppUser):
+            query = query.where(TelegramSupportMessage.user_id == actor.id)
+        elif user_id is not None:
+            query = query.where(TelegramSupportMessage.user_id == user_id)
+
+        rows = db.scalars(query.offset(offset).limit(limit)).all()
         return {
             "messages": [
                 {
                     "id": row.id,
+                    "userId": row.user_id,
                     "direction": row.direction,
                     "status": row.status,
                     "message": row.message_text,
