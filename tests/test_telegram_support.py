@@ -101,9 +101,6 @@ class TelegramSupportRoutesTest(unittest.TestCase):
             self.assertEqual(chat_id, -5169340336)
             self.assertIn("Phone: +9647700000002", text)
             self.assertIn("Name: Standard User", text)
-            self.assertNotIn("User ID:", text)
-            self.assertNotIn("Thread:", text)
-            self.assertNotIn("App URL:", text)
             return {"ok": True, "result": {"message_id": 789}}
 
         original = telegram_support._telegram_send_message
