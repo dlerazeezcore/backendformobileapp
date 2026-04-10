@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     auth_token_ttl_seconds: int = Field(default=DEFAULT_AUTH_TOKEN_TTL_SECONDS, alias="AUTH_TOKEN_TTL_SECONDS")
     telegram_support_bot_token: str | None = Field(default=None, alias="TELEGRAM_SUPPORT_BOT_TOKEN")
     telegram_support_webhook_secret: str | None = Field(default=None, alias="TELEGRAM_SUPPORT_WEBHOOK_SECRET")
+    telegram_support_auto_sync_on_list: bool = Field(default=True, alias="TELEGRAM_SUPPORT_AUTO_SYNC_ON_LIST")
 
 
 @lru_cache
