@@ -1523,6 +1523,11 @@ Example:
   - `usedDataMb`
   - `remainingDataMb`
 - `dataUnit` is always `"MB"` for these canonical fields.
+- `usageUnit` is always `"MB"` (explicit frontend-safe unit key).
+- GB helper fields are derived from MB only:
+  - `totalDataGb = totalDataMb / 1024`
+  - `usedDataGb = usedDataMb / 1024`
+  - `remainingDataGb = remainingDataMb / 1024`
 
 Example:
 

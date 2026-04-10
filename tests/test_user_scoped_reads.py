@@ -116,7 +116,7 @@ class UserScopedReadsTest(unittest.TestCase):
                         iccid="ICCID-USER1",
                         app_status="ACTIVE",
                         installed=True,
-                        total_data_mb=100352,
+                        total_data_mb=102400,
                         used_data_mb=2048,
                         remaining_data_mb=98304,
                         validity_days=30,
@@ -188,10 +188,14 @@ class UserScopedReadsTest(unittest.TestCase):
             self.assertEqual(profile["iccid"], "ICCID-USER1")
             self.assertEqual(profile["countryCode"], "IQ")
             self.assertEqual(profile["countryName"], "Iraq")
-            self.assertEqual(profile["totalDataMb"], 98)
+            self.assertEqual(profile["totalDataMb"], 100)
             self.assertEqual(profile["usedDataMb"], 2)
             self.assertEqual(profile["remainingDataMb"], 96)
             self.assertEqual(profile["dataUnit"], "MB")
+            self.assertEqual(profile["usageUnit"], "MB")
+            self.assertEqual(profile["totalDataGb"], round(profile["totalDataMb"] / 1024, 6))
+            self.assertEqual(profile["usedDataGb"], round(profile["usedDataMb"] / 1024, 6))
+            self.assertEqual(profile["remainingDataGb"], round(profile["remainingDataMb"] / 1024, 6))
 
     def test_profiles_my_supports_filters(self) -> None:
         token = self._token(

@@ -320,6 +320,11 @@ def _serialize_profile(row: ESimProfile, *, now: datetime) -> dict[str, Any]:
     if remaining_data_mb is None and total_data_mb is not None and used_data_mb is not None:
         remaining_data_mb = max(total_data_mb - used_data_mb, 0)
 
+    def _to_gb(value_mb: int | None) -> float | None:
+        if value_mb is None:
+            return None
+        return round(float(value_mb) / 1024.0, 6)
+
     status_value = _normalize_status(row.app_status or row.provider_status)
     days_left: int | None = None
     if row.expires_at is not None:
@@ -343,7 +348,11 @@ def _serialize_profile(row: ESimProfile, *, now: datetime) -> dict[str, Any]:
         "totalDataMb": total_data_mb,
         "usedDataMb": used_data_mb,
         "remainingDataMb": remaining_data_mb,
+        "totalDataGb": _to_gb(total_data_mb),
+        "usedDataGb": _to_gb(used_data_mb),
+        "remainingDataGb": _to_gb(remaining_data_mb),
         "dataUnit": "MB",
+        "usageUnit": "MB",
         "daysLeft": days_left,
         "activationCode": row.activation_code,
         "installUrl": row.install_url,
