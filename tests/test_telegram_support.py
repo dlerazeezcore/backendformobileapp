@@ -103,8 +103,14 @@ class TelegramSupportRoutesTest(unittest.TestCase):
             self.assertIn("Name: Standard User", text)
             return {"ok": True, "result": {"message_id": 789}}
 
+        async def fake_ensure_webhook(*, bot_token: str, webhook_secret: str | None):
+            _ = (bot_token, webhook_secret)
+            return None
+
         original = telegram_support._telegram_send_message
+        original_ensure = telegram_support._ensure_telegram_webhook
         telegram_support._telegram_send_message = fake_send_message
+        telegram_support._ensure_telegram_webhook = fake_ensure_webhook
         try:
             with TestClient(create_app()) as client:
                 response = client.post(
@@ -117,6 +123,7 @@ class TelegramSupportRoutesTest(unittest.TestCase):
                 self.assertEqual(payload["message"]["status"], "sent")
         finally:
             telegram_support._telegram_send_message = original
+            telegram_support._ensure_telegram_webhook = original_ensure
 
     def test_admin_can_send_support_reply(self) -> None:
         app = create_app()
@@ -156,8 +163,14 @@ class TelegramSupportRoutesTest(unittest.TestCase):
             _ = (bot_token, chat_id, text, reply_to)
             return {"ok": True, "result": {"message_id": 900}}
 
+        async def fake_ensure_webhook(*, bot_token: str, webhook_secret: str | None):
+            _ = (bot_token, webhook_secret)
+            return None
+
         original = telegram_support._telegram_send_message
+        original_ensure = telegram_support._ensure_telegram_webhook
         telegram_support._telegram_send_message = fake_send_message
+        telegram_support._ensure_telegram_webhook = fake_ensure_webhook
         try:
             with TestClient(create_app()) as client:
                 send_response = client.post(
@@ -177,6 +190,7 @@ class TelegramSupportRoutesTest(unittest.TestCase):
                 self.assertEqual(payload["messages"][0]["userId"], "22222222-2222-2222-2222-222222222222")
         finally:
             telegram_support._telegram_send_message = original
+            telegram_support._ensure_telegram_webhook = original_ensure
 
     def test_webhook_reply_records_message_and_sends_push(self) -> None:
         app = create_app()
@@ -288,6 +302,44 @@ class TelegramSupportRoutesTest(unittest.TestCase):
             )
             self.assertEqual(webhook.status_code, 200)
             self.assertEqual(webhook.json().get("pushDeliveryStatus"), "sent")
+
+    def test_webhook_accepts_secret_from_query_param(self) -> None:
+        with TestClient(create_app()) as client:
+            webhook = client.post(
+                "/api/v1/support/telegram/webhook?secret=webhook-secret",
+                json={
+                    "message": {
+                        "message_id": 559,
+                        "text": "Query secret test\nPhone: +9647700000002",
+                        "chat": {"id": -5169340336},
+                    }
+                },
+            )
+            self.assertEqual(webhook.status_code, 200)
+            self.assertTrue(webhook.json().get("ok"))
+
+    def test_webhook_duplicate_message_id_is_idempotent(self) -> None:
+        with TestClient(create_app()) as client:
+            payload = {
+                "message": {
+                    "message_id": 560,
+                    "text": "Duplicate test\nPhone: +9647700000002",
+                    "chat": {"id": -5169340336},
+                }
+            }
+            first = client.post(
+                "/api/v1/support/telegram/webhook",
+                headers={"X-Telegram-Bot-Api-Secret-Token": "webhook-secret"},
+                json=payload,
+            )
+            self.assertEqual(first.status_code, 200)
+            second = client.post(
+                "/api/v1/support/telegram/webhook",
+                headers={"X-Telegram-Bot-Api-Secret-Token": "webhook-secret"},
+                json=payload,
+            )
+            self.assertEqual(second.status_code, 200)
+            self.assertTrue(second.json().get("duplicate"))
 
 if __name__ == "__main__":
     unittest.main()
