@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 from math import ceil
+import re
 import uuid
 from datetime import datetime, timezone
 from time import time
@@ -112,6 +113,163 @@ def _format_number_as_string(value: float | int | str | None, fallback: str) -> 
     if abs(number - int(number)) < 1e-9:
         return str(int(number))
     return f"{number:.6f}".rstrip("0").rstrip(".")
+
+
+def _as_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return int(float(text))
+    except ValueError:
+        return None
+
+
+def _bytes_to_mb(value: int | None) -> int | None:
+    if value is None:
+        return None
+    if value < 0:
+        return 0
+    return int(round(value / (1024 * 1024)))
+
+
+def _normalize_country_entry(entry: Any) -> dict[str, str] | None:
+    if isinstance(entry, dict):
+        code = str(
+            entry.get("code")
+            or entry.get("countryCode")
+            or entry.get("isoCode")
+            or ""
+        ).strip().upper()
+        name = str(entry.get("name") or entry.get("countryName") or "").strip()
+        if code and name:
+            return {"code": code, "name": name}
+        if code:
+            return {"code": code, "name": code}
+        if name:
+            return {"code": name[:2].upper(), "name": name}
+        return None
+    if isinstance(entry, str):
+        value = entry.strip()
+        if not value:
+            return None
+        if len(value) == 2 and value.isalpha():
+            code = value.upper()
+            return {"code": code, "name": code}
+        return {"code": value[:2].upper(), "name": value}
+    return None
+
+
+def _extract_included_countries(package_row: dict[str, Any]) -> list[dict[str, str]]:
+    candidates = (
+        package_row.get("includedCountries"),
+        package_row.get("includedCountryList"),
+        package_row.get("includeCountries"),
+        package_row.get("countryList"),
+        package_row.get("countries"),
+        package_row.get("regionCountries"),
+    )
+    countries: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def _add_entry(entry: Any) -> None:
+        normalized = _normalize_country_entry(entry)
+        if normalized is None:
+            return
+        key = f"{normalized['code']}::{normalized['name']}"
+        if key in seen:
+            return
+        seen.add(key)
+        countries.append(normalized)
+
+    for candidate in candidates:
+        if isinstance(candidate, list):
+            for item in candidate:
+                _add_entry(item)
+        elif isinstance(candidate, dict):
+            _add_entry(candidate)
+        elif isinstance(candidate, str):
+            text = candidate.strip()
+            if not text:
+                continue
+            if text.startswith("[") and text.endswith("]"):
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, list):
+                        for item in parsed:
+                            _add_entry(item)
+                    else:
+                        _add_entry(parsed)
+                    continue
+                except Exception:
+                    pass
+            for token in re.split(r"[,\|;/]+", text):
+                _add_entry(token)
+    return countries
+
+
+def _augment_package_list_response(provider_payload: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(provider_payload)
+    obj = payload.get("obj")
+    if not isinstance(obj, dict):
+        return payload
+    package_list = obj.get("packageList")
+    if not isinstance(package_list, list):
+        return payload
+    enhanced: list[dict[str, Any]] = []
+    for raw_item in package_list:
+        item = dict(raw_item) if isinstance(raw_item, dict) else {}
+        included = _extract_included_countries(item)
+        if included:
+            item["includedCountries"] = included
+        enhanced.append(item)
+    obj = dict(obj)
+    obj["packageList"] = enhanced
+    payload["obj"] = obj
+    return payload
+
+
+def _augment_profile_usage_units(provider_payload: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(provider_payload)
+    obj = payload.get("obj")
+    if not isinstance(obj, dict):
+        return payload
+    esim_list = obj.get("esimList")
+    if not isinstance(esim_list, list):
+        return payload
+    enriched: list[dict[str, Any]] = []
+    for raw_item in esim_list:
+        item = dict(raw_item) if isinstance(raw_item, dict) else {}
+        total_mb = _as_int(item.get("totalDataMb"))
+        used_mb = _as_int(item.get("usedDataMb"))
+        remaining_mb = _as_int(item.get("remainingDataMb"))
+        if total_mb is None:
+            total_mb = _as_int(item.get("totalVolume"))
+        if used_mb is None:
+            used_mb = _as_int(item.get("orderUsage"))
+        if total_mb is None:
+            total_mb = _bytes_to_mb(_as_int(item.get("totalDataBytes")))
+        if used_mb is None:
+            used_mb = _bytes_to_mb(_as_int(item.get("usedDataBytes") or item.get("dataUsageBytes")))
+        if remaining_mb is None and total_mb is not None and used_mb is not None:
+            remaining_mb = max(total_mb - used_mb, 0)
+        item["totalDataMb"] = total_mb
+        item["usedDataMb"] = used_mb
+        item["remainingDataMb"] = remaining_mb
+        item["dataUsageUnit"] = "MB"
+        enriched.append(item)
+    obj = dict(obj)
+    obj["esimList"] = enriched
+    payload["obj"] = obj
+    return payload
 
 
 def _to_bool(value: Any, *, default: bool) -> bool:
@@ -711,6 +869,20 @@ def _normalize_payment_method(
     return normalized_method, normalized_provider
 
 
+def _resolve_payment_method_provider(payload: ManagedOrderPayload) -> tuple[str | None, str | None]:
+    custom = payload.custom_fields or {}
+    method = payload.payment_method
+    provider = payload.payment_provider
+    if method is None:
+        method = custom.get("paymentMethod") or custom.get("payment_method")
+    if provider is None:
+        provider = custom.get("paymentProvider") or custom.get("payment_provider")
+    normalized_method, normalized_provider = _normalize_payment_method(method, provider)
+    if normalized_method and normalized_provider is None:
+        normalized_provider = "internal_loyalty" if normalized_method == "loyalty" else normalized_method
+    return normalized_method, normalized_provider
+
+
 def _resolve_or_create_payment_for_managed_order(
     *,
     store: SupabaseStore,
@@ -724,27 +896,35 @@ def _resolve_or_create_payment_for_managed_order(
     provider_request_payload: dict[str, Any],
     provider_response_payload: dict[str, Any],
 ) -> PaymentAttempt | None:
-    method, provider_code = _normalize_payment_method(payload.payment_method, payload.payment_provider)
+    method, provider_code = _resolve_payment_method_provider(payload)
     attempt: PaymentAttempt | None = None
     if payload.payment_attempt_id:
         attempt = store.get_payment_attempt_by_id(payload.payment_attempt_id, for_update=True)
     elif payload.payment_transaction_id:
         attempt = store.get_payment_attempt_by_transaction_id(payload.payment_transaction_id, for_update=True)
 
-    # Loyalty can work without a prior checkout intent. Create and mark paid here.
-    if attempt is None and method == "loyalty":
-        transaction_id = payload.payment_transaction_id or f"loyalty-{order_item_id}-{uuid.uuid4().hex[:12]}"
+    # Managed booking can finalize without a pre-created payment attempt.
+    # Persist successful methods (loyalty + future methods) for reporting.
+    if attempt is None and method:
+        transaction_id = payload.payment_transaction_id or f"{method}-{order_item_id}-{uuid.uuid4().hex[:12]}"
         attempt = store.get_payment_attempt_by_transaction_id(transaction_id, for_update=True)
         if attempt is None:
+            normalized_status = (
+                store._normalize_payment_status(payload.payment_status)
+                if payload.payment_status
+                else "paid"
+            )
+            if normalized_status not in {"paid", "refunded"}:
+                return None
             attempt = store.create_payment_attempt(
                 transaction_id=transaction_id,
-                payment_method="loyalty",
-                provider=provider_code or "internal_loyalty",
+                payment_method=method,
+                provider=provider_code or ("internal_loyalty" if method == "loyalty" else method),
                 customer_order_id=customer_order_id,
                 order_item_id=order_item_id,
                 user_id=user_id,
                 service_type=service_type,
-                status="paid",
+                status=normalized_status,
                 amount_minor=payload.payment_amount_minor if payload.payment_amount_minor is not None else amount_minor,
                 currency_code=payload.payment_currency_code or currency_code,
                 provider_payment_id=payload.payment_provider_payment_id,
@@ -752,12 +932,12 @@ def _resolve_or_create_payment_for_managed_order(
                 idempotency_key=payload.payment_idempotency_key,
                 metadata={
                     "source": "orders_managed",
-                    "paymentMethod": "loyalty",
+                    "paymentMethod": method,
                     "autoPaidOnBooking": True,
                 },
                 provider_request={"managedOrderRequest": provider_request_payload},
                 provider_response={"managedOrderResponse": provider_response_payload},
-                paid_at=utcnow(),
+                paid_at=utcnow() if normalized_status == "paid" else None,
             )
 
     if attempt is None:
@@ -785,7 +965,7 @@ def _resolve_or_create_payment_for_managed_order(
         normalized_status = store._normalize_payment_status(payload.payment_status)
         if normalized_status in {"paid", "refunded"}:
             store.apply_payment_status_transition(attempt, new_status=normalized_status)
-    elif method == "loyalty":
+    elif method is not None:
         store.apply_payment_status_transition(attempt, new_status="paid")
     return attempt
 
@@ -799,8 +979,10 @@ def register_esim_access_routes(
     async def query_packages(
         payload: PackageQueryRequest,
         provider: ESimAccessAPI = Depends(get_provider),
-    ) -> ESimAccessResponse[PackageListResult]:
-        return await provider.get_packages(payload)
+    ) -> dict[str, Any]:
+        provider_response = await provider.get_packages(payload)
+        raw_payload = provider_response.model_dump(by_alias=True, exclude_none=True)
+        return _augment_package_list_response(raw_payload)
 
     @app.post("/api/v1/esim-access/orders")
     async def create_order(
@@ -820,6 +1002,7 @@ def register_esim_access_routes(
         assert isinstance(auth_user, AppUser)
         provider_response = await provider.order_profiles(payload.provider_request)
         store = SupabaseStore(db)
+        resolved_payment_method, resolved_payment_provider = _resolve_payment_method_provider(payload)
         provider_request_payload = payload.provider_request.model_dump(by_alias=True, exclude_none=True)
         provider_response_payload = provider_response.model_dump(by_alias=True, exclude_none=True)
         try:
@@ -846,6 +1029,8 @@ def register_esim_access_routes(
                 package_code=payload.package_code,
                 package_slug=payload.package_slug,
                 package_name=payload.package_name,
+                payment_method=resolved_payment_method,
+                payment_provider=resolved_payment_provider,
                 custom_fields=payload.custom_fields,
                 auto_commit=False,
             )
@@ -861,6 +1046,11 @@ def register_esim_access_routes(
                 provider_request_payload=provider_request_payload,
                 provider_response_payload=provider_response_payload,
             )
+            if payment_attempt is not None:
+                order_item.payment_method = payment_attempt.payment_method
+                order_item.payment_provider = payment_attempt.provider
+                customer_order.payment_method = payment_attempt.payment_method
+                customer_order.payment_provider = payment_attempt.provider
             db.commit()
         except Exception:
             db.rollback()
@@ -903,8 +1093,10 @@ def register_esim_access_routes(
     async def query_profiles(
         payload: ProfileQueryRequest,
         provider: ESimAccessAPI = Depends(get_provider),
-    ) -> ESimAccessResponse[ProfileListResult]:
-        return await provider.query_profiles(payload)
+    ) -> dict[str, Any]:
+        provider_response = await provider.query_profiles(payload)
+        raw_payload = provider_response.model_dump(by_alias=True, exclude_none=True)
+        return _augment_profile_usage_units(raw_payload)
 
     @app.post("/api/v1/esim-access/profiles/sync")
     async def sync_profiles(

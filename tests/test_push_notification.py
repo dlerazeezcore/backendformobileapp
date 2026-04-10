@@ -590,6 +590,35 @@ class PushNotificationRoutesTest(unittest.TestCase):
             self.assertEqual(len(devices), 1)
             self.assertEqual(devices[0].active, False)
 
+    def test_admin_send_user_ids_targets_only_requested_users_tokens(self) -> None:
+        self.client.post(
+            "/api/v1/push-notifications/devices/register",
+            json={"token": "target-user-token", "platform": "android"},
+            headers=self.user_headers,
+        )
+        self.client.post(
+            "/api/v1/push-notifications/devices/register",
+            json={"token": "other-user-token", "platform": "ios"},
+            headers=self.loyalty_user_headers,
+        )
+
+        response = self.client.post(
+            "/api/v1/admin/push-notifications/send",
+            json={
+                "title": "Targeted Notice",
+                "body": "Only one user should receive this.",
+                "userIds": [self.user_id],
+            },
+            headers=self.admin_headers,
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["delivery"]["requestedTokens"], 1)
+        self.assertEqual(payload["delivery"]["successCount"], 1)
+        self.assertGreaterEqual(len(self.provider.sent_payloads), 1)
+        sent_tokens = self.provider.sent_payloads[-1]["tokens"]
+        self.assertEqual(sent_tokens, ["target-user-token"])
+
     def test_admin_without_push_permission_gets_403(self) -> None:
         response = self.client.post(
             "/api/v1/admin/push-notifications/send",

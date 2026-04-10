@@ -140,6 +140,26 @@ class AdminAuthorizationTest(unittest.TestCase):
             self.assertEqual(user_row.get("id"), "22222222-2222-2222-2222-222222222222")
             self.assertEqual(user_row.get("id"), user_row.get("userId"))
 
+    def test_admin_users_list_includes_stable_status_flags(self) -> None:
+        token = create_access_token(
+            subject_id="11111111-1111-1111-1111-111111111111",
+            phone="+9647700000001",
+            subject_type="admin",
+            secret_key="test-auth-secret",
+            ttl_seconds=3600,
+        )
+        with TestClient(create_app()) as client:
+            response = client.get("/api/v1/admin/admin-users", headers={"Authorization": f"Bearer {token}"})
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertIn("adminUsers", payload)
+            self.assertGreaterEqual(len(payload["adminUsers"]), 1)
+            row = payload["adminUsers"][0]
+            self.assertIn("status", row)
+            self.assertIn("isLoyalty", row)
+            self.assertIn("blockedAt", row)
+            self.assertIn("deletedAt", row)
+
 
 if __name__ == "__main__":
     unittest.main()

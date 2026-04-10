@@ -687,6 +687,13 @@ Example payload:
 
 Use `GET /api/v1/admin/admin-users` to list admin/operator accounts.
 
+`GET /api/v1/admin/admin-users` now always includes stable status flags in each row:
+
+- `isLoyalty` (always boolean; currently `false` for admin rows)
+- `status`
+- `blockedAt`
+- `deletedAt`
+
 ### Admin login
 
 `POST /api/v1/auth/admin/login`
@@ -1330,6 +1337,13 @@ Optional fields for linking/creating payment records:
 - `paymentIdempotencyKey`
 
 For `paymentMethod = loyalty`, backend creates or updates a `payment_attempts` row with `provider = internal_loyalty` and marks it paid when booking succeeds.
+If `paymentMethod` is passed in `customFields` (legacy/mobile payloads), backend also resolves and persists it.
+
+For long-term reporting:
+
+- `order_items.payment_method` and `order_items.payment_provider` are persisted per booked item.
+- `customer_orders.payment_method` and `customer_orders.payment_provider` are persisted as order-level summary fields.
+- `payment_attempts` remains the source of truth for successful payment lifecycle/reconciliation.
 
 ### Error contract for frontend
 
@@ -1436,6 +1450,7 @@ Filtering behavior:
 - only `isPopular = true`
 - only rows active in current time window (`startsAt <= now`, `endsAt` is null or future)
 - deduplicated by latest row per `code` (per `serviceType`) before sorting by `sortOrder`
+- read-after-write freshness: public reads are from DB directly (no app cache layer), so new admin updates are visible immediately.
 
 This is the current table for homepage merchandising.
 
@@ -1487,6 +1502,10 @@ Example:
   - `status` (optional)
   - `installed` (optional boolean)
   - `userId` (optional, admin token only)
+- usage fields are canonical in **MB** units:
+  - `totalDataMb`
+  - `usedDataMb`
+  - `remainingDataMb`
 
 Example:
 
@@ -1541,6 +1560,21 @@ Example:
 - same auth/ownership/request rules as install route
 - sets `installed=true`, `installedAt`/`activatedAt`, and active app status
 - returns updated profile object in `data.profile`
+
+`POST /api/v1/esim-access/profiles/query`
+
+- provider response is preserved, and each `obj.esimList[]` item is augmented with canonical usage fields:
+  - `totalDataMb`
+  - `usedDataMb`
+  - `remainingDataMb`
+  - `dataUsageUnit` = `MB`
+- when provider sends byte-based usage fields, backend normalizes them to MB and returns both.
+
+`POST /api/v1/esim-access/packages/query`
+
+- provider response is preserved, and regional package rows are augmented with:
+  - `includedCountries: [{ \"code\": \"FR\", \"name\": \"France\" }, ...]`
+- this field is additive and backward-compatible.
 
 The frontend admin panel should treat these as configuration sources for future purchases, not retroactive changes to old orders.
 

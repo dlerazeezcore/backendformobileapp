@@ -162,4 +162,15 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         _: AdminUser = Depends(_require_admin_actor),
     ) -> dict[str, Any]:
         rows = SupabaseStore(db).list_rows(AdminUser, exclude={"password_hash"}, limit=limit, offset=offset)
-        return {"adminUsers": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
+        normalized_rows: list[dict[str, Any]] = []
+        for row in rows:
+            normalized_rows.append(
+                {
+                    **row,
+                    "isLoyalty": bool(row.get("is_loyalty", False)),
+                    "status": str(row.get("status") or "active"),
+                    "blockedAt": row.get("blocked_at"),
+                    "deletedAt": row.get("deleted_at"),
+                }
+            )
+        return {"adminUsers": normalized_rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}

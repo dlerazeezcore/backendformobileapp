@@ -339,6 +339,8 @@ class CustomerOrder(TimeMixin, Base):
     discount_minor: Mapped[int | None] = mapped_column(Integer, default=0)
     total_minor: Mapped[int | None] = mapped_column(Integer)
     refunded_minor: Mapped[int | None] = mapped_column(Integer, default=0)
+    payment_method: Mapped[str | None] = mapped_column(String(32), index=True)
+    payment_provider: Mapped[str | None] = mapped_column(String(64), index=True)
     booked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     user: Mapped[AppUser | None] = relationship(back_populates="customer_orders")
     order_items: Mapped[list["OrderItem"]] = relationship(back_populates="customer_order")
@@ -368,6 +370,8 @@ class OrderItem(TimeMixin, Base):
     discount_minor: Mapped[int | None] = mapped_column(Integer)
     sale_price_minor: Mapped[int | None] = mapped_column(Integer)
     refund_amount_minor: Mapped[int | None] = mapped_column(Integer)
+    payment_method: Mapped[str | None] = mapped_column(String(32), index=True)
+    payment_provider: Mapped[str | None] = mapped_column(String(64), index=True)
     applied_pricing_rule_id: Mapped[int | None] = mapped_column(Integer)
     applied_discount_rule_id: Mapped[int | None] = mapped_column(Integer)
     applied_pricing_rule_type: Mapped[str | None] = mapped_column(String(16))
@@ -1746,6 +1750,8 @@ class SupabaseStore:
         package_code: str | None = None,
         package_slug: str | None = None,
         package_name: str | None = None,
+        payment_method: str | None = None,
+        payment_provider: str | None = None,
         custom_fields: dict[str, Any] | None = None,
         auto_commit: bool = True,
     ) -> tuple[CustomerOrder, OrderItem]:
@@ -1833,6 +1839,8 @@ class SupabaseStore:
         )
         order.user = user
         order.order_status = "BOOKED" if provider_response.get("success") else "FAILED"
+        order.payment_method = str(payment_method or "").strip().lower() or None
+        order.payment_provider = str(payment_provider or "").strip().lower() or None
         order.currency_code = sale_currency_code
         order.exchange_rate = applied_exchange_rate
         order.subtotal_minor = subtotal_minor
@@ -1845,6 +1853,8 @@ class SupabaseStore:
         item.provider_order_no = provider_obj.get("orderNo")
         item.provider_transaction_id = provider_obj.get("transactionId") or order_request.get("transactionId")
         item.provider_status = "SUCCESS" if provider_response.get("success") else "FAILED"
+        item.payment_method = str(payment_method or "").strip().lower() or None
+        item.payment_provider = str(payment_provider or "").strip().lower() or None
         item.country_code = country_code
         item.country_name = country_name
         item.package_code = package_code or package_info.get("packageCode")

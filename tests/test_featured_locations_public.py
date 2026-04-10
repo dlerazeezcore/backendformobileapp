@@ -202,7 +202,37 @@ class PublicFeaturedLocationsTest(unittest.TestCase):
             )
             self.assertEqual(response.status_code, 401)
 
+    def test_public_featured_locations_read_after_admin_write_is_fresh(self) -> None:
+        admin_token = create_access_token(
+            subject_id="11111111-1111-1111-1111-111111111111",
+            phone="+9647700000001",
+            subject_type="admin",
+            secret_key="test-auth-secret",
+            ttl_seconds=3600,
+        )
+        with TestClient(create_app()) as client:
+            write_response = client.post(
+                "/api/v1/admin/featured-locations",
+                headers={"Authorization": f"Bearer {admin_token}"},
+                json={
+                    "code": "IQ",
+                    "name": "Iraq Fresh",
+                    "serviceType": "esim",
+                    "locationType": "country",
+                    "isPopular": True,
+                    "enabled": True,
+                    "sortOrder": 1,
+                },
+            )
+            self.assertEqual(write_response.status_code, 200)
+
+            read_response = client.get("/api/v1/featured-locations/public?serviceType=esim")
+            self.assertEqual(read_response.status_code, 200)
+            locations = read_response.json().get("data", {}).get("locations", [])
+            self.assertEqual(len(locations), 1)
+            self.assertEqual(locations[0]["code"], "IQ")
+            self.assertEqual(locations[0]["name"], "Iraq Fresh")
+
 
 if __name__ == "__main__":
     unittest.main()
-

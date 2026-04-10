@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from auth import create_access_token
 from config import get_settings
 from esim_access_api import register_esim_access_routes
-from supabase_store import AppUser, Base, CustomerOrder, normalize_database_url
+from supabase_store import AppUser, Base, CustomerOrder, OrderItem, PaymentAttempt, normalize_database_url
 
 
 class _ManagedOrderProvider:
@@ -46,6 +46,8 @@ class ManagedOrderAuthBindingTest(unittest.TestCase):
         self.user_id = str(uuid.uuid4())
         self.user_phone = "+9647701230001"
         os.environ["AUTH_SECRET_KEY"] = "test-auth-secret"
+        os.environ["ESIM_ACCESS_ACCESS_CODE"] = "test-code"
+        os.environ["ESIM_ACCESS_SECRET_KEY"] = "test-secret"
         get_settings.cache_clear()
 
         engine = create_engine(
@@ -139,6 +141,56 @@ class ManagedOrderAuthBindingTest(unittest.TestCase):
             self.assertIsNotNone(order)
             assert order is not None
             self.assertEqual(order.user_id, self.user_id)
+
+    def test_managed_order_loyalty_creates_payment_attempt_and_order_payment_fields(self) -> None:
+        response = self.client.post(
+            "/api/v1/esim-access/orders/managed",
+            headers=self._user_auth_header(),
+            json={
+                "providerRequest": {
+                    "transactionId": "APP-ORDER-LOYALTY-1",
+                    "packageInfoList": [{"packageCode": "PKG-LOYALTY-1", "count": 1, "price": 900}],
+                },
+                "user": {
+                    "phone": self.user_phone,
+                    "name": "Token User",
+                    "email": "token-user@example.com",
+                },
+                "platformCode": "mobile_app",
+                "currencyCode": "IQD",
+                "providerCurrencyCode": "IQD",
+                "customFields": {
+                    "paymentMethod": "loyalty",
+                    "paymentStatus": "approved",
+                },
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        payment = payload.get("database", {}).get("payment")
+        self.assertIsNotNone(payment)
+        assert payment is not None
+        self.assertEqual(payment.get("paymentMethod"), "loyalty")
+        self.assertEqual(payment.get("status"), "paid")
+
+        order_id = payload["database"]["customerOrderId"]
+        order_item_id = payload["database"]["orderItemId"]
+        with self.session_factory() as session:
+            attempt = session.scalar(select(PaymentAttempt).where(PaymentAttempt.order_item_id == order_item_id))
+            self.assertIsNotNone(attempt)
+            assert attempt is not None
+            self.assertEqual(attempt.payment_method, "loyalty")
+            self.assertEqual(attempt.status, "paid")
+
+            order = session.scalar(select(CustomerOrder).where(CustomerOrder.id == order_id))
+            self.assertIsNotNone(order)
+            assert order is not None
+            self.assertEqual(order.payment_method, "loyalty")
+
+            item = session.scalar(select(OrderItem).where(OrderItem.id == order_item_id))
+            self.assertIsNotNone(item)
+            assert item is not None
+            self.assertEqual(item.payment_method, "loyalty")
 
 
 if __name__ == "__main__":
