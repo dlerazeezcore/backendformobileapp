@@ -49,11 +49,9 @@ async def _telegram_send_message(*, bot_token: str, chat_id: int, text: str, rep
 def _render_user_message_for_telegram(*, actor: AppUser, text: str) -> str:
     return (
         "📩 Support message\n"
-        f"User ID: {actor.id}\n"
         f"Phone: {actor.phone}\n"
         f"Name: {actor.name}\n"
-        f"Thread: user:{actor.id}\n"
-        f"App URL: {TELEGRAM_SUPPORT_PUBLIC_BASE_URL}\n\n"
+        "\n"
         f"{text.strip()}"
     )
 
@@ -278,6 +276,20 @@ def register_telegram_support_routes(
                 if mapped_user is not None:
                     user_id = mapped_user.id
 
+        if user_id is None:
+            recent_thread = db.scalar(
+                select(TelegramSupportMessage)
+                .where(
+                    TelegramSupportMessage.telegram_chat_id == chat_id,
+                    TelegramSupportMessage.direction == "user_to_admin",
+                    TelegramSupportMessage.user_id.is_not(None),
+                )
+                .order_by(TelegramSupportMessage.created_at.desc())
+                .limit(1)
+            )
+            if recent_thread is not None and recent_thread.user_id:
+                user_id = recent_thread.user_id
+
         row = TelegramSupportMessage(
             user_id=user_id,
             direction="admin_to_user",
@@ -312,6 +324,8 @@ def register_telegram_support_routes(
                     row.error_message = str(exc)
             else:
                 row.push_delivery_status = "no_devices"
+        else:
+            row.push_delivery_status = "unmapped"
 
         row.updated_at = utcnow()
         db.commit()
