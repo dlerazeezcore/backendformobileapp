@@ -85,6 +85,64 @@ def parse_provider_int(value: Any) -> int | None:
     return None
 
 
+def _pick_first_provider_int(payload: dict[str, Any], keys: tuple[str, ...]) -> int | None:
+    for key in keys:
+        parsed = parse_provider_int(payload.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _usage_unit_from_hint(unit_hint: str | None, *, total_raw: int | None, used_raw: int | None) -> str:
+    normalized = str(unit_hint or "").strip().lower()
+    if "byte" in normalized:
+        return "bytes"
+    if "kb" in normalized or "kib" in normalized:
+        return "kb"
+    if "gb" in normalized or "gib" in normalized:
+        return "gb"
+    if "mb" in normalized or "mib" in normalized:
+        return "mb"
+
+    candidates = [value for value in (total_raw, used_raw) if value is not None]
+    if not candidates:
+        return "mb"
+    max_value = max(candidates)
+    # Heuristic fallback for legacy provider payloads missing explicit unit:
+    # very large values are usually bytes, medium-large values usually KB.
+    if max_value >= 5_000_000:
+        return "bytes"
+    if max_value >= 5_000:
+        return "kb"
+    return "mb"
+
+
+def _usage_value_to_mb(value: int | None, unit: str) -> int | None:
+    if value is None:
+        return None
+    if value < 0:
+        return 0
+    if unit == "bytes":
+        return max(int(round(value / (1024 * 1024))), 0)
+    if unit == "kb":
+        return max(int(round(value / 1024)), 0)
+    if unit == "gb":
+        return max(int(round(value * 1024)), 0)
+    return value
+
+
+def normalize_usage_pair_to_mb(
+    *,
+    total_raw: int | None,
+    used_raw: int | None,
+    unit_hint: str | None = None,
+) -> tuple[int | None, int | None, str]:
+    detected_unit = _usage_unit_from_hint(unit_hint, total_raw=total_raw, used_raw=used_raw)
+    total_mb = _usage_value_to_mb(total_raw, detected_unit)
+    used_mb = _usage_value_to_mb(used_raw, detected_unit)
+    return total_mb, used_mb, detected_unit
+
+
 def normalize_database_url(database_url: str) -> str:
     if database_url.startswith("postgresql://"):
         return database_url.replace("postgresql://", "postgresql+psycopg://", 1)
@@ -1958,8 +2016,38 @@ class SupabaseStore:
                 profile = ESimProfile()
                 self.session.add(profile)
             before = profile.app_status
-            total_data_mb = parse_provider_int(item.get("totalVolume"))
-            used_data_mb = parse_provider_int(item.get("orderUsage"))
+            raw_total = _pick_first_provider_int(
+                item,
+                (
+                    "totalDataMb",
+                    "totalVolume",
+                    "totalData",
+                    "totalDataKb",
+                    "totalDataBytes",
+                ),
+            )
+            raw_used = _pick_first_provider_int(
+                item,
+                (
+                    "usedDataMb",
+                    "orderUsage",
+                    "dataUsage",
+                    "usedDataKb",
+                    "usedDataBytes",
+                    "dataUsageBytes",
+                ),
+            )
+            total_data_mb, used_data_mb, _detected_unit = normalize_usage_pair_to_mb(
+                total_raw=raw_total,
+                used_raw=raw_used,
+                unit_hint=str(
+                    item.get("usageUnit")
+                    or item.get("dataUnit")
+                    or item.get("volumeUnit")
+                    or item.get("unit")
+                    or ""
+                ),
+            )
             remaining_data_mb = None
             if total_data_mb is not None and used_data_mb is not None:
                 remaining_data_mb = max(total_data_mb - used_data_mb, 0)
@@ -1989,6 +2077,13 @@ class SupabaseStore:
             elif profile.activated_at is not None and validity_days and profile.expires_at is None:
                 profile.expires_at = profile.activated_at + timedelta(days=validity_days)
             profile.last_provider_sync_at = utcnow()
+            profile.custom_fields = self._merge_json_dict(
+                profile.custom_fields,
+                {
+                    "usageUnit": "MB",
+                    "packageDataMb": total_data_mb,
+                },
+            )
             order_item.item_status = profile.app_status or order_item.item_status
             order_item.provider_status = profile.provider_status
             order_item.last_provider_sync_at = utcnow()
@@ -2036,14 +2131,49 @@ class SupabaseStore:
             if profile is None:
                 continue
             before = profile.used_data_mb
-            total_data_mb = parse_provider_int(record.get("totalData"))
-            used_data_mb = parse_provider_int(record.get("dataUsage"))
+            raw_total = _pick_first_provider_int(
+                record,
+                (
+                    "totalDataMb",
+                    "totalData",
+                    "totalDataKb",
+                    "totalDataBytes",
+                ),
+            )
+            raw_used = _pick_first_provider_int(
+                record,
+                (
+                    "usedDataMb",
+                    "dataUsage",
+                    "usedDataKb",
+                    "usedDataBytes",
+                    "dataUsageBytes",
+                ),
+            )
+            total_data_mb, used_data_mb, _detected_unit = normalize_usage_pair_to_mb(
+                total_raw=raw_total,
+                used_raw=raw_used,
+                unit_hint=str(
+                    record.get("usageUnit")
+                    or record.get("dataUnit")
+                    or record.get("volumeUnit")
+                    or record.get("unit")
+                    or ""
+                ),
+            )
             remaining_data_mb = None
             if total_data_mb is not None and used_data_mb is not None:
                 remaining_data_mb = max(total_data_mb - used_data_mb, 0)
             profile.total_data_mb = total_data_mb if total_data_mb is not None else profile.total_data_mb
             profile.used_data_mb = used_data_mb
             profile.remaining_data_mb = remaining_data_mb
+            profile.custom_fields = self._merge_json_dict(
+                profile.custom_fields,
+                {
+                    "usageUnit": "MB",
+                    "packageDataMb": profile.total_data_mb,
+                },
+            )
             profile.last_provider_sync_at = parse_provider_datetime(record.get("lastUpdateTime")) or utcnow()
             if used_data_mb not in (None, 0) and profile.activated_at is None:
                 profile.activated_at = utcnow()
