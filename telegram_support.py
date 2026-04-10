@@ -75,6 +75,12 @@ def register_telegram_support_routes(
     ) -> AppUser | AdminUser:
         return require_active_subject(db, claims=claims)
 
+    async def _require_active_actor(
+        claims: dict[str, Any] = Depends(get_token_claims),
+        db: Session = Depends(get_db),
+    ) -> AppUser | AdminUser:
+        return require_active_subject(db, claims=claims)
+
     @app.post("/api/v1/support/telegram/messages")
     async def send_support_message(
         payload: SupportMessagePayload,
