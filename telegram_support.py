@@ -223,8 +223,7 @@ def register_telegram_support_routes(
             "pagination": {"limit": limit, "offset": offset, "count": len(rows)},
         }
 
-    @app.post("/api/v1/support/telegram/webhook")
-    async def telegram_webhook(
+    async def _process_telegram_webhook(
         payload: dict[str, Any],
         db: Session = Depends(get_db),
         push_provider: PushNotificationService = Depends(get_push_provider),
@@ -330,3 +329,21 @@ def register_telegram_support_routes(
         row.updated_at = utcnow()
         db.commit()
         return {"ok": True, "messageId": row.id, "userId": user_id, "pushDeliveryStatus": row.push_delivery_status}
+
+    @app.post("/api/v1/support/telegram/webhook")
+    async def telegram_webhook(
+        payload: dict[str, Any],
+        db: Session = Depends(get_db),
+        push_provider: PushNotificationService = Depends(get_push_provider),
+        secret_header: str | None = Header(default=None, alias="X-Telegram-Bot-Api-Secret-Token"),
+    ) -> dict[str, Any]:
+        return await _process_telegram_webhook(payload, db, push_provider, secret_header)
+
+    @app.post("/api/v1/support/telegram/webhooks")
+    async def telegram_webhooks_alias(
+        payload: dict[str, Any],
+        db: Session = Depends(get_db),
+        push_provider: PushNotificationService = Depends(get_push_provider),
+        secret_header: str | None = Header(default=None, alias="X-Telegram-Bot-Api-Secret-Token"),
+    ) -> dict[str, Any]:
+        return await _process_telegram_webhook(payload, db, push_provider, secret_header)

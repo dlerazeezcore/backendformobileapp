@@ -263,6 +263,31 @@ class TelegramSupportRoutesTest(unittest.TestCase):
             self.assertEqual(webhook.status_code, 200)
             self.assertEqual(webhook.json().get("pushDeliveryStatus"), "sent")
 
+    def test_webhooks_alias_route_accepts_telegram_payload(self) -> None:
+        app = create_app()
+
+        def fake_push(*, tokens, title, body, data, channel_id, image=None):
+            _ = image
+            self.assertEqual(tokens, ["push-token-1"])
+            self.assertEqual(title, "Support reply")
+            self.assertEqual(channel_id, "support")
+            return {"successCount": 1, "failureCount": 0, "invalidTokens": []}
+
+        with TestClient(app) as client:
+            client.app.state.push_notification_service.send_push_notification = fake_push
+            webhook = client.post(
+                "/api/v1/support/telegram/webhooks",
+                headers={"X-Telegram-Bot-Api-Secret-Token": "webhook-secret"},
+                json={
+                    "message": {
+                        "message_id": 558,
+                        "text": "Alias route test\nPhone: +9647700000002",
+                        "chat": {"id": -5169340336},
+                    }
+                },
+            )
+            self.assertEqual(webhook.status_code, 200)
+            self.assertEqual(webhook.json().get("pushDeliveryStatus"), "sent")
 
 if __name__ == "__main__":
     unittest.main()
