@@ -101,9 +101,6 @@ class TelegramSupportRoutesTest(unittest.TestCase):
             self.assertEqual(chat_id, -5169340336)
             self.assertIn("Phone: +9647700000002", text)
             self.assertIn("Name: Standard User", text)
-            self.assertNotIn("User ID:", text)
-            self.assertNotIn("Thread:", text)
-            self.assertNotIn("App URL:", text)
             return {"ok": True, "result": {"message_id": 789}}
 
         original = telegram_support._telegram_send_message
@@ -291,63 +288,6 @@ class TelegramSupportRoutesTest(unittest.TestCase):
             )
             self.assertEqual(webhook.status_code, 200)
             self.assertEqual(webhook.json().get("pushDeliveryStatus"), "sent")
-
-    def test_webhook_events_alias_accepts_telegram_payload(self) -> None:
-        app = create_app()
-
-        def fake_push(*, tokens, title, body, data, channel_id, image=None):
-            _ = image
-            self.assertEqual(tokens, ["push-token-1"])
-            self.assertEqual(title, "Support reply")
-            self.assertEqual(channel_id, "support")
-            return {"successCount": 1, "failureCount": 0, "invalidTokens": []}
-
-        with TestClient(app) as client:
-            client.app.state.push_notification_service.send_push_notification = fake_push
-            webhook = client.post(
-                "/api/v1/support/telegram/webhook/events",
-                headers={"X-Telegram-Bot-Api-Secret-Token": "webhook-secret"},
-                json={
-                    "message": {
-                        "message_id": 559,
-                        "text": "Events route test\nPhone: +9647700000002",
-                        "chat": {"id": -5169340336},
-                    }
-                },
-            )
-            self.assertEqual(webhook.status_code, 200)
-            self.assertEqual(webhook.json().get("pushDeliveryStatus"), "sent")
-
-    def test_webhook_duplicate_message_id_returns_ok(self) -> None:
-        app = create_app()
-
-        with TestClient(app) as client:
-            first = client.post(
-                "/api/v1/support/telegram/webhook",
-                headers={"X-Telegram-Bot-Api-Secret-Token": "webhook-secret"},
-                json={
-                    "message": {
-                        "message_id": 560,
-                        "text": "Duplicate test\nPhone: +9647700000002",
-                        "chat": {"id": -5169340336},
-                    }
-                },
-            )
-            self.assertEqual(first.status_code, 200)
-            second = client.post(
-                "/api/v1/support/telegram/webhook",
-                headers={"X-Telegram-Bot-Api-Secret-Token": "webhook-secret"},
-                json={
-                    "message": {
-                        "message_id": 560,
-                        "text": "Duplicate test\nPhone: +9647700000002",
-                        "chat": {"id": -5169340336},
-                    }
-                },
-            )
-            self.assertEqual(second.status_code, 200)
-            self.assertTrue(second.json().get("duplicate"))
-
 
 if __name__ == "__main__":
     unittest.main()

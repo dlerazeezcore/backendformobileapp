@@ -17,6 +17,7 @@ from phone_utils import phone_lookup_candidates
 from supabase_store import AdminUser, AppUser, PushDevice, TelegramSupportMessage, utcnow
 
 TELEGRAM_SUPPORT_CHAT_ID = -5169340336
+TELEGRAM_SUPPORT_PUBLIC_BASE_URL = "https://mean-lettie-corevia-0bd7cc91.koyeb.app/"
 USER_ID_PATTERN = re.compile(r"User ID:\s*([0-9a-fA-F-]{36})")
 PHONE_PATTERN = re.compile(r"Phone:\s*(\+?[0-9][0-9\s\-]{6,})")
 
@@ -230,8 +231,7 @@ def register_telegram_support_routes(
     ) -> dict[str, Any]:
         settings = get_settings()
         configured_secret = str(settings.telegram_support_webhook_secret or "").strip()
-        incoming_secret = str(secret_header or "").strip()
-        if configured_secret and incoming_secret and not hmac.compare_digest(incoming_secret, configured_secret):
+        if not configured_secret or not hmac.compare_digest(str(secret_header or ""), configured_secret):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid Telegram webhook secret")
 
         message = payload.get("message") if isinstance(payload, dict) else None
@@ -245,16 +245,6 @@ def register_telegram_support_routes(
         chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
         chat_id = int(chat.get("id")) if chat.get("id") is not None else TELEGRAM_SUPPORT_CHAT_ID
         telegram_message_id = int(message.get("message_id")) if message.get("message_id") is not None else None
-        if telegram_message_id is not None:
-            existing = db.scalar(select(TelegramSupportMessage).where(TelegramSupportMessage.telegram_message_id == telegram_message_id))
-            if existing is not None:
-                return {
-                    "ok": True,
-                    "messageId": existing.id,
-                    "userId": existing.user_id,
-                    "pushDeliveryStatus": existing.push_delivery_status,
-                    "duplicate": True,
-                }
 
         user_id: str | None = None
         reply_block = message.get("reply_to_message") if isinstance(message.get("reply_to_message"), dict) else None
@@ -351,15 +341,6 @@ def register_telegram_support_routes(
 
     @app.post("/api/v1/support/telegram/webhooks")
     async def telegram_webhooks_alias(
-        payload: dict[str, Any],
-        db: Session = Depends(get_db),
-        push_provider: PushNotificationService = Depends(get_push_provider),
-        secret_header: str | None = Header(default=None, alias="X-Telegram-Bot-Api-Secret-Token"),
-    ) -> dict[str, Any]:
-        return await _process_telegram_webhook(payload, db, push_provider, secret_header)
-
-    @app.post("/api/v1/support/telegram/webhook/events")
-    async def telegram_webhook_events_alias(
         payload: dict[str, Any],
         db: Session = Depends(get_db),
         push_provider: PushNotificationService = Depends(get_push_provider),
