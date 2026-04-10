@@ -23,6 +23,7 @@ USER_ID_PATTERN = re.compile(r"User ID:\s*([0-9a-fA-F-]{36})")
 
 class SupportMessagePayload(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
+    user_id: str | None = Field(default=None, alias="userId")
 
 
 async def _telegram_send_message(*, bot_token: str, chat_id: int, text: str, reply_to: int | None = None) -> dict[str, Any]:
@@ -68,13 +69,11 @@ def register_telegram_support_routes(
     get_db: Callable[..., Any],
     get_push_provider: Callable[..., PushNotificationService],
 ) -> None:
-    async def _require_user_actor(
+    async def _require_active_actor(
         claims: dict[str, Any] = Depends(get_token_claims),
         db: Session = Depends(get_db),
-    ) -> AppUser:
-        row = require_active_subject(db, claims=claims, subject_type="user")
-        assert isinstance(row, AppUser)
-        return row
+    ) -> AppUser | AdminUser:
+        return require_active_subject(db, claims=claims)
 
     async def _require_active_actor(
         claims: dict[str, Any] = Depends(get_token_claims),
@@ -86,36 +85,91 @@ def register_telegram_support_routes(
     async def send_support_message(
         payload: SupportMessagePayload,
         db: Session = Depends(get_db),
-        actor: AppUser = Depends(_require_user_actor),
+        actor: AppUser | AdminUser = Depends(_require_active_actor),
+        push_provider: PushNotificationService = Depends(get_push_provider),
     ) -> dict[str, Any]:
-        settings = get_settings()
-        bot_token = str(settings.telegram_support_bot_token or "").strip()
-        if not bot_token:
-            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Telegram support is not configured")
+        if isinstance(actor, AppUser):
+            settings = get_settings()
+            bot_token = str(settings.telegram_support_bot_token or "").strip()
+            if not bot_token:
+                raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Telegram support is not configured")
+
+            row = TelegramSupportMessage(
+                user_id=actor.id,
+                direction="user_to_admin",
+                status="pending",
+                message_text=payload.message.strip(),
+                telegram_chat_id=TELEGRAM_SUPPORT_CHAT_ID,
+            )
+            db.add(row)
+            db.flush()
+
+            outbound_text = _render_user_message_for_telegram(actor=actor, text=payload.message)
+            try:
+                sent = await _telegram_send_message(bot_token=bot_token, chat_id=TELEGRAM_SUPPORT_CHAT_ID, text=outbound_text)
+                result = sent.get("result") or {}
+                row.telegram_message_id = int(result.get("message_id")) if result.get("message_id") is not None else None
+                row.provider_payload = sent
+                row.status = "sent"
+            except HTTPException as exc:
+                row.status = "failed"
+                row.error_message = str(exc.detail)
+                row.updated_at = utcnow()
+                db.commit()
+                raise
+
+            row.updated_at = utcnow()
+            db.commit()
+            db.refresh(row)
+            return {
+                "message": {
+                    "id": row.id,
+                    "userId": row.user_id,
+                    "direction": row.direction,
+                    "status": row.status,
+                    "telegramMessageId": row.telegram_message_id,
+                    "createdAt": row.created_at,
+                }
+            }
+
+        target_user_id = payload.user_id
+        if not target_user_id:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="userId is required for admin messages")
 
         row = TelegramSupportMessage(
-            user_id=actor.id,
-            direction="user_to_admin",
+            user_id=target_user_id,
+            admin_user_id=actor.id,
+            direction="admin_to_user",
             status="pending",
             message_text=payload.message.strip(),
-            telegram_chat_id=TELEGRAM_SUPPORT_CHAT_ID,
+            push_delivery_status="pending",
         )
         db.add(row)
         db.flush()
 
-        outbound_text = _render_user_message_for_telegram(actor=actor, text=payload.message)
-        try:
-            sent = await _telegram_send_message(bot_token=bot_token, chat_id=TELEGRAM_SUPPORT_CHAT_ID, text=outbound_text)
-            result = sent.get("result") or {}
-            row.telegram_message_id = int(result.get("message_id")) if result.get("message_id") is not None else None
-            row.provider_payload = sent
+        tokens = db.scalars(select(PushDevice.token).where(PushDevice.user_id == target_user_id, PushDevice.active.is_(True))).all()
+        if tokens:
+            try:
+                send_result = push_provider.send_push_notification(
+                    tokens=tokens,
+                    title="Support reply",
+                    body=payload.message.strip()[:2000],
+                    data={"type": "support_reply", "supportMessageId": row.id},
+                    channel_id="support",
+                )
+                if int(send_result.get("successCount") or 0) > 0:
+                    row.push_delivery_status = "sent"
+                    row.status = "sent"
+                else:
+                    row.push_delivery_status = "failed"
+                    row.status = "failed"
+            except Exception as exc:  # noqa: BLE001
+                row.push_delivery_status = "failed"
+                row.status = "failed"
+                row.error_message = str(exc)
+        else:
+            row.push_delivery_status = "no_devices"
             row.status = "sent"
-        except HTTPException as exc:
-            row.status = "failed"
-            row.error_message = str(exc.detail)
-            row.updated_at = utcnow()
-            db.commit()
-            raise
 
         row.updated_at = utcnow()
         db.commit()
@@ -123,9 +177,10 @@ def register_telegram_support_routes(
         return {
             "message": {
                 "id": row.id,
+                "userId": row.user_id,
                 "direction": row.direction,
                 "status": row.status,
-                "telegramMessageId": row.telegram_message_id,
+                "pushDeliveryStatus": row.push_delivery_status,
                 "createdAt": row.created_at,
             }
         }

@@ -117,6 +117,37 @@ class TelegramSupportRoutesTest(unittest.TestCase):
         finally:
             telegram_support._telegram_send_message = original
 
+    def test_admin_can_send_support_reply(self) -> None:
+        app = create_app()
+
+        captured = {}
+
+        def fake_push(*, tokens, title, body, data, channel_id, image=None):
+            _ = image
+            captured["tokens"] = tokens
+            captured["title"] = title
+            captured["body"] = body
+            captured["data"] = data
+            captured["channel_id"] = channel_id
+            return {"successCount": 1, "failureCount": 0, "invalidTokens": []}
+
+        with TestClient(app) as client:
+            client.app.state.push_notification_service.send_push_notification = fake_push
+            response = client.post(
+                "/api/v1/support/telegram/messages",
+                headers={"Authorization": f"Bearer {self._admin_token()}"},
+                json={"userId": "22222222-2222-2222-2222-222222222222", "message": "We are checking your issue."},
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()["message"]
+            self.assertEqual(payload["direction"], "admin_to_user")
+            self.assertEqual(payload["status"], "sent")
+            self.assertEqual(payload["pushDeliveryStatus"], "sent")
+
+        self.assertEqual(captured["tokens"], ["push-token-1"])
+        self.assertEqual(captured["title"], "Support reply")
+        self.assertEqual(captured["channel_id"], "support")
+
     def test_admin_can_list_support_messages(self) -> None:
         import telegram_support
 
