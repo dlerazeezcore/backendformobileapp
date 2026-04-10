@@ -551,6 +551,8 @@ These routes are intended for mobile app read flows and do not require admin sco
 
 - `GET /api/v1/esim-access/exchange-rates/current` (user/admin token)
 - `GET /api/v1/esim-access/profiles/my` (user/admin token, scoped to token subject only)
+- `POST /api/v1/esim-access/profiles/install/my` (user/admin token, ownership checks)
+- `POST /api/v1/esim-access/profiles/activate/my` (user/admin token, ownership checks)
 
 ### Push notification routes
 
@@ -1447,6 +1449,8 @@ For user-scoped read flows (mobile app):
 
 - `GET /api/v1/esim-access/exchange-rates/current`
 - `GET /api/v1/esim-access/profiles/my`
+- `POST /api/v1/esim-access/profiles/install/my`
+- `POST /api/v1/esim-access/profiles/activate/my`
 
 `GET /api/v1/esim-access/exchange-rates/current`
 
@@ -1476,11 +1480,13 @@ Example:
 
 - auth: bearer token required
 - scoped to token subject only (no cross-user leakage)
+- optional `userId` query is allowed for admin tokens only
 - query params:
   - `limit` (default 100, max 500)
   - `offset` (default 0)
   - `status` (optional)
   - `installed` (optional boolean)
+  - `userId` (optional, admin token only)
 
 Example:
 
@@ -1516,6 +1522,25 @@ Example:
   }
 }
 ```
+
+`POST /api/v1/esim-access/profiles/install/my`
+
+- auth: bearer token required
+- request body supports:
+  - `iccid` or `esimTranNo` (one required)
+  - `userId` (optional; admin token can target a specific user)
+  - `platformCode` (optional; defaults to `mobile-app`)
+  - `note` (optional)
+- ownership rules:
+  - user token can only act on profiles owned by that same user
+  - admin token can act on profile ownership matching provided `userId` (or its own subject if omitted)
+- returns updated profile object in `data.profile`
+
+`POST /api/v1/esim-access/profiles/activate/my`
+
+- same auth/ownership/request rules as install route
+- sets `installed=true`, `installedAt`/`activatedAt`, and active app status
+- returns updated profile object in `data.profile`
 
 The frontend admin panel should treat these as configuration sources for future purchases, not retroactive changes to old orders.
 

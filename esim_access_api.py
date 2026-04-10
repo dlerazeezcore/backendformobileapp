@@ -12,12 +12,13 @@ from typing import Any, Callable, Generic, TypeVar
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
-from fastapi import Depends, FastAPI, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from auth import get_token_claims, require_active_subject
-from supabase_store import AppUser, ESimProfile, PaymentAttempt, SupabaseStore, utcnow
+from supabase_store import AdminUser, AppUser, ESimProfile, PaymentAttempt, SupabaseStore, utcnow
 from users import UserPayload
 
 
@@ -158,6 +159,33 @@ def _serialize_profile(row: ESimProfile, *, now: datetime) -> dict[str, Any]:
         "esimTranNo": row.esim_tran_no,
         "customFields": row.custom_fields or {},
     }
+
+
+def _resolve_target_user_id(
+    *,
+    actor: AppUser | AdminUser,
+    claims: dict[str, Any],
+    requested_user_id: str | None,
+) -> str:
+    subject_type = str(claims.get("typ") or "")
+    if subject_type == "user":
+        if requested_user_id and requested_user_id != actor.id:
+            raise HTTPException(
+                status_code=403,
+                detail="User token cannot access another user's data.",
+            )
+        return actor.id
+    if subject_type == "admin":
+        return requested_user_id or actor.id
+    raise HTTPException(status_code=403, detail="Token subject is not allowed for this endpoint.")
+
+
+def _resolve_profile_identifier(payload: MyProfileActionPayload) -> tuple[str, str]:
+    if payload.iccid and payload.iccid.strip():
+        return "iccid", payload.iccid.strip()
+    if payload.esim_tran_no and payload.esim_tran_no.strip():
+        return "esim_tran_no", payload.esim_tran_no.strip()
+    raise HTTPException(status_code=422, detail="Either iccid or esimTranNo is required.")
 
 
 def build_topup_error_response(exc: Exception) -> JSONResponse:
@@ -602,6 +630,14 @@ class ActionContext(BaseModel):
     platform_name: str | None = Field(default=None, alias="platformName")
     note: str | None = None
     custom_fields: dict[str, Any] = Field(default_factory=dict, alias="customFields")
+
+
+class MyProfileActionPayload(BaseModel):
+    iccid: str | None = None
+    esim_tran_no: str | None = Field(default=None, alias="esimTranNo")
+    user_id: str | None = Field(default=None, alias="userId")
+    platform_code: str | None = Field(default="mobile-app", alias="platformCode")
+    note: str | None = None
 
 
 class ManagedOrderPayload(BaseModel):
@@ -1134,7 +1170,14 @@ def register_esim_access_routes(
             },
         }
 
-    @app.get("/api/v1/esim-access/profiles/my")
+    @app.get(
+        "/api/v1/esim-access/profiles/my",
+        summary="List eSIM profiles for the authenticated subject",
+        responses={
+            401: {"description": "Missing or invalid bearer token."},
+            403: {"description": "Token subject cannot access the requested user scope."},
+        },
+    )
     async def list_my_profiles(
         db: Session = Depends(get_db),
         claims: dict[str, Any] = Depends(get_token_claims),
@@ -1142,12 +1185,13 @@ def register_esim_access_routes(
         offset: int = Query(default=0, ge=0),
         status: str | None = Query(default=None),
         installed: bool | None = Query(default=None),
+        user_id: str | None = Query(default=None, alias="userId"),
     ) -> dict[str, Any]:
         actor = require_active_subject(db, claims=claims)
-        user_id = actor.id
+        target_user_id = _resolve_target_user_id(actor=actor, claims=claims, requested_user_id=user_id)
         store = SupabaseStore(db)
         rows, total = store.list_profiles_for_user(
-            user_id=user_id,
+            user_id=target_user_id,
             limit=limit,
             offset=offset,
             status=status,
@@ -1163,6 +1207,84 @@ def register_esim_access_routes(
                 "total": total,
             },
         }
+
+    @app.post(
+        "/api/v1/esim-access/profiles/install/my",
+        summary="Mark caller-owned profile as installed",
+        responses={
+            401: {"description": "Missing or invalid bearer token."},
+            403: {"description": "Ownership mismatch or forbidden target user scope."},
+        },
+    )
+    async def install_my_profile(
+        payload: MyProfileActionPayload,
+        db: Session = Depends(get_db),
+        claims: dict[str, Any] = Depends(get_token_claims),
+    ) -> dict[str, Any]:
+        actor = require_active_subject(db, claims=claims)
+        target_user_id = _resolve_target_user_id(actor=actor, claims=claims, requested_user_id=payload.user_id)
+        identifier_key, identifier_value = _resolve_profile_identifier(payload)
+        store = SupabaseStore(db)
+        profile = (
+            db.scalar(select(ESimProfile).where(ESimProfile.iccid == identifier_value))
+            if identifier_key == "iccid"
+            else db.scalar(select(ESimProfile).where(ESimProfile.esim_tran_no == identifier_value))
+        )
+        if profile is None:
+            raise HTTPException(status_code=404, detail="Profile not found.")
+        if profile.user_id != target_user_id:
+            raise HTTPException(status_code=403, detail="Profile ownership mismatch.")
+        updated = store.apply_profile_action(
+            action="install",
+            identifier_key=identifier_key,
+            identifier_value=identifier_value,
+            platform_code=payload.platform_code,
+            actor_phone=str(claims.get("phone") or ""),
+            note=payload.note,
+            payload=payload.model_dump(by_alias=True, exclude_none=True),
+        )
+        if updated is None:
+            raise HTTPException(status_code=404, detail="Profile not found.")
+        return {"success": True, "data": {"profile": _serialize_profile(updated, now=utcnow())}}
+
+    @app.post(
+        "/api/v1/esim-access/profiles/activate/my",
+        summary="Mark caller-owned profile as activated",
+        responses={
+            401: {"description": "Missing or invalid bearer token."},
+            403: {"description": "Ownership mismatch or forbidden target user scope."},
+        },
+    )
+    async def activate_my_profile(
+        payload: MyProfileActionPayload,
+        db: Session = Depends(get_db),
+        claims: dict[str, Any] = Depends(get_token_claims),
+    ) -> dict[str, Any]:
+        actor = require_active_subject(db, claims=claims)
+        target_user_id = _resolve_target_user_id(actor=actor, claims=claims, requested_user_id=payload.user_id)
+        identifier_key, identifier_value = _resolve_profile_identifier(payload)
+        store = SupabaseStore(db)
+        profile = (
+            db.scalar(select(ESimProfile).where(ESimProfile.iccid == identifier_value))
+            if identifier_key == "iccid"
+            else db.scalar(select(ESimProfile).where(ESimProfile.esim_tran_no == identifier_value))
+        )
+        if profile is None:
+            raise HTTPException(status_code=404, detail="Profile not found.")
+        if profile.user_id != target_user_id:
+            raise HTTPException(status_code=403, detail="Profile ownership mismatch.")
+        updated = store.apply_profile_action(
+            action="activate",
+            identifier_key=identifier_key,
+            identifier_value=identifier_value,
+            platform_code=payload.platform_code,
+            actor_phone=str(claims.get("phone") or ""),
+            note=payload.note,
+            payload=payload.model_dump(by_alias=True, exclude_none=True),
+        )
+        if updated is None:
+            raise HTTPException(status_code=404, detail="Profile not found.")
+        return {"success": True, "data": {"profile": _serialize_profile(updated, now=utcnow())}}
 
     @app.post("/api/v1/esim-access/webhooks/events")
     @app.post("/api/v1/esim-access/webhook/events")

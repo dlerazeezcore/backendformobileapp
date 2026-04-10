@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, delete
+from sqlalchemy import create_engine, delete, select
 from sqlalchemy.orm import sessionmaker
 
 from app import create_app
@@ -206,6 +206,95 @@ class UserScopedReadsTest(unittest.TestCase):
             self.assertEqual(payload["data"]["profiles"][0]["status"], "active")
             self.assertTrue(payload["data"]["profiles"][0]["installed"])
 
+    def test_profiles_my_user_token_forbids_other_user_filter(self) -> None:
+        token = self._token(
+            subject_id="22222222-2222-2222-2222-222222222222",
+            phone="+9647700000002",
+            subject_type="user",
+        )
+        with TestClient(create_app()) as client:
+            response = client.get(
+                "/api/v1/esim-access/profiles/my?userId=33333333-3333-3333-3333-333333333333",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            self.assertEqual(response.status_code, 403)
+
+    def test_profiles_my_admin_token_can_target_user_id(self) -> None:
+        token = self._token(
+            subject_id="11111111-1111-1111-1111-111111111111",
+            phone="+9647700000001",
+            subject_type="admin",
+        )
+        with TestClient(create_app()) as client:
+            response = client.get(
+                "/api/v1/esim-access/profiles/my?userId=33333333-3333-3333-3333-333333333333",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertEqual(payload["data"]["total"], 1)
+            self.assertEqual(payload["data"]["profiles"][0]["userId"], "33333333-3333-3333-3333-333333333333")
+
+    def test_install_my_updates_owned_profile(self) -> None:
+        token = self._token(
+            subject_id="22222222-2222-2222-2222-222222222222",
+            phone="+9647700000002",
+            subject_type="user",
+        )
+        with self.session_factory() as session:
+            profile = session.scalar(select(ESimProfile).where(ESimProfile.iccid == "ICCID-USER1"))
+            assert profile is not None
+            profile.installed = False
+            profile.installed_at = None
+            session.commit()
+
+        with TestClient(create_app()) as client:
+            response = client.post(
+                "/api/v1/esim-access/profiles/install/my",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"iccid": "ICCID-USER1"},
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            profile = payload["data"]["profile"]
+            self.assertTrue(profile["installed"])
+            self.assertIsNotNone(profile["installedAt"])
+            self.assertEqual(profile["iccid"], "ICCID-USER1")
+
+    def test_activate_my_forbids_non_owner(self) -> None:
+        token = self._token(
+            subject_id="22222222-2222-2222-2222-222222222222",
+            phone="+9647700000002",
+            subject_type="user",
+        )
+        with TestClient(create_app()) as client:
+            response = client.post(
+                "/api/v1/esim-access/profiles/activate/my",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"iccid": "ICCID-USER2"},
+            )
+            self.assertEqual(response.status_code, 403)
+
+    def test_activate_my_admin_can_target_user_id(self) -> None:
+        token = self._token(
+            subject_id="11111111-1111-1111-1111-111111111111",
+            phone="+9647700000001",
+            subject_type="admin",
+        )
+        with TestClient(create_app()) as client:
+            response = client.post(
+                "/api/v1/esim-access/profiles/activate/my",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"iccid": "ICCID-USER2", "userId": "33333333-3333-3333-3333-333333333333"},
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            profile = payload["data"]["profile"]
+            self.assertEqual(profile["iccid"], "ICCID-USER2")
+            self.assertTrue(profile["installed"])
+            self.assertIsNotNone(profile["activatedAt"])
+            self.assertEqual(profile["status"], "active")
+
     def test_exchange_rates_current_returns_configured_values(self) -> None:
         user_token = self._token(
             subject_id="22222222-2222-2222-2222-222222222222",
@@ -253,10 +342,13 @@ class UserScopedReadsTest(unittest.TestCase):
         with TestClient(create_app()) as client:
             exchange_response = client.get("/api/v1/esim-access/exchange-rates/current")
             profiles_response = client.get("/api/v1/esim-access/profiles/my")
+            install_response = client.post("/api/v1/esim-access/profiles/install/my", json={"iccid": "ICCID-USER1"})
+            activate_response = client.post("/api/v1/esim-access/profiles/activate/my", json={"iccid": "ICCID-USER1"})
             self.assertEqual(exchange_response.status_code, 401)
             self.assertEqual(profiles_response.status_code, 401)
+            self.assertEqual(install_response.status_code, 401)
+            self.assertEqual(activate_response.status_code, 401)
 
 
 if __name__ == "__main__":
     unittest.main()
-

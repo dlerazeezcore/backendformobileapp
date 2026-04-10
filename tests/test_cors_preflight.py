@@ -64,6 +64,27 @@ class CorsPreflightTest(unittest.TestCase):
             self.assertEqual(exchange_preflight.headers.get("access-control-allow-origin"), "http://localhost:5173")
             self.assertEqual(profiles_preflight.headers.get("access-control-allow-origin"), "http://localhost:5173")
 
+            install_preflight = client.options(
+                "/api/v1/esim-access/profiles/install/my",
+                headers={
+                    "Origin": "http://localhost:5173",
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": "authorization,content-type",
+                },
+            )
+            activate_preflight = client.options(
+                "/api/v1/esim-access/profiles/activate/my",
+                headers={
+                    "Origin": "http://localhost:5173",
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": "authorization,content-type",
+                },
+            )
+            self.assertEqual(install_preflight.status_code, 200)
+            self.assertEqual(activate_preflight.status_code, 200)
+            self.assertEqual(install_preflight.headers.get("access-control-allow-origin"), "http://localhost:5173")
+            self.assertEqual(activate_preflight.headers.get("access-control-allow-origin"), "http://localhost:5173")
+
 
 if __name__ == "__main__":
     unittest.main()
