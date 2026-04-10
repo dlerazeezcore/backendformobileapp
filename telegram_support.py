@@ -13,12 +13,13 @@ from sqlalchemy.orm import Session
 from auth import get_token_claims, require_active_subject
 from config import get_settings
 from push_notification import PushNotificationService
+from phone_utils import phone_lookup_candidates
 from supabase_store import AdminUser, AppUser, PushDevice, TelegramSupportMessage, utcnow
 
 TELEGRAM_SUPPORT_CHAT_ID = -5169340336
 TELEGRAM_SUPPORT_PUBLIC_BASE_URL = "https://mean-lettie-corevia-0bd7cc91.koyeb.app/"
-
 USER_ID_PATTERN = re.compile(r"User ID:\s*([0-9a-fA-F-]{36})")
+PHONE_PATTERN = re.compile(r"Phone:\s*(\+?[0-9][0-9\s\-]{6,})")
 
 
 class SupportMessagePayload(BaseModel):
@@ -64,17 +65,25 @@ def _extract_user_id_from_text(text: str) -> str | None:
     return match.group(1)
 
 
+def _extract_phone_from_text(text: str) -> str | None:
+    match = PHONE_PATTERN.search(text)
+    if match is None:
+        return None
+    return match.group(1).strip()
+
+
+def _find_user_by_phone(db: Session, phone: str) -> AppUser | None:
+    candidates = phone_lookup_candidates(phone)
+    if not candidates:
+        return None
+    return db.scalar(select(AppUser).where(AppUser.phone.in_(candidates)))
+
+
 def register_telegram_support_routes(
     app: FastAPI,
     get_db: Callable[..., Any],
     get_push_provider: Callable[..., PushNotificationService],
 ) -> None:
-    async def _require_active_actor(
-        claims: dict[str, Any] = Depends(get_token_claims),
-        db: Session = Depends(get_db),
-    ) -> AppUser | AdminUser:
-        return require_active_subject(db, claims=claims)
-
     async def _require_active_actor(
         claims: dict[str, Any] = Depends(get_token_claims),
         db: Session = Depends(get_db),
@@ -254,6 +263,20 @@ def register_telegram_support_routes(
 
         if user_id is None:
             user_id = _extract_user_id_from_text(text)
+
+        if user_id is None and reply_block is not None:
+            reply_phone = _extract_phone_from_text(str(reply_block.get("text") or ""))
+            if reply_phone:
+                mapped_user = _find_user_by_phone(db, reply_phone)
+                if mapped_user is not None:
+                    user_id = mapped_user.id
+
+        if user_id is None:
+            phone_from_text = _extract_phone_from_text(text)
+            if phone_from_text:
+                mapped_user = _find_user_by_phone(db, phone_from_text)
+                if mapped_user is not None:
+                    user_id = mapped_user.id
 
         row = TelegramSupportMessage(
             user_id=user_id,

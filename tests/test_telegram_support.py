@@ -99,7 +99,8 @@ class TelegramSupportRoutesTest(unittest.TestCase):
             _ = reply_to
             self.assertEqual(bot_token, "fake-token")
             self.assertEqual(chat_id, -5169340336)
-            self.assertIn("User ID: 22222222-2222-2222-2222-222222222222", text)
+            self.assertIn("Phone: +9647700000002", text)
+            self.assertIn("Name: Standard User", text)
             return {"ok": True, "result": {"message_id": 789}}
 
         original = telegram_support._telegram_send_message
@@ -219,7 +220,7 @@ class TelegramSupportRoutesTest(unittest.TestCase):
                         "chat": {"id": -5169340336},
                         "reply_to_message": {
                             "message_id": 555,
-                            "text": "📩 Support message\nUser ID: 22222222-2222-2222-2222-222222222222",
+                            "text": "📩 Support message\nPhone: +9647700000002\nName: Standard User",
                         },
                     }
                 },
@@ -235,6 +236,32 @@ class TelegramSupportRoutesTest(unittest.TestCase):
             self.assertEqual(row.user_id, "22222222-2222-2222-2222-222222222222")
             self.assertEqual(row.push_delivery_status, "sent")
         engine.dispose()
+
+    def test_webhook_reply_maps_user_by_phone_when_no_reply_mapping(self) -> None:
+        app = create_app()
+
+        def fake_push(*, tokens, title, body, data, channel_id, image=None):
+            _ = image
+            self.assertEqual(tokens, ["push-token-1"])
+            self.assertEqual(title, "Support reply")
+            self.assertEqual(channel_id, "support")
+            return {"successCount": 1, "failureCount": 0, "invalidTokens": []}
+
+        with TestClient(app) as client:
+            client.app.state.push_notification_service.send_push_notification = fake_push
+            webhook = client.post(
+                "/api/v1/support/telegram/webhook",
+                headers={"X-Telegram-Bot-Api-Secret-Token": "webhook-secret"},
+                json={
+                    "message": {
+                        "message_id": 557,
+                        "text": "Resolved. Please check.\nPhone: +9647700000002",
+                        "chat": {"id": -5169340336},
+                    }
+                },
+            )
+            self.assertEqual(webhook.status_code, 200)
+            self.assertEqual(webhook.json().get("pushDeliveryStatus"), "sent")
 
 
 if __name__ == "__main__":
