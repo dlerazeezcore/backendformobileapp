@@ -2469,6 +2469,39 @@ class SupabaseStore:
             )
         return result
 
+    def get_current_exchange_rate_settings(self) -> ExchangeRate | None:
+        return self.get_active_exchange_rate(base_currency="USD", quote_currency="IQD")
+
+    def list_profiles_for_user(
+        self,
+        *,
+        user_id: str,
+        limit: int = 100,
+        offset: int = 0,
+        status: str | None = None,
+        installed: bool | None = None,
+    ) -> tuple[list[ESimProfile], int]:
+        effective_limit = max(1, min(limit, 500))
+        effective_offset = max(0, offset)
+
+        query = select(ESimProfile).where(ESimProfile.user_id == user_id)
+        if status is not None and status.strip():
+            normalized_status = status.strip().upper()
+            query = query.where(func.upper(func.coalesce(ESimProfile.app_status, "")) == normalized_status)
+        if installed is not None:
+            query = query.where(ESimProfile.installed.is_(installed))
+
+        count_query = select(func.count()).select_from(query.subquery())
+        total = int(self.session.scalar(count_query) or 0)
+
+        rows = self.session.scalars(
+            query
+            .order_by(ESimProfile.updated_at.desc(), ESimProfile.id.desc())
+            .offset(effective_offset)
+            .limit(effective_limit)
+        ).all()
+        return rows, total
+
     def save_payload(
         self,
         entity_type: str,

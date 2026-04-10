@@ -41,6 +41,29 @@ class CorsPreflightTest(unittest.TestCase):
             allowed_headers = str(response.headers.get("access-control-allow-headers") or "").lower()
             self.assertIn("authorization", allowed_headers)
 
+    def test_user_scoped_read_routes_support_preflight(self) -> None:
+        with TestClient(create_app()) as client:
+            exchange_preflight = client.options(
+                "/api/v1/esim-access/exchange-rates/current",
+                headers={
+                    "Origin": "http://localhost:5173",
+                    "Access-Control-Request-Method": "GET",
+                    "Access-Control-Request-Headers": "authorization,content-type",
+                },
+            )
+            profiles_preflight = client.options(
+                "/api/v1/esim-access/profiles/my?limit=100&offset=0",
+                headers={
+                    "Origin": "http://localhost:5173",
+                    "Access-Control-Request-Method": "GET",
+                    "Access-Control-Request-Headers": "authorization,content-type",
+                },
+            )
+            self.assertEqual(exchange_preflight.status_code, 200)
+            self.assertEqual(profiles_preflight.status_code, 200)
+            self.assertEqual(exchange_preflight.headers.get("access-control-allow-origin"), "http://localhost:5173")
+            self.assertEqual(profiles_preflight.headers.get("access-control-allow-origin"), "http://localhost:5173")
+
 
 if __name__ == "__main__":
     unittest.main()

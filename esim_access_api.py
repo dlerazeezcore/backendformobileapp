@@ -4,19 +4,20 @@ import asyncio
 import hashlib
 import hmac
 import json
+from math import ceil
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from time import time
 from typing import Any, Callable, Generic, TypeVar
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from auth import get_token_claims, require_active_subject
-from supabase_store import AppUser, PaymentAttempt, SupabaseStore, utcnow
+from supabase_store import AppUser, ESimProfile, PaymentAttempt, SupabaseStore, utcnow
 from users import UserPayload
 
 
@@ -82,6 +83,81 @@ def _normalize_provider_business_status(*, upstream_status: int | None, provider
     if any(token in message for token in _TOPUP_CONFLICT_HINTS):
         return 409
     return 502
+
+
+def _to_utc_z(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    return normalized.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _normalize_status(value: str | None) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return "inactive"
+    if raw == "canceled":
+        return "cancelled"
+    return raw
+
+
+def _format_number_as_string(value: float | int | str | None, fallback: str) -> str:
+    if value is None:
+        return fallback
+    if isinstance(value, str):
+        trimmed = value.strip()
+        return trimmed if trimmed else fallback
+    number = float(value)
+    if abs(number - int(number)) < 1e-9:
+        return str(int(number))
+    return f"{number:.6f}".rstrip("0").rstrip(".")
+
+
+def _to_bool(value: Any, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes", "y", "on"}:
+        return True
+    if text in {"false", "0", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _serialize_profile(row: ESimProfile, *, now: datetime) -> dict[str, Any]:
+    status_value = _normalize_status(row.app_status or row.provider_status)
+    days_left: int | None = None
+    if row.expires_at is not None:
+        expires_at = row.expires_at if row.expires_at.tzinfo is not None else row.expires_at.replace(tzinfo=timezone.utc)
+        now_at = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+        delta_seconds = (expires_at - now_at).total_seconds()
+        days_left = max(int(ceil(delta_seconds / 86400)), 0)
+    country_code = row.order_item.country_code if row.order_item is not None else None
+    country_name = row.order_item.country_name if row.order_item is not None else None
+    return {
+        "id": row.id,
+        "userId": row.user_id,
+        "iccid": row.iccid,
+        "countryCode": country_code,
+        "countryName": country_name,
+        "status": status_value,
+        "installed": bool(row.installed),
+        "installedAt": _to_utc_z(row.installed_at),
+        "activatedAt": _to_utc_z(row.activated_at),
+        "expiresAt": _to_utc_z(row.expires_at),
+        "totalDataMb": row.total_data_mb,
+        "usedDataMb": row.used_data_mb,
+        "remainingDataMb": row.remaining_data_mb,
+        "daysLeft": days_left,
+        "activationCode": row.activation_code,
+        "installUrl": row.install_url,
+        "esimTranNo": row.esim_tran_no,
+        "customFields": row.custom_fields or {},
+    }
 
 
 def build_topup_error_response(exc: Exception) -> JSONResponse:
@@ -1016,6 +1092,77 @@ def register_esim_access_routes(
         provider: ESimAccessAPI = Depends(get_provider),
     ) -> ESimAccessResponse[LocationListResult]:
         return await provider.locations(payload)
+
+    @app.get("/api/v1/esim-access/exchange-rates/current")
+    async def get_current_exchange_rate_settings(
+        db: Session = Depends(get_db),
+        claims: dict[str, Any] = Depends(get_token_claims),
+    ) -> dict[str, Any]:
+        _ = require_active_subject(db, claims=claims)
+        store = SupabaseStore(db)
+        exchange = store.get_current_exchange_rate_settings()
+        if exchange is None:
+            return {
+                "success": True,
+                "data": {
+                    "enableIQD": False,
+                    "exchangeRate": "1320",
+                    "markupPercent": "0",
+                    "source": "tulip-admin",
+                    "updatedAt": _to_utc_z(utcnow()),
+                },
+            }
+
+        custom = exchange.custom_fields or {}
+        enable_iqd = _to_bool(
+            custom.get("enableIQD", custom.get("enable_iqd")),
+            default=True,
+        )
+        markup_percent = _format_number_as_string(
+            custom.get("markupPercent", custom.get("markup_percent", 0)),
+            "0",
+        )
+        source = str(exchange.source or custom.get("source") or "tulip-admin").strip() or "tulip-admin"
+        return {
+            "success": True,
+            "data": {
+                "enableIQD": enable_iqd,
+                "exchangeRate": _format_number_as_string(exchange.rate, "1320"),
+                "markupPercent": markup_percent,
+                "source": source,
+                "updatedAt": _to_utc_z(exchange.updated_at),
+            },
+        }
+
+    @app.get("/api/v1/esim-access/profiles/my")
+    async def list_my_profiles(
+        db: Session = Depends(get_db),
+        claims: dict[str, Any] = Depends(get_token_claims),
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+        status: str | None = Query(default=None),
+        installed: bool | None = Query(default=None),
+    ) -> dict[str, Any]:
+        actor = require_active_subject(db, claims=claims)
+        user_id = actor.id
+        store = SupabaseStore(db)
+        rows, total = store.list_profiles_for_user(
+            user_id=user_id,
+            limit=limit,
+            offset=offset,
+            status=status,
+            installed=installed,
+        )
+        now = utcnow()
+        return {
+            "success": True,
+            "data": {
+                "profiles": [_serialize_profile(row, now=now) for row in rows],
+                "limit": limit,
+                "offset": offset,
+                "total": total,
+            },
+        }
 
     @app.post("/api/v1/esim-access/webhooks/events")
     @app.post("/api/v1/esim-access/webhook/events")

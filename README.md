@@ -545,6 +545,13 @@ These are the routes frontend should mainly use.
 - `POST /api/v1/esim-access/profiles/unsuspend/managed`
 - `POST /api/v1/esim-access/profiles/revoke/managed`
 
+### User-scoped read routes
+
+These routes are intended for mobile app read flows and do not require admin scope.
+
+- `GET /api/v1/esim-access/exchange-rates/current` (user/admin token)
+- `GET /api/v1/esim-access/profiles/my` (user/admin token, scoped to token subject only)
+
 ### Push notification routes
 
 User token/device routes:
@@ -595,6 +602,8 @@ Admin delivery routes:
 - `GET /api/v1/admin/lifecycle-events`
 - `GET /api/v1/admin/payment-attempts`
 - `GET /api/v1/admin/payment-provider-events`
+
+Admin routes above remain unchanged; mobile/user flows should use user-scoped read routes instead of admin list endpoints.
 
 ### Auth routes
 
@@ -1433,6 +1442,80 @@ For admin pricing:
 - `POST /api/v1/admin/exchange-rates`
 - `POST /api/v1/admin/pricing-rules`
 - `POST /api/v1/admin/discount-rules`
+
+For user-scoped read flows (mobile app):
+
+- `GET /api/v1/esim-access/exchange-rates/current`
+- `GET /api/v1/esim-access/profiles/my`
+
+`GET /api/v1/esim-access/exchange-rates/current`
+
+- auth: user token or admin token
+- returns current active USD -> IQD settings for app display
+- fallback when no configured active row:
+  - `enableIQD=false`
+  - `exchangeRate="1320"`
+  - `markupPercent="0"`
+
+Example:
+
+```json
+{
+  "success": true,
+  "data": {
+    "enableIQD": true,
+    "exchangeRate": "1500",
+    "markupPercent": "10",
+    "source": "tulip-admin",
+    "updatedAt": "2026-04-10T12:00:00Z"
+  }
+}
+```
+
+`GET /api/v1/esim-access/profiles/my`
+
+- auth: bearer token required
+- scoped to token subject only (no cross-user leakage)
+- query params:
+  - `limit` (default 100, max 500)
+  - `offset` (default 0)
+  - `status` (optional)
+  - `installed` (optional boolean)
+
+Example:
+
+```json
+{
+  "success": true,
+  "data": {
+    "profiles": [
+      {
+        "id": "...",
+        "userId": "...",
+        "iccid": "...",
+        "countryCode": "IQ",
+        "countryName": "Iraq",
+        "status": "active",
+        "installed": true,
+        "installedAt": "...",
+        "activatedAt": "...",
+        "expiresAt": "...",
+        "totalDataMb": 1024,
+        "usedDataMb": 250,
+        "remainingDataMb": 774,
+        "daysLeft": 12,
+        "activationCode": "...",
+        "installUrl": "...",
+        "esimTranNo": "...",
+        "customFields": {}
+      }
+    ],
+    "limit": 100,
+    "offset": 0,
+    "total": 1
+  }
+}
+```
 
 The frontend admin panel should treat these as configuration sources for future purchases, not retroactive changes to old orders.
 
