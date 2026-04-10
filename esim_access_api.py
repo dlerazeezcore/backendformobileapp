@@ -317,6 +317,11 @@ def _serialize_profile(row: ESimProfile, *, now: datetime) -> dict[str, Any]:
     total_data_mb = _normalize_mb(row.total_data_mb)
     used_data_mb = _normalize_mb(row.used_data_mb)
     remaining_data_mb = _normalize_mb(row.remaining_data_mb)
+    package_data_mb = total_data_mb
+    if package_data_mb is None:
+        package_data_mb = _normalize_mb(_as_int(custom_fields.get("packageDataMb")))
+    if package_data_mb is None:
+        package_data_mb = _normalize_mb(_as_int(custom_fields.get("packageData")))
     if remaining_data_mb is None and total_data_mb is not None and used_data_mb is not None:
         remaining_data_mb = max(total_data_mb - used_data_mb, 0)
 
@@ -346,6 +351,7 @@ def _serialize_profile(row: ESimProfile, *, now: datetime) -> dict[str, Any]:
         "activatedAt": _to_utc_z(row.activated_at),
         "expiresAt": _to_utc_z(row.expires_at),
         "totalDataMb": total_data_mb,
+        "packageDataMb": package_data_mb,
         "usedDataMb": used_data_mb,
         "remainingDataMb": remaining_data_mb,
         "totalDataGb": _to_gb(total_data_mb),

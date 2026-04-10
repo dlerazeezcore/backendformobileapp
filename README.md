@@ -1548,6 +1548,7 @@ Example:
         "activatedAt": "...",
         "expiresAt": "...",
         "totalDataMb": 1024,
+        "packageDataMb": 1024,
         "usedDataMb": 250,
         "remainingDataMb": 774,
         "daysLeft": 12,

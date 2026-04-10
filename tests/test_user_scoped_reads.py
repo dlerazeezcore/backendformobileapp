@@ -189,6 +189,7 @@ class UserScopedReadsTest(unittest.TestCase):
             self.assertEqual(profile["countryCode"], "IQ")
             self.assertEqual(profile["countryName"], "Iraq")
             self.assertEqual(profile["totalDataMb"], 100)
+            self.assertEqual(profile["packageDataMb"], 100)
             self.assertEqual(profile["usedDataMb"], 2)
             self.assertEqual(profile["remainingDataMb"], 96)
             self.assertEqual(profile["dataUnit"], "MB")
