@@ -18,7 +18,6 @@ from phone_utils import phone_lookup_candidates
 from supabase_store import AdminUser, AppUser, PushDevice, TelegramSupportMessage, utcnow
 
 TELEGRAM_SUPPORT_CHAT_ID = -5169340336
-TELEGRAM_SUPPORT_PUBLIC_BASE_URL = "https://mean-lettie-corevia-0bd7cc91.koyeb.app/"
 USER_ID_PATTERN = re.compile(r"User ID:\s*([0-9a-fA-F-]{36})")
 PHONE_PATTERN = re.compile(r"Phone:\s*(\+?[0-9][0-9\s\-]{6,})")
 
@@ -73,13 +72,13 @@ async def _telegram_set_webhook(*, bot_token: str, webhook_url: str, secret_toke
     return bool(body.get("ok"))
 
 
-def _build_telegram_webhook_url() -> str:
-    return f"{TELEGRAM_SUPPORT_PUBLIC_BASE_URL.rstrip('/')}/api/v1/support/telegram/webhook"
+def _build_telegram_webhook_url(base_url: str) -> str:
+    return f"{base_url.rstrip('/')}/api/v1/support/telegram/webhook"
 
 
-async def _ensure_telegram_webhook(bot_token: str, webhook_secret: str | None) -> None:
+async def _ensure_telegram_webhook(bot_token: str, webhook_secret: str | None, webhook_base_url: str) -> None:
     info = await _telegram_get_webhook_info(bot_token=bot_token)
-    desired_url = _build_telegram_webhook_url()
+    desired_url = _build_telegram_webhook_url(webhook_base_url)
     current_url = str(info.get("url") or "").strip()
     # Self-heal if webhook is missing or points to a different endpoint.
     if current_url != desired_url:
@@ -160,7 +159,12 @@ def register_telegram_support_routes(
             if not bot_token:
                 raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Telegram support is not configured")
             webhook_secret = str(settings.telegram_support_webhook_secret or "").strip() or None
-            await _ensure_telegram_webhook(bot_token=bot_token, webhook_secret=webhook_secret)
+            webhook_base_url = str(settings.telegram_support_webhook_base_url or "").strip()
+            await _ensure_telegram_webhook(
+                bot_token=bot_token,
+                webhook_secret=webhook_secret,
+                webhook_base_url=webhook_base_url,
+            )
 
             row = TelegramSupportMessage(
                 user_id=actor.id,

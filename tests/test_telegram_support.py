@@ -103,8 +103,8 @@ class TelegramSupportRoutesTest(unittest.TestCase):
             self.assertIn("Name: Standard User", text)
             return {"ok": True, "result": {"message_id": 789}}
 
-        async def fake_ensure_webhook(*, bot_token: str, webhook_secret: str | None):
-            _ = (bot_token, webhook_secret)
+        async def fake_ensure_webhook(*, bot_token: str, webhook_secret: str | None, webhook_base_url: str):
+            _ = (bot_token, webhook_secret, webhook_base_url)
             return None
 
         original = telegram_support._telegram_send_message
@@ -163,8 +163,8 @@ class TelegramSupportRoutesTest(unittest.TestCase):
             _ = (bot_token, chat_id, text, reply_to)
             return {"ok": True, "result": {"message_id": 900}}
 
-        async def fake_ensure_webhook(*, bot_token: str, webhook_secret: str | None):
-            _ = (bot_token, webhook_secret)
+        async def fake_ensure_webhook(*, bot_token: str, webhook_secret: str | None, webhook_base_url: str):
+            _ = (bot_token, webhook_secret, webhook_base_url)
             return None
 
         original = telegram_support._telegram_send_message
