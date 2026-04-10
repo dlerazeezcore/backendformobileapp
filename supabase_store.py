@@ -2418,6 +2418,57 @@ class SupabaseStore:
             )
         return result
 
+    def list_public_featured_locations(self, *, service_type: str = "esim") -> list[dict[str, Any]]:
+        now = utcnow()
+        rows = self.session.scalars(
+            select(FeaturedLocation)
+            .where(
+                FeaturedLocation.service_type == service_type,
+                FeaturedLocation.enabled.is_(True),
+                FeaturedLocation.is_popular.is_(True),
+                or_(FeaturedLocation.starts_at.is_(None), FeaturedLocation.starts_at <= now),
+                or_(FeaturedLocation.ends_at.is_(None), FeaturedLocation.ends_at > now),
+            )
+            .order_by(
+                FeaturedLocation.updated_at.desc(),
+                FeaturedLocation.created_at.desc(),
+                FeaturedLocation.id.desc(),
+            )
+        ).all()
+
+        latest_by_code: dict[str, FeaturedLocation] = {}
+        for row in rows:
+            key = str(row.code or "").strip().upper()
+            if not key:
+                continue
+            if key not in latest_by_code:
+                latest_by_code[key] = row
+
+        deduped_rows = list(latest_by_code.values())
+        deduped_rows.sort(
+            key=lambda row: (
+                int(row.sort_order or 0),
+                str(row.name or ""),
+                str(row.code or ""),
+            )
+        )
+
+        result: list[dict[str, Any]] = []
+        for row in deduped_rows:
+            result.append(
+                {
+                    "code": row.code,
+                    "name": row.name,
+                    "serviceType": row.service_type,
+                    "locationType": row.location_type,
+                    "isPopular": bool(row.is_popular),
+                    "enabled": bool(row.enabled),
+                    "sortOrder": int(row.sort_order or 0),
+                    "updatedAt": self._to_app_timezone(row.updated_at),
+                }
+            )
+        return result
+
     def save_payload(
         self,
         entity_type: str,

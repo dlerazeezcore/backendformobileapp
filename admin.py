@@ -244,6 +244,15 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         rows = SupabaseStore(db).list_rows(FeaturedLocation, limit=limit, offset=offset)
         return {"locations": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
 
+    @app.get("/api/v1/featured-locations/public")
+    @app.get("/api/v1/esim-access/featured-locations")
+    async def list_public_featured_locations(
+        db: Session = Depends(get_db),
+        service_type: str = Query(default="esim", alias="serviceType"),
+    ) -> dict[str, Any]:
+        locations = SupabaseStore(db).list_public_featured_locations(service_type=service_type)
+        return {"success": True, "data": {"locations": locations}}
+
     @app.post("/api/v1/admin/exchange-rates")
     async def save_exchange_rate(
         payload: ExchangeRatePayload,

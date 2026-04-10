@@ -527,6 +527,7 @@ These are useful for raw provider communication and debugging.
 - `POST /api/v1/esim-access/sms/send`
 - `POST /api/v1/esim-access/usage/query`
 - `POST /api/v1/esim-access/locations/query`
+- `GET /api/v1/esim-access/featured-locations` (public read alias)
 - `POST /api/v1/esim-access/webhooks/events`
 - `POST /api/v1/esim-access/webhook/events` (alias of `webhooks/events`)
 
@@ -584,6 +585,8 @@ Admin delivery routes:
 - `GET /api/v1/admin/discount-rules`
 - `POST /api/v1/admin/featured-locations`
 - `GET /api/v1/admin/featured-locations`
+- `GET /api/v1/featured-locations/public` (public read, guest/user)
+- `GET /api/v1/esim-access/featured-locations` (public read alias, guest/user)
 - `POST /api/v1/admin/exchange-rates`
 - `GET /api/v1/admin/exchange-rates`
 - `GET /api/v1/admin/orders`
@@ -615,7 +618,7 @@ Recommended frontend usage:
 
 1. admin creates pricing rules, discount rules, exchange rates, and featured countries
 2. app logs in and registers its push token/device with backend
-3. app queries package list from backend
+3. app loads featured countries from public endpoint and queries package list from backend
 4. app creates payment attempt (FIB checkout or loyalty flow)
 5. backend receives webhook callbacks and app polls payment status when needed
 6. app submits managed order request after payment success
@@ -1389,8 +1392,39 @@ Example payload:
 
 For homepage featured or popular countries:
 
-- use `POST /api/v1/admin/featured-locations`
-- read with `GET /api/v1/admin/featured-locations`
+- manage with admin endpoint: `POST /api/v1/admin/featured-locations`
+- admin audit/read: `GET /api/v1/admin/featured-locations`
+- app read (no admin token required): `GET /api/v1/featured-locations/public?serviceType=esim`
+- alias: `GET /api/v1/esim-access/featured-locations?serviceType=esim`
+
+Public featured locations response shape:
+
+```json
+{
+  "success": true,
+  "data": {
+    "locations": [
+      {
+        "code": "IQ",
+        "name": "Iraq",
+        "serviceType": "esim",
+        "locationType": "country",
+        "isPopular": true,
+        "enabled": true,
+        "sortOrder": 1,
+        "updatedAt": "2026-04-10T12:00:00+03:00"
+      }
+    ]
+  }
+}
+```
+
+Filtering behavior:
+
+- only `enabled = true`
+- only `isPopular = true`
+- only rows active in current time window (`startsAt <= now`, `endsAt` is null or future)
+- deduplicated by latest row per `code` (per `serviceType`) before sorting by `sortOrder`
 
 This is the current table for homepage merchandising.
 
