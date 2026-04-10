@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import hmac
-import logging
 import re
 from typing import Any, Callable
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -18,9 +17,9 @@ from phone_utils import phone_lookup_candidates
 from supabase_store import AdminUser, AppUser, PushDevice, TelegramSupportMessage, utcnow
 
 TELEGRAM_SUPPORT_CHAT_ID = -5169340336
+TELEGRAM_SUPPORT_PUBLIC_BASE_URL = "https://mean-lettie-corevia-0bd7cc91.koyeb.app/"
 USER_ID_PATTERN = re.compile(r"User ID:\s*([0-9a-fA-F-]{36})")
 PHONE_PATTERN = re.compile(r"Phone:\s*(\+?[0-9][0-9\s\-]{6,})")
-logger = logging.getLogger(__name__)
 
 
 class SupportMessagePayload(BaseModel):
@@ -226,29 +225,13 @@ def register_telegram_support_routes(
 
     async def _process_telegram_webhook(
         payload: dict[str, Any],
-        db: Session,
-        push_provider: PushNotificationService,
-        request: Request,
-        secret_header: str | None,
+        db: Session = Depends(get_db),
+        push_provider: PushNotificationService = Depends(get_push_provider),
+        secret_header: str | None = Header(default=None, alias="X-Telegram-Bot-Api-Secret-Token"),
     ) -> dict[str, Any]:
-        update_id = payload.get("update_id") if isinstance(payload, dict) else None
-        logger.info(
-            "telegram_webhook_incoming path=%s has_secret_header=%s update_id=%s",
-            request.url.path,
-            bool(str(secret_header or "").strip()),
-            update_id,
-        )
         settings = get_settings()
         configured_secret = str(settings.telegram_support_webhook_secret or "").strip()
-        incoming_secret = str(secret_header or "").strip()
-        secret_ok = (not configured_secret) or (not incoming_secret) or hmac.compare_digest(incoming_secret, configured_secret)
-        logger.info(
-            "telegram_webhook_secret_check configured=%s incoming=%s result=%s",
-            bool(configured_secret),
-            bool(incoming_secret),
-            secret_ok,
-        )
-        if configured_secret and incoming_secret and not hmac.compare_digest(incoming_secret, configured_secret):
+        if not configured_secret or not hmac.compare_digest(str(secret_header or ""), configured_secret):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid Telegram webhook secret")
 
         message = payload.get("message") if isinstance(payload, dict) else None
@@ -262,23 +245,6 @@ def register_telegram_support_routes(
         chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
         chat_id = int(chat.get("id")) if chat.get("id") is not None else TELEGRAM_SUPPORT_CHAT_ID
         telegram_message_id = int(message.get("message_id")) if message.get("message_id") is not None else None
-        if telegram_message_id is not None:
-            existing = db.scalar(select(TelegramSupportMessage).where(TelegramSupportMessage.telegram_message_id == telegram_message_id))
-            if existing is not None:
-                logger.info(
-                    "telegram_webhook_duplicate message_id=%s existing_id=%s user_id=%s push_status=%s",
-                    telegram_message_id,
-                    existing.id,
-                    existing.user_id,
-                    existing.push_delivery_status,
-                )
-                return {
-                    "ok": True,
-                    "messageId": existing.id,
-                    "userId": existing.user_id,
-                    "pushDeliveryStatus": existing.push_delivery_status,
-                    "duplicate": True,
-                }
 
         user_id: str | None = None
         reply_block = message.get("reply_to_message") if isinstance(message.get("reply_to_message"), dict) else None
@@ -362,42 +328,22 @@ def register_telegram_support_routes(
 
         row.updated_at = utcnow()
         db.commit()
-        logger.info(
-            "telegram_webhook_persisted direction=%s status=%s push_status=%s user_id=%s created_at=%s",
-            row.direction,
-            row.status,
-            row.push_delivery_status,
-            row.user_id,
-            row.created_at,
-        )
         return {"ok": True, "messageId": row.id, "userId": user_id, "pushDeliveryStatus": row.push_delivery_status}
 
     @app.post("/api/v1/support/telegram/webhook")
     async def telegram_webhook(
         payload: dict[str, Any],
-        request: Request,
         db: Session = Depends(get_db),
         push_provider: PushNotificationService = Depends(get_push_provider),
         secret_header: str | None = Header(default=None, alias="X-Telegram-Bot-Api-Secret-Token"),
     ) -> dict[str, Any]:
-        return await _process_telegram_webhook(payload, db, push_provider, request, secret_header)
+        return await _process_telegram_webhook(payload, db, push_provider, secret_header)
 
     @app.post("/api/v1/support/telegram/webhooks")
     async def telegram_webhooks_alias(
         payload: dict[str, Any],
-        request: Request,
         db: Session = Depends(get_db),
         push_provider: PushNotificationService = Depends(get_push_provider),
         secret_header: str | None = Header(default=None, alias="X-Telegram-Bot-Api-Secret-Token"),
     ) -> dict[str, Any]:
-        return await _process_telegram_webhook(payload, db, push_provider, request, secret_header)
-
-    @app.post("/api/v1/support/telegram/webhook/events")
-    async def telegram_webhook_events_alias(
-        payload: dict[str, Any],
-        request: Request,
-        db: Session = Depends(get_db),
-        push_provider: PushNotificationService = Depends(get_push_provider),
-        secret_header: str | None = Header(default=None, alias="X-Telegram-Bot-Api-Secret-Token"),
-    ) -> dict[str, Any]:
-        return await _process_telegram_webhook(payload, db, push_provider, request, secret_header)
+        return await _process_telegram_webhook(payload, db, push_provider, secret_header)
