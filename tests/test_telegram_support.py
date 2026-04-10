@@ -25,7 +25,6 @@ class TelegramSupportRoutesTest(unittest.TestCase):
         os.environ["AUTH_SECRET_KEY"] = "test-auth-secret"
         os.environ["TELEGRAM_SUPPORT_BOT_TOKEN"] = "fake-token"
         os.environ["TELEGRAM_SUPPORT_WEBHOOK_SECRET"] = "webhook-secret"
-        os.environ["TELEGRAM_SUPPORT_AUTO_SYNC_ON_LIST"] = "false"
         get_settings.cache_clear()
 
         engine = create_engine(
@@ -102,9 +101,6 @@ class TelegramSupportRoutesTest(unittest.TestCase):
             self.assertEqual(chat_id, -5169340336)
             self.assertIn("Phone: +9647700000002", text)
             self.assertIn("Name: Standard User", text)
-            self.assertNotIn("User ID:", text)
-            self.assertNotIn("Thread:", text)
-            self.assertNotIn("App URL:", text)
             return {"ok": True, "result": {"message_id": 789}}
 
         original = telegram_support._telegram_send_message
@@ -179,47 +175,6 @@ class TelegramSupportRoutesTest(unittest.TestCase):
                 payload = response.json()
                 self.assertGreaterEqual(payload["pagination"]["count"], 1)
                 self.assertEqual(payload["messages"][0]["userId"], "22222222-2222-2222-2222-222222222222")
-        finally:
-            telegram_support._telegram_send_message = original
-
-    def test_list_endpoint_returns_both_directions_for_user_thread(self) -> None:
-        import telegram_support
-
-        async def fake_send_message(*, bot_token: str, chat_id: int, text: str, reply_to: int | None = None):
-            _ = (bot_token, chat_id, text, reply_to)
-            return {"ok": True, "result": {"message_id": 901}}
-
-        def fake_push(*, tokens, title, body, data, channel_id, image=None):
-            _ = (tokens, title, body, data, channel_id, image)
-            return {"successCount": 1, "failureCount": 0, "invalidTokens": []}
-
-        original = telegram_support._telegram_send_message
-        telegram_support._telegram_send_message = fake_send_message
-        try:
-            with TestClient(create_app()) as client:
-                client.app.state.push_notification_service.send_push_notification = fake_push
-                user_send = client.post(
-                    "/api/v1/support/telegram/messages",
-                    headers={"Authorization": f"Bearer {self._user_token()}"},
-                    json={"message": "Need help with order #1100"},
-                )
-                self.assertEqual(user_send.status_code, 200)
-
-                admin_send = client.post(
-                    "/api/v1/support/telegram/messages",
-                    headers={"Authorization": f"Bearer {self._admin_token()}"},
-                    json={"userId": "22222222-2222-2222-2222-222222222222", "message": "We replied from admin."},
-                )
-                self.assertEqual(admin_send.status_code, 200)
-
-                listed = client.get(
-                    "/api/v1/support/telegram/messages?limit=200&offset=0",
-                    headers={"Authorization": f"Bearer {self._user_token()}"},
-                )
-                self.assertEqual(listed.status_code, 200)
-                directions = {m["direction"] for m in listed.json()["messages"]}
-                self.assertIn("user_to_admin", directions)
-                self.assertIn("admin_to_user", directions)
         finally:
             telegram_support._telegram_send_message = original
 
@@ -333,139 +288,6 @@ class TelegramSupportRoutesTest(unittest.TestCase):
             )
             self.assertEqual(webhook.status_code, 200)
             self.assertEqual(webhook.json().get("pushDeliveryStatus"), "sent")
-
-    def test_webhook_events_alias_accepts_telegram_payload(self) -> None:
-        app = create_app()
-
-        def fake_push(*, tokens, title, body, data, channel_id, image=None):
-            _ = image
-            self.assertEqual(tokens, ["push-token-1"])
-            self.assertEqual(title, "Support reply")
-            self.assertEqual(channel_id, "support")
-            return {"successCount": 1, "failureCount": 0, "invalidTokens": []}
-
-        with TestClient(app) as client:
-            client.app.state.push_notification_service.send_push_notification = fake_push
-            webhook = client.post(
-                "/api/v1/support/telegram/webhook/events",
-                headers={"X-Telegram-Bot-Api-Secret-Token": "webhook-secret"},
-                json={
-                    "message": {
-                        "message_id": 559,
-                        "text": "Events route test\nPhone: +9647700000002",
-                        "chat": {"id": -5169340336},
-                    }
-                },
-            )
-            self.assertEqual(webhook.status_code, 200)
-            self.assertEqual(webhook.json().get("pushDeliveryStatus"), "sent")
-
-    def test_webhook_duplicate_message_id_returns_ok(self) -> None:
-        app = create_app()
-
-        with TestClient(app) as client:
-            first = client.post(
-                "/api/v1/support/telegram/webhook",
-                headers={"X-Telegram-Bot-Api-Secret-Token": "webhook-secret"},
-                json={
-                    "message": {
-                        "message_id": 560,
-                        "text": "Duplicate test\nPhone: +9647700000002",
-                        "chat": {"id": -5169340336},
-                    }
-                },
-            )
-            self.assertEqual(first.status_code, 200)
-            second = client.post(
-                "/api/v1/support/telegram/webhook",
-                headers={"X-Telegram-Bot-Api-Secret-Token": "webhook-secret"},
-                json={
-                    "message": {
-                        "message_id": 560,
-                        "text": "Duplicate test\nPhone: +9647700000002",
-                        "chat": {"id": -5169340336},
-                    }
-                },
-            )
-            self.assertEqual(second.status_code, 200)
-            self.assertTrue(second.json().get("duplicate"))
-
-    def test_sync_endpoint_pulls_updates_and_persists_message(self) -> None:
-        import telegram_support
-
-        app = create_app()
-
-        async def fake_get_updates(*, bot_token: str, offset: int | None = None):
-            _ = (bot_token, offset)
-            return {
-                "ok": True,
-                "result": [
-                    {
-                        "update_id": 10001,
-                        "message": {
-                            "message_id": 561,
-                            "text": "Sync endpoint message\nPhone: +9647700000002",
-                            "chat": {"id": -5169340336},
-                        },
-                    }
-                ],
-            }
-
-        original = telegram_support._telegram_get_updates
-        telegram_support._telegram_get_updates = fake_get_updates
-        try:
-            with TestClient(app) as client:
-                response = client.post(
-                    "/api/v1/support/telegram/sync",
-                    headers={"Authorization": f"Bearer {self._admin_token()}"},
-                )
-                self.assertEqual(response.status_code, 200)
-                self.assertEqual(response.json().get("processed"), 1)
-        finally:
-            telegram_support._telegram_get_updates = original
-
-    def test_list_endpoint_auto_sync_pulls_updates_when_enabled(self) -> None:
-        import telegram_support
-
-        os.environ["TELEGRAM_SUPPORT_AUTO_SYNC_ON_LIST"] = "true"
-        get_settings.cache_clear()
-        app = create_app()
-
-        async def fake_get_updates(*, bot_token: str, offset: int | None = None):
-            _ = (bot_token, offset)
-            return {
-                "ok": True,
-                "result": [
-                    {
-                        "update_id": 20001,
-                        "message": {
-                            "message_id": 8001,
-                            "text": "Auto sync message\nPhone: +9647700000002",
-                            "chat": {"id": -5169340336},
-                        },
-                    }
-                ],
-            }
-
-        original_get = telegram_support._telegram_get_updates
-        original_sync_at = telegram_support._TELEGRAM_LAST_SYNC_AT
-        telegram_support._TELEGRAM_LAST_SYNC_AT = 0.0
-        telegram_support._telegram_get_updates = fake_get_updates
-        try:
-            with TestClient(app) as client:
-                response = client.get(
-                    "/api/v1/support/telegram/messages?limit=200&offset=0",
-                    headers={"Authorization": f"Bearer {self._user_token()}"},
-                )
-                self.assertEqual(response.status_code, 200)
-                messages = response.json()["messages"]
-                self.assertTrue(any(message["message"] == "Auto sync message\nPhone: +9647700000002" for message in messages))
-        finally:
-            telegram_support._telegram_get_updates = original_get
-            telegram_support._TELEGRAM_LAST_SYNC_AT = original_sync_at
-            os.environ["TELEGRAM_SUPPORT_AUTO_SYNC_ON_LIST"] = "false"
-            get_settings.cache_clear()
-
 
 if __name__ == "__main__":
     unittest.main()

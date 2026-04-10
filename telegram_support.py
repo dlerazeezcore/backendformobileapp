@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import hmac
-import logging
 import re
-import time
 from typing import Any, Callable
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -19,12 +17,9 @@ from phone_utils import phone_lookup_candidates
 from supabase_store import AdminUser, AppUser, PushDevice, TelegramSupportMessage, utcnow
 
 TELEGRAM_SUPPORT_CHAT_ID = -5169340336
+TELEGRAM_SUPPORT_PUBLIC_BASE_URL = "https://mean-lettie-corevia-0bd7cc91.koyeb.app/"
 USER_ID_PATTERN = re.compile(r"User ID:\s*([0-9a-fA-F-]{36})")
 PHONE_PATTERN = re.compile(r"Phone:\s*(\+?[0-9][0-9\s\-]{6,})")
-logger = logging.getLogger(__name__)
-_TELEGRAM_LAST_UPDATE_ID = 0
-_TELEGRAM_LAST_SYNC_AT = 0.0
-_TELEGRAM_SYNC_INTERVAL_SECONDS = 5.0
 
 
 class SupportMessagePayload(BaseModel):
@@ -48,21 +43,6 @@ async def _telegram_send_message(*, bot_token: str, chat_id: int, text: str, rep
     body = response.json()
     if not bool(body.get("ok")):
         raise HTTPException(status_code=502, detail="Telegram provider returned an unsuccessful response")
-    return body
-
-
-async def _telegram_get_updates(*, bot_token: str, offset: int | None = None) -> dict[str, Any]:
-    api_url = f"https://api.telegram.org/bot{bot_token}/getUpdates"
-    payload: dict[str, Any] = {"timeout": 0, "allowed_updates": ["message"]}
-    if offset is not None:
-        payload["offset"] = offset
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        response = await client.post(api_url, json=payload)
-    if response.status_code >= 400:
-        raise HTTPException(status_code=502, detail="Telegram provider rejected getUpdates request")
-    body = response.json()
-    if not bool(body.get("ok")):
-        raise HTTPException(status_code=502, detail="Telegram provider returned an unsuccessful getUpdates response")
     return body
 
 
@@ -95,34 +75,6 @@ def _find_user_by_phone(db: Session, phone: str) -> AppUser | None:
     if not candidates:
         return None
     return db.scalar(select(AppUser).where(AppUser.phone.in_(candidates)))
-
-
-async def _sync_updates_from_telegram(
-    *,
-    db: Session,
-    push_provider: PushNotificationService,
-    process_update: Callable[[dict[str, Any], Session, PushNotificationService, Request | None, str | None], Any],
-) -> int:
-    global _TELEGRAM_LAST_UPDATE_ID
-    settings = get_settings()
-    bot_token = str(settings.telegram_support_bot_token or "").strip()
-    if not bot_token:
-        return 0
-    updates = await _telegram_get_updates(bot_token=bot_token, offset=_TELEGRAM_LAST_UPDATE_ID + 1)
-    processed = 0
-    for item in list(updates.get("result") or []):
-        update_id = int(item.get("update_id") or 0)
-        if update_id > _TELEGRAM_LAST_UPDATE_ID:
-            _TELEGRAM_LAST_UPDATE_ID = update_id
-        await process_update(
-            item,
-            db,
-            push_provider,
-            None,
-            str(settings.telegram_support_webhook_secret or "").strip() or None,
-        )
-        processed += 1
-    return processed
 
 
 def register_telegram_support_routes(
@@ -244,25 +196,10 @@ def register_telegram_support_routes(
     async def list_my_support_messages(
         db: Session = Depends(get_db),
         actor: AppUser | AdminUser = Depends(_require_active_actor),
-        push_provider: PushNotificationService = Depends(get_push_provider),
         limit: int = Query(default=50, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
         user_id: str | None = Query(default=None, alias="userId"),
     ) -> dict[str, Any]:
-        settings = get_settings()
-        global _TELEGRAM_LAST_SYNC_AT
-        if settings.telegram_support_auto_sync_on_list:
-            now = time.monotonic()
-            if now - _TELEGRAM_LAST_SYNC_AT >= _TELEGRAM_SYNC_INTERVAL_SECONDS:
-                try:
-                    await _sync_updates_from_telegram(
-                        db=db,
-                        push_provider=push_provider,
-                        process_update=_process_telegram_webhook,
-                    )
-                    _TELEGRAM_LAST_SYNC_AT = now
-                except Exception:  # noqa: BLE001
-                    logger.exception("telegram_list_sync_failed")
         query = select(TelegramSupportMessage).order_by(TelegramSupportMessage.created_at.desc())
         if isinstance(actor, AppUser):
             query = query.where(TelegramSupportMessage.user_id == actor.id)
@@ -288,29 +225,13 @@ def register_telegram_support_routes(
 
     async def _process_telegram_webhook(
         payload: dict[str, Any],
-        db: Session,
-        push_provider: PushNotificationService,
-        request: Request | None,
-        secret_header: str | None,
+        db: Session = Depends(get_db),
+        push_provider: PushNotificationService = Depends(get_push_provider),
+        secret_header: str | None = Header(default=None, alias="X-Telegram-Bot-Api-Secret-Token"),
     ) -> dict[str, Any]:
-        update_id = payload.get("update_id") if isinstance(payload, dict) else None
-        logger.info(
-            "telegram_webhook_incoming path=%s has_secret_header=%s update_id=%s",
-            request.url.path if request is not None else "<telegram-poller>",
-            bool(str(secret_header or "").strip()),
-            update_id,
-        )
         settings = get_settings()
         configured_secret = str(settings.telegram_support_webhook_secret or "").strip()
-        incoming_secret = str(secret_header or "").strip()
-        secret_ok = (not configured_secret) or (not incoming_secret) or hmac.compare_digest(incoming_secret, configured_secret)
-        logger.info(
-            "telegram_webhook_secret_check configured=%s incoming=%s result=%s",
-            bool(configured_secret),
-            bool(incoming_secret),
-            secret_ok,
-        )
-        if configured_secret and incoming_secret and not hmac.compare_digest(incoming_secret, configured_secret):
+        if not configured_secret or not hmac.compare_digest(str(secret_header or ""), configured_secret):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid Telegram webhook secret")
 
         message = payload.get("message") if isinstance(payload, dict) else None
@@ -324,23 +245,6 @@ def register_telegram_support_routes(
         chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
         chat_id = int(chat.get("id")) if chat.get("id") is not None else TELEGRAM_SUPPORT_CHAT_ID
         telegram_message_id = int(message.get("message_id")) if message.get("message_id") is not None else None
-        if telegram_message_id is not None:
-            existing = db.scalar(select(TelegramSupportMessage).where(TelegramSupportMessage.telegram_message_id == telegram_message_id))
-            if existing is not None:
-                logger.info(
-                    "telegram_webhook_duplicate message_id=%s existing_id=%s user_id=%s push_status=%s",
-                    telegram_message_id,
-                    existing.id,
-                    existing.user_id,
-                    existing.push_delivery_status,
-                )
-                return {
-                    "ok": True,
-                    "messageId": existing.id,
-                    "userId": existing.user_id,
-                    "pushDeliveryStatus": existing.push_delivery_status,
-                    "duplicate": True,
-                }
 
         user_id: str | None = None
         reply_block = message.get("reply_to_message") if isinstance(message.get("reply_to_message"), dict) else None
@@ -424,56 +328,22 @@ def register_telegram_support_routes(
 
         row.updated_at = utcnow()
         db.commit()
-        logger.info(
-            "telegram_webhook_persisted direction=%s status=%s push_status=%s user_id=%s created_at=%s",
-            row.direction,
-            row.status,
-            row.push_delivery_status,
-            row.user_id,
-            row.created_at,
-        )
         return {"ok": True, "messageId": row.id, "userId": user_id, "pushDeliveryStatus": row.push_delivery_status}
 
     @app.post("/api/v1/support/telegram/webhook")
     async def telegram_webhook(
         payload: dict[str, Any],
-        request: Request,
         db: Session = Depends(get_db),
         push_provider: PushNotificationService = Depends(get_push_provider),
         secret_header: str | None = Header(default=None, alias="X-Telegram-Bot-Api-Secret-Token"),
     ) -> dict[str, Any]:
-        return await _process_telegram_webhook(payload, db, push_provider, request, secret_header)
+        return await _process_telegram_webhook(payload, db, push_provider, secret_header)
 
     @app.post("/api/v1/support/telegram/webhooks")
     async def telegram_webhooks_alias(
         payload: dict[str, Any],
-        request: Request,
         db: Session = Depends(get_db),
         push_provider: PushNotificationService = Depends(get_push_provider),
         secret_header: str | None = Header(default=None, alias="X-Telegram-Bot-Api-Secret-Token"),
     ) -> dict[str, Any]:
-        return await _process_telegram_webhook(payload, db, push_provider, request, secret_header)
-
-    @app.post("/api/v1/support/telegram/webhook/events")
-    async def telegram_webhook_events_alias(
-        payload: dict[str, Any],
-        request: Request,
-        db: Session = Depends(get_db),
-        push_provider: PushNotificationService = Depends(get_push_provider),
-        secret_header: str | None = Header(default=None, alias="X-Telegram-Bot-Api-Secret-Token"),
-    ) -> dict[str, Any]:
-        return await _process_telegram_webhook(payload, db, push_provider, request, secret_header)
-
-    @app.post("/api/v1/support/telegram/sync")
-    async def sync_telegram_updates(
-        db: Session = Depends(get_db),
-        actor: AppUser | AdminUser = Depends(_require_active_actor),
-        push_provider: PushNotificationService = Depends(get_push_provider),
-    ) -> dict[str, Any]:
-        _ = actor
-        processed = await _sync_updates_from_telegram(
-            db=db,
-            push_provider=push_provider,
-            process_update=_process_telegram_webhook,
-        )
-        return {"ok": True, "processed": processed, "lastUpdateId": _TELEGRAM_LAST_UPDATE_ID}
+        return await _process_telegram_webhook(payload, db, push_provider, secret_header)
