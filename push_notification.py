@@ -459,9 +459,10 @@ def register_push_notification_routes(
             recipient_scope = "mixed"
 
         logger.info(
-            "push.send.pre_resolution audience=%s send_to_all_active=%s normalized_user_ids=%s tokens_count=%s recipient_scope=%s",
+            "push.send.pre_resolution payload_audience=%s payload_send_to_all_active=%s payload_user_ids=%s normalized_user_ids=%s tokens_count=%s recipient_scope=%s",
             payload.audience,
             payload.send_to_all_active,
+            payload.user_ids,
             requested_user_ids,
             len(direct_tokens),
             recipient_scope,
@@ -479,6 +480,15 @@ def register_push_notification_routes(
         deduped_tokens_count = len(deduped_tokens)
         merged_target_user_ids_count = len(merged_target_user_ids)
         debug_payload = {
+            "payload.audience": payload.audience,
+            "payload.send_to_all_active": payload.send_to_all_active,
+            "payload.user_ids": payload.user_ids,
+            "recipient_scope": recipient_scope,
+            "requested_user_ids_count": requested_user_ids_count,
+            "audience_user_ids_count": audience_user_ids_count,
+            "store_tokens_count": store_tokens_count,
+            "deduped_tokens_count": deduped_tokens_count,
+            "matched_user_ids": merged_target_user_ids,
             "recipientScope": recipient_scope,
             "requestedAudience": audience or None,
             "requestedUserIdsCount": requested_user_ids_count,
