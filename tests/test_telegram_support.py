@@ -99,6 +99,7 @@ class TelegramSupportRoutesTest(unittest.TestCase):
             _ = reply_to
             self.assertEqual(bot_token, "fake-token")
             self.assertEqual(chat_id, -5169340336)
+            self.assertIn("User ID: 22222222-2222-2222-2222-222222222222", text)
             self.assertIn("Phone: +9647700000002", text)
             self.assertIn("Name: Standard User", text)
             return {"ok": True, "result": {"message_id": 789}}
@@ -250,6 +251,78 @@ class TelegramSupportRoutesTest(unittest.TestCase):
             self.assertEqual(row.user_id, "22222222-2222-2222-2222-222222222222")
             self.assertEqual(row.push_delivery_status, "sent")
         engine.dispose()
+
+    def test_support_upload_presign_and_attachment_only_message(self) -> None:
+        import telegram_support
+        outer_self = self
+
+        class FakeS3Client:
+            def generate_presigned_url(self, operation_name: str, Params: dict[str, str], ExpiresIn: int) -> str:
+                _ = operation_name
+                outer_self.assertEqual(Params["Bucket"], "Tulip Mobile APP")
+                outer_self.assertIn("support/user/22222222-2222-2222-2222-222222222222", Params["Key"])
+                outer_self.assertEqual(Params["ContentType"], "image/jpeg")
+                outer_self.assertGreaterEqual(ExpiresIn, 60)
+                return "https://example-upload.local/presigned"
+
+        async def fake_send_message(*, bot_token: str, chat_id: int, text: str, reply_to: int | None = None):
+            _ = (bot_token, chat_id, reply_to)
+            self.assertIn("[Attachment only]", text)
+            self.assertIn("Attachments:", text)
+            self.assertIn("https://splzxivzahitxmjcqstn.storage.supabase.co/storage/v1/object/public/Tulip%20Mobile%20APP", text)
+            return {"ok": True, "result": {"message_id": 901}}
+
+        async def fake_ensure_webhook(*, bot_token: str, webhook_secret: str | None, webhook_base_url: str):
+            _ = (bot_token, webhook_secret, webhook_base_url)
+            return None
+
+        original_client_builder = telegram_support._build_support_upload_client
+        original_send = telegram_support._telegram_send_message
+        original_ensure = telegram_support._ensure_telegram_webhook
+        telegram_support._build_support_upload_client = lambda settings: FakeS3Client()
+        telegram_support._telegram_send_message = fake_send_message
+        telegram_support._ensure_telegram_webhook = fake_ensure_webhook
+        os.environ["SUPPORT_UPLOADS_S3_ENDPOINT"] = "https://splzxivzahitxmjcqstn.storage.supabase.co/storage/v1/s3"
+        os.environ["SUPPORT_UPLOADS_ACCESS_KEY_ID"] = "key"
+        os.environ["SUPPORT_UPLOADS_SECRET_ACCESS_KEY"] = "secret"
+        os.environ["SUPPORT_UPLOADS_BUCKET"] = "Tulip Mobile APP"
+        get_settings.cache_clear()
+        try:
+            with TestClient(create_app()) as client:
+                presign = client.post(
+                    "/api/v1/support/uploads/presign",
+                    headers={"Authorization": f"Bearer {self._user_token()}"},
+                    json={"fileName": "issue-photo.jpg", "contentType": "image/jpeg", "sizeBytes": 1024},
+                )
+                self.assertEqual(presign.status_code, 200)
+                upload = presign.json()["upload"]
+                self.assertEqual(upload["method"], "PUT")
+                self.assertEqual(upload["requiredHeaders"]["Content-Type"], "image/jpeg")
+                self.assertTrue(upload["publicUrl"])
+                send = client.post(
+                    "/api/v1/support/telegram/messages",
+                    headers={"Authorization": f"Bearer {self._user_token()}"},
+                    json={
+                        "message": "",
+                        "attachments": [
+                            {
+                                "objectPath": upload["objectPath"],
+                                "publicUrl": upload["publicUrl"],
+                                "fileName": "issue-photo.jpg",
+                                "contentType": "image/jpeg",
+                                "sizeBytes": 1024,
+                            }
+                        ],
+                    },
+                )
+                self.assertEqual(send.status_code, 200)
+                self.assertEqual(send.json()["message"]["status"], "sent")
+                self.assertEqual(len(send.json()["message"]["attachments"]), 1)
+        finally:
+            telegram_support._build_support_upload_client = original_client_builder
+            telegram_support._telegram_send_message = original_send
+            telegram_support._ensure_telegram_webhook = original_ensure
+            get_settings.cache_clear()
 
     def test_webhook_reply_maps_user_by_phone_when_no_reply_mapping(self) -> None:
         app = create_app()

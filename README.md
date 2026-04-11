@@ -1601,6 +1601,97 @@ Example:
 
 The frontend admin panel should treat these as configuration sources for future purchases, not retroactive changes to old orders.
 
+## Telegram Support + Image Uploads
+
+Support messaging endpoints:
+
+- `POST /api/v1/support/telegram/messages`
+- `GET /api/v1/support/telegram/messages`
+- `POST /api/v1/support/telegram/webhook`
+- `POST /api/v1/support/uploads/presign`
+
+`POST /api/v1/support/uploads/presign`
+
+- auth: user token or admin token
+- purpose: generate a short-lived pre-signed upload URL for support attachments
+- request body:
+
+```json
+{
+  "fileName": "issue-photo.jpg",
+  "contentType": "image/jpeg",
+  "sizeBytes": 245761
+}
+```
+
+- response body:
+
+```json
+{
+  "upload": {
+    "bucket": "Tulip Mobile APP",
+    "objectPath": "support/user/<user-id>/2026/04/11/<uuid>_issue-photo.jpg",
+    "publicUrl": "https://<project-ref>.storage.supabase.co/storage/v1/object/public/Tulip%20Mobile%20APP/support/user/<user-id>/2026/04/11/<uuid>_issue-photo.jpg",
+    "uploadUrl": "https://...signed...",
+    "method": "PUT",
+    "requiredHeaders": {
+      "Content-Type": "image/jpeg"
+    },
+    "expiresInSeconds": 600,
+    "maxFileBytes": 10485760
+  }
+}
+```
+
+Supported `contentType` values:
+
+- `image/jpeg`
+- `image/png`
+- `image/webp`
+- `image/heic`
+- `image/heif`
+
+`POST /api/v1/support/telegram/messages`
+
+- request now supports text-only, attachment-only, or mixed messages:
+
+```json
+{
+  "message": "Please check this issue",
+  "attachments": [
+    {
+      "objectPath": "support/user/<user-id>/.../issue-photo.jpg",
+      "publicUrl": "https://.../storage/v1/object/public/.../issue-photo.jpg",
+      "fileName": "issue-photo.jpg",
+      "contentType": "image/jpeg",
+      "sizeBytes": 245761
+    }
+  ]
+}
+```
+
+- when `message` is empty, at least one `attachments[]` item is required.
+- response includes `message.attachments`.
+
+Required env vars for support uploads:
+
+- `SUPPORT_UPLOADS_S3_ENDPOINT` (example: `https://splzxivzahitxmjcqstn.storage.supabase.co/storage/v1/s3`)
+- `SUPPORT_UPLOADS_S3_REGION` (example: `ap-southeast-2`)
+- `SUPPORT_UPLOADS_ACCESS_KEY_ID`
+- `SUPPORT_UPLOADS_SECRET_ACCESS_KEY`
+- `SUPPORT_UPLOADS_BUCKET` (example: `Tulip Mobile APP`)
+
+Optional env vars:
+
+- `SUPPORT_UPLOADS_OBJECT_PREFIX` (default: `support`)
+- `SUPPORT_UPLOADS_URL_TTL_SECONDS` (default: `600`, max used by backend: `3600`)
+- `SUPPORT_UPLOADS_MAX_FILE_BYTES` (default: `10485760`)
+- `SUPPORT_UPLOADS_PUBLIC_BASE_URL`
+
+If `SUPPORT_UPLOADS_PUBLIC_BASE_URL` is not set and endpoint is Supabase S3 style, backend auto-derives public URL base as:
+
+- `<endpoint-root>/storage/v1/object/public/<bucket>/<objectPath>`
+
 ## Current eSIM Access Mapping
 
 The current database reflects the provider like this:
