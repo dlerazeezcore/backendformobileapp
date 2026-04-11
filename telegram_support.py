@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import copy
 import hmac
 import mimetypes
 import re
+import threading
+import time
 import uuid
 from typing import Any, Callable
 from urllib.parse import quote
@@ -31,6 +34,9 @@ ALLOWED_SUPPORT_UPLOAD_CONTENT_TYPES = {
     "image/heif",
 }
 MAX_SUPPORT_ATTACHMENTS = 5
+SUPPORT_MESSAGES_CACHE_TTL_SECONDS = 2.0
+_SUPPORT_MESSAGES_CACHE: dict[tuple[str, str, str, int, int], tuple[float, dict[str, Any]]] = {}
+_SUPPORT_MESSAGES_CACHE_LOCK = threading.Lock()
 
 try:
     import boto3
@@ -442,6 +448,41 @@ def _extract_telegram_message(payload: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _support_messages_cache_key(
+    *,
+    actor: AppUser | AdminUser,
+    user_id: str | None,
+    limit: int,
+    offset: int,
+) -> tuple[str, str, str, int, int]:
+    actor_type = "user" if isinstance(actor, AppUser) else "admin"
+    return (actor_type, actor.id, str(user_id or ""), limit, offset)
+
+
+def _support_messages_cache_get(cache_key: tuple[str, str, str, int, int]) -> dict[str, Any] | None:
+    now = time.monotonic()
+    with _SUPPORT_MESSAGES_CACHE_LOCK:
+        cached = _SUPPORT_MESSAGES_CACHE.get(cache_key)
+        if cached is None:
+            return None
+        expires_at, payload = cached
+        if now > expires_at:
+            _SUPPORT_MESSAGES_CACHE.pop(cache_key, None)
+            return None
+    return copy.deepcopy(payload)
+
+
+def _support_messages_cache_set(cache_key: tuple[str, str, str, int, int], payload: dict[str, Any]) -> None:
+    expires_at = time.monotonic() + SUPPORT_MESSAGES_CACHE_TTL_SECONDS
+    with _SUPPORT_MESSAGES_CACHE_LOCK:
+        _SUPPORT_MESSAGES_CACHE[cache_key] = (expires_at, copy.deepcopy(payload))
+
+
+def _support_messages_cache_clear() -> None:
+    with _SUPPORT_MESSAGES_CACHE_LOCK:
+        _SUPPORT_MESSAGES_CACHE.clear()
+
+
 def register_telegram_support_routes(
     app: FastAPI,
     get_db: Callable[..., Any],
@@ -583,6 +624,7 @@ def register_telegram_support_routes(
             row.updated_at = utcnow()
             db.commit()
             db.refresh(row)
+            _support_messages_cache_clear()
             return {
                 "message": {
                     "id": row.id,
@@ -638,6 +680,7 @@ def register_telegram_support_routes(
         row.updated_at = utcnow()
         db.commit()
         db.refresh(row)
+        _support_messages_cache_clear()
         return {
             "message": {
                 "id": row.id,
@@ -706,6 +749,16 @@ def register_telegram_support_routes(
         offset: int = Query(default=0, ge=0),
         user_id: str | None = Query(default=None, alias="userId"),
     ) -> dict[str, Any]:
+        cache_key = _support_messages_cache_key(
+            actor=actor,
+            user_id=(user_id if isinstance(actor, AdminUser) else actor.id),
+            limit=limit,
+            offset=offset,
+        )
+        cached = _support_messages_cache_get(cache_key)
+        if cached is not None:
+            return cached
+
         query = select(TelegramSupportMessage).order_by(TelegramSupportMessage.created_at.desc())
         if isinstance(actor, AppUser):
             query = query.where(TelegramSupportMessage.user_id == actor.id)
@@ -713,7 +766,7 @@ def register_telegram_support_routes(
             query = query.where(TelegramSupportMessage.user_id == user_id)
 
         rows = db.scalars(query.offset(offset).limit(limit)).all()
-        return {
+        response_payload = {
             "messages": [
                 {
                     "id": row.id,
@@ -733,6 +786,8 @@ def register_telegram_support_routes(
             ],
             "pagination": {"limit": limit, "offset": offset, "count": len(rows)},
         }
+        _support_messages_cache_set(cache_key, response_payload)
+        return response_payload
 
     async def _process_telegram_webhook(
         payload: dict[str, Any],
@@ -912,6 +967,7 @@ def register_telegram_support_routes(
 
         row.updated_at = utcnow()
         db.commit()
+        _support_messages_cache_clear()
         return {"ok": True, "messageId": row.id, "userId": user_id, "pushDeliveryStatus": row.push_delivery_status}
 
     @app.post("/api/v1/support/telegram/webhook")
