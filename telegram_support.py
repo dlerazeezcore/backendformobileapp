@@ -33,9 +33,11 @@ MAX_SUPPORT_ATTACHMENTS = 5
 
 try:
     import boto3
+    import botocore.handlers
     from botocore.config import Config as BotoConfig
 except Exception:  # pragma: no cover - runtime dependency handling
     boto3 = None
+    botocore = None
     BotoConfig = None
 
 
@@ -108,7 +110,7 @@ def _build_support_upload_client(settings: Any):
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Support uploads are not configured on this deployment.",
         )
-    return boto3.client(
+    client = boto3.client(
         "s3",
         endpoint_url=endpoint,
         region_name=str(settings.support_uploads_s3_region or "").strip() or "ap-southeast-2",
@@ -116,6 +118,13 @@ def _build_support_upload_client(settings: Any):
         aws_secret_access_key=secret_access_key,
         config=BotoConfig(signature_version="s3v4"),
     )
+    # Supabase bucket names can include spaces (e.g. "Tulip Mobile APP"), while
+    # botocore enforces AWS bucket-name regex in local pre-validation.
+    # Remove only this client-side validation hook so presign can proceed.
+    if botocore is not None:
+        client.meta.events.unregister("before-parameter-build.s3", botocore.handlers.validate_bucket_name)
+        client.meta.events.unregister("before-parameter-build.s3.PutObject", botocore.handlers.validate_bucket_name)
+    return client
 
 
 def _sanitize_support_filename(name: str) -> str:
