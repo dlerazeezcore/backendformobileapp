@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import hmac
 import mimetypes
 import re
@@ -34,7 +33,7 @@ ALLOWED_SUPPORT_UPLOAD_CONTENT_TYPES = {
     "image/heif",
 }
 MAX_SUPPORT_ATTACHMENTS = 5
-SUPPORT_MESSAGES_CACHE_TTL_SECONDS = 2.0
+SUPPORT_MESSAGES_CACHE_TTL_SECONDS = 8.0
 _SUPPORT_MESSAGES_CACHE: dict[tuple[str, str, str, int, int], tuple[float, dict[str, Any]]] = {}
 _SUPPORT_MESSAGES_CACHE_LOCK = threading.Lock()
 
@@ -469,13 +468,13 @@ def _support_messages_cache_get(cache_key: tuple[str, str, str, int, int]) -> di
         if now > expires_at:
             _SUPPORT_MESSAGES_CACHE.pop(cache_key, None)
             return None
-    return copy.deepcopy(payload)
+    return payload
 
 
 def _support_messages_cache_set(cache_key: tuple[str, str, str, int, int], payload: dict[str, Any]) -> None:
     expires_at = time.monotonic() + SUPPORT_MESSAGES_CACHE_TTL_SECONDS
     with _SUPPORT_MESSAGES_CACHE_LOCK:
-        _SUPPORT_MESSAGES_CACHE[cache_key] = (expires_at, copy.deepcopy(payload))
+        _SUPPORT_MESSAGES_CACHE[cache_key] = (expires_at, payload)
 
 
 def _support_messages_cache_clear() -> None:
