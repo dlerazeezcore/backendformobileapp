@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from functools import lru_cache
 from typing import Any, Callable, Iterable
 
@@ -15,6 +16,7 @@ from supabase_store import AdminUser, AppUser, PushDevice, PushNotification, Sup
 
 ALLOWED_PUSH_AUDIENCES = {"all", "authenticated", "loyalty", "active_esim", "admins", "all_devices"}
 ALLOWED_APP_UPDATE_AUDIENCES = {"all", "authenticated", "loyalty", "active_esim", "all_devices"}
+logger = logging.getLogger(__name__)
 
 try:
     import firebase_admin
@@ -427,7 +429,9 @@ def register_push_notification_routes(
         admin_user: AdminUser = Depends(_require_admin_sender),
     ) -> Any:
         store = SupabaseStore(db)
-        requested_user_ids = [str(item).strip() for item in payload.user_ids if str(item).strip()]
+        requested_user_ids = PushNotificationService._normalize_tokens(
+            [str(item).strip() for item in payload.user_ids if str(item).strip()]
+        )
         direct_tokens = [str(item).strip() for item in payload.tokens if str(item).strip()]
         audience = str(payload.audience or "").strip().lower()
         if payload.send_to_all_active and not audience:
@@ -454,12 +458,43 @@ def register_push_notification_routes(
         if direct_tokens and audience:
             recipient_scope = "mixed"
 
+        logger.info(
+            "push.send.pre_resolution audience=%s send_to_all_active=%s normalized_user_ids=%s tokens_count=%s recipient_scope=%s",
+            payload.audience,
+            payload.send_to_all_active,
+            requested_user_ids,
+            len(direct_tokens),
+            recipient_scope,
+        )
+
         deduped_tokens = PushNotificationService._normalize_tokens(
             [*direct_tokens, *audience_tokens, *store_tokens]
         )
         merged_target_user_ids = PushNotificationService._normalize_tokens(
             [*audience_user_ids, *requested_user_ids]
         )
+        requested_user_ids_count = len(requested_user_ids)
+        audience_user_ids_count = len(audience_user_ids)
+        store_tokens_count = len(store_tokens)
+        deduped_tokens_count = len(deduped_tokens)
+        merged_target_user_ids_count = len(merged_target_user_ids)
+        debug_payload = {
+            "recipientScope": recipient_scope,
+            "requestedAudience": audience or None,
+            "requestedUserIdsCount": requested_user_ids_count,
+            "matchedAudienceUserIdsCount": audience_user_ids_count,
+            "matchedDirectUserTokensCount": store_tokens_count,
+            "totalDedupedTokens": deduped_tokens_count,
+        }
+        logger.info(
+            "push.send.post_resolution requested_user_ids_count=%s audience_user_ids_count=%s store_tokens_count=%s deduped_tokens_count=%s merged_target_user_ids_count=%s",
+            requested_user_ids_count,
+            audience_user_ids_count,
+            store_tokens_count,
+            deduped_tokens_count,
+            merged_target_user_ids_count,
+        )
+
         if not deduped_tokens:
             return JSONResponse(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -468,15 +503,16 @@ def register_push_notification_routes(
                     "errorCode": "NO_ELIGIBLE_PUSH_TOKENS",
                     "message": "No eligible push tokens found for the selected targets.",
                     "requestedAudience": audience or None,
-                    "requestedUserIdsCount": len(requested_user_ids),
+                    "requestedUserIdsCount": requested_user_ids_count,
                     "requestedTokensCount": len(direct_tokens),
-                    "matchedAudienceUserIdsCount": len(audience_user_ids),
+                    "matchedAudienceUserIdsCount": audience_user_ids_count,
                     "matchedAudienceTokensCount": len(audience_tokens),
-                    "matchedDirectUserTokensCount": len(store_tokens),
-                    "totalDedupedTokens": len(deduped_tokens),
+                    "matchedDirectUserTokensCount": store_tokens_count,
+                    "totalDedupedTokens": deduped_tokens_count,
                     "activeUserTokens": store.count_active_push_tokens(subject_type="user"),
                     "activeAdminTokens": store.count_active_push_tokens(subject_type="admin"),
-                    "eligibleTokensForRequestedAudience": len(deduped_tokens),
+                    "eligibleTokensForRequestedAudience": deduped_tokens_count,
+                    "data": {"debug": debug_payload},
                 },
             )
 
@@ -494,7 +530,7 @@ def register_push_notification_routes(
                 "requestedTokens": len(deduped_tokens),
                 "audience": audience or None,
                 "requestedUserIds": requested_user_ids,
-                "audienceUserIdsCount": len(audience_user_ids),
+                "audienceUserIdsCount": audience_user_ids_count,
             },
             status="queued",
         )
@@ -518,6 +554,7 @@ def register_push_notification_routes(
             return {
                 "notification": _serialize_push_notification(notification),
                 "delivery": {"requestedTokens": len(deduped_tokens), "dryRun": True},
+                "data": {"debug": debug_payload},
             }
 
         if not provider.is_configured():
@@ -586,6 +623,7 @@ def register_push_notification_routes(
                 "invalidTokenCount": len(invalid_tokens),
                 "invalidTokens": invalid_tokens,
             },
+            "data": {"debug": debug_payload},
         }
 
     @app.post("/api/esim-app/push/admin/send-app-update", response_model=None)
