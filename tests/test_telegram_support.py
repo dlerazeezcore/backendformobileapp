@@ -265,6 +265,13 @@ class TelegramSupportRoutesTest(unittest.TestCase):
                 outer_self.assertGreaterEqual(ExpiresIn, 60)
                 return "https://example-upload.local/presigned"
 
+            def get_object(self, Bucket: str, Key: str) -> dict[str, object]:
+                import io
+
+                outer_self.assertEqual(Bucket, "Tulip Mobile APP")
+                outer_self.assertIn("support/user/22222222-2222-2222-2222-222222222222", Key)
+                return {"Body": io.BytesIO(b"fake-image-bytes"), "ContentType": "image/jpeg"}
+
         async def fake_send_message(*, bot_token: str, chat_id: int, text: str, reply_to: int | None = None):
             _ = (bot_token, chat_id, text, reply_to)
             self.fail("sendMessage should not be used for image attachments when publicUrl is present.")
@@ -273,12 +280,18 @@ class TelegramSupportRoutesTest(unittest.TestCase):
             *,
             bot_token: str,
             chat_id: int,
-            photo_url: str,
+            photo_url: str | None = None,
+            photo_bytes: bytes | None = None,
+            photo_filename: str | None = None,
+            photo_content_type: str | None = None,
             caption: str | None = None,
             reply_to: int | None = None,
         ):
             _ = (bot_token, chat_id, reply_to)
-            self.assertIn("https://splzxivzahitxmjcqstn.storage.supabase.co/storage/v1/object/public/Tulip%20Mobile%20APP", photo_url)
+            self.assertIsNone(photo_url)
+            self.assertEqual(photo_bytes, b"fake-image-bytes")
+            self.assertEqual(photo_filename, "issue-photo.jpg")
+            self.assertEqual(photo_content_type, "image/jpeg")
             self.assertIn("User ID: 22222222-2222-2222-2222-222222222222", caption or "")
             self.assertIn("[Attachment only]", caption or "")
             return {"ok": True, "result": {"message_id": 901}}

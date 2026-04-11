@@ -158,6 +158,24 @@ def _build_support_public_url(*, settings: Any, bucket: str, object_path: str) -
     return f"{derived.rstrip('/')}/{encoded_bucket}/{encoded_object_path}"
 
 
+def _load_support_attachment_bytes(
+    *,
+    settings: Any,
+    object_path: str,
+) -> tuple[bytes, str | None]:
+    bucket = str(settings.support_uploads_bucket or "").strip()
+    if not bucket:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Support uploads bucket is not configured on this deployment.",
+        )
+    client = _build_support_upload_client(settings)
+    response = client.get_object(Bucket=bucket, Key=object_path)
+    body = response["Body"].read()
+    content_type = response.get("ContentType")
+    return body, str(content_type).strip() if content_type else None
+
+
 async def _telegram_send_message(*, bot_token: str, chat_id: int, text: str, reply_to: int | None = None) -> dict[str, Any]:
     api_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload: dict[str, Any] = {
@@ -181,21 +199,34 @@ async def _telegram_send_photo(
     *,
     bot_token: str,
     chat_id: int,
-    photo_url: str,
+    photo_url: str | None = None,
+    photo_bytes: bytes | None = None,
+    photo_filename: str | None = None,
+    photo_content_type: str | None = None,
     caption: str | None = None,
     reply_to: int | None = None,
 ) -> dict[str, Any]:
     api_url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
-    payload: dict[str, Any] = {
-        "chat_id": chat_id,
-        "photo": photo_url,
-    }
+    if not photo_url and photo_bytes is None:
+        raise HTTPException(status_code=422, detail="photo_url or photo_bytes is required")
+    payload: dict[str, Any] = {"chat_id": str(chat_id)}
     if caption:
         payload["caption"] = caption[:1024]
     if reply_to is not None:
         payload["reply_parameters"] = {"message_id": reply_to}
     async with httpx.AsyncClient(timeout=20.0) as client:
-        response = await client.post(api_url, json=payload)
+        if photo_bytes is not None:
+            files = {
+                "photo": (
+                    photo_filename or "support-image.jpg",
+                    photo_bytes,
+                    photo_content_type or "image/jpeg",
+                )
+            }
+            response = await client.post(api_url, data=payload, files=files)
+        else:
+            payload["photo"] = str(photo_url)
+            response = await client.post(api_url, json=payload)
     if response.status_code >= 400:
         raise HTTPException(status_code=502, detail="Telegram provider rejected sendPhoto request")
     body = response.json()
@@ -458,26 +489,57 @@ def register_telegram_support_routes(
             image_attachments = [
                 attachment
                 for attachment in attachments
-                if _is_image_attachment(attachment) and str(attachment.get("publicUrl") or "").strip()
+                if _is_image_attachment(attachment)
             ]
             non_image_attachments = [attachment for attachment in attachments if attachment not in image_attachments]
             base_text = _render_user_message_for_telegram(actor=actor, text=message_text, attachments=[])
             try:
                 sent_responses: list[dict[str, Any]] = []
+                photo_send_errors: list[dict[str, str]] = []
+                failed_image_attachments: list[dict[str, Any]] = []
                 if image_attachments:
                     for index, attachment in enumerate(image_attachments):
-                        sent = await _telegram_send_photo(
-                            bot_token=bot_token,
-                            chat_id=TELEGRAM_SUPPORT_CHAT_ID,
-                            photo_url=str(attachment.get("publicUrl")),
-                            caption=base_text if index == 0 else None,
-                        )
-                        sent_responses.append(sent)
-                    if non_image_attachments:
+                        caption = base_text if index == 0 else None
+                        sent: dict[str, Any] | None = None
+                        object_path = str(attachment.get("objectPath") or "").strip()
+                        try:
+                            if object_path:
+                                photo_bytes, content_type = _load_support_attachment_bytes(
+                                    settings=settings,
+                                    object_path=object_path,
+                                )
+                                sent = await _telegram_send_photo(
+                                    bot_token=bot_token,
+                                    chat_id=TELEGRAM_SUPPORT_CHAT_ID,
+                                    photo_bytes=photo_bytes,
+                                    photo_filename=str(attachment.get("fileName") or "support-image.jpg"),
+                                    photo_content_type=content_type or str(attachment.get("contentType") or "").strip() or None,
+                                    caption=caption,
+                                )
+                            else:
+                                sent = await _telegram_send_photo(
+                                    bot_token=bot_token,
+                                    chat_id=TELEGRAM_SUPPORT_CHAT_ID,
+                                    photo_url=str(attachment.get("publicUrl")),
+                                    caption=caption,
+                                )
+                        except Exception as exc:  # noqa: BLE001
+                            photo_send_errors.append(
+                                {
+                                    "attachment": str(attachment.get("fileName") or attachment.get("publicUrl") or "unknown"),
+                                    "error": str(exc),
+                                }
+                            )
+                            failed_image_attachments.append(attachment)
+                        if sent is not None:
+                            sent_responses.append(sent)
+
+                    remaining_attachments = [*non_image_attachments, *failed_image_attachments]
+                    if remaining_attachments or not sent_responses:
                         other_text = _render_user_message_for_telegram(
                             actor=actor,
-                            text="[Additional attachments]",
-                            attachments=non_image_attachments,
+                            text=message_text if not sent_responses else "[Additional attachments]",
+                            attachments=remaining_attachments,
                         )
                         sent_responses.append(
                             await _telegram_send_message(
@@ -505,7 +567,11 @@ def register_telegram_support_routes(
                     if first_result.get("message_id") is not None
                     else None
                 )
-                row.provider_payload = {"telegramResponses": sent_responses, "attachments": attachments}
+                row.provider_payload = {
+                    "telegramResponses": sent_responses,
+                    "attachments": attachments,
+                    "photoSendErrors": photo_send_errors,
+                }
                 row.status = "sent"
             except HTTPException as exc:
                 row.status = "failed"
