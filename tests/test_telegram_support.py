@@ -266,10 +266,21 @@ class TelegramSupportRoutesTest(unittest.TestCase):
                 return "https://example-upload.local/presigned"
 
         async def fake_send_message(*, bot_token: str, chat_id: int, text: str, reply_to: int | None = None):
+            _ = (bot_token, chat_id, text, reply_to)
+            self.fail("sendMessage should not be used for image attachments when publicUrl is present.")
+
+        async def fake_send_photo(
+            *,
+            bot_token: str,
+            chat_id: int,
+            photo_url: str,
+            caption: str | None = None,
+            reply_to: int | None = None,
+        ):
             _ = (bot_token, chat_id, reply_to)
-            self.assertIn("[Attachment only]", text)
-            self.assertIn("Attachments:", text)
-            self.assertIn("https://splzxivzahitxmjcqstn.storage.supabase.co/storage/v1/object/public/Tulip%20Mobile%20APP", text)
+            self.assertIn("https://splzxivzahitxmjcqstn.storage.supabase.co/storage/v1/object/public/Tulip%20Mobile%20APP", photo_url)
+            self.assertIn("User ID: 22222222-2222-2222-2222-222222222222", caption or "")
+            self.assertIn("[Attachment only]", caption or "")
             return {"ok": True, "result": {"message_id": 901}}
 
         async def fake_ensure_webhook(*, bot_token: str, webhook_secret: str | None, webhook_base_url: str):
@@ -278,9 +289,11 @@ class TelegramSupportRoutesTest(unittest.TestCase):
 
         original_client_builder = telegram_support._build_support_upload_client
         original_send = telegram_support._telegram_send_message
+        original_send_photo = telegram_support._telegram_send_photo
         original_ensure = telegram_support._ensure_telegram_webhook
         telegram_support._build_support_upload_client = lambda settings: FakeS3Client()
         telegram_support._telegram_send_message = fake_send_message
+        telegram_support._telegram_send_photo = fake_send_photo
         telegram_support._ensure_telegram_webhook = fake_ensure_webhook
         os.environ["SUPPORT_UPLOADS_S3_ENDPOINT"] = "https://splzxivzahitxmjcqstn.storage.supabase.co/storage/v1/s3"
         os.environ["SUPPORT_UPLOADS_ACCESS_KEY_ID"] = "key"
@@ -321,8 +334,45 @@ class TelegramSupportRoutesTest(unittest.TestCase):
         finally:
             telegram_support._build_support_upload_client = original_client_builder
             telegram_support._telegram_send_message = original_send
+            telegram_support._telegram_send_photo = original_send_photo
             telegram_support._ensure_telegram_webhook = original_ensure
             get_settings.cache_clear()
+
+    def test_webhook_photo_only_message_is_mirrored_and_not_ignored(self) -> None:
+        import telegram_support
+
+        async def fake_mirror_attachment(**kwargs):
+            _ = kwargs
+            return {
+                "objectPath": "support/telegram/inbound/2026/04/11/photo.jpg",
+                "publicUrl": "https://example.com/photo.jpg",
+                "fileName": "photo.jpg",
+                "contentType": "image/jpeg",
+                "sizeBytes": 12345,
+                "source": "telegram",
+                "telegramFileId": "file-123",
+            }
+
+        original_mirror = telegram_support._mirror_telegram_attachment_to_support_bucket
+        telegram_support._mirror_telegram_attachment_to_support_bucket = fake_mirror_attachment
+        try:
+            with TestClient(create_app()) as client:
+                webhook = client.post(
+                    "/api/v1/support/telegram/webhook",
+                    headers={"X-Telegram-Bot-Api-Secret-Token": "webhook-secret"},
+                    json={
+                        "message": {
+                            "message_id": 561,
+                            "photo": [{"file_id": "file-123", "file_size": 999}],
+                            "chat": {"id": -5169340336},
+                        }
+                    },
+                )
+                self.assertEqual(webhook.status_code, 200)
+                self.assertTrue(webhook.json().get("ok"))
+                self.assertNotEqual(webhook.json().get("ignored"), "empty_text")
+        finally:
+            telegram_support._mirror_telegram_attachment_to_support_bucket = original_mirror
 
     def test_webhook_reply_maps_user_by_phone_when_no_reply_mapping(self) -> None:
         app = create_app()
