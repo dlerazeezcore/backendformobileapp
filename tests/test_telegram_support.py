@@ -258,10 +258,11 @@ class TelegramSupportRoutesTest(unittest.TestCase):
 
         class FakeS3Client:
             def generate_presigned_url(self, operation_name: str, Params: dict[str, str], ExpiresIn: int) -> str:
-                _ = operation_name
+                outer_self.assertIn(operation_name, {"put_object", "get_object"})
                 outer_self.assertEqual(Params["Bucket"], "Tulip Mobile APP")
                 outer_self.assertIn("support/user/22222222-2222-2222-2222-222222222222", Params["Key"])
-                outer_self.assertEqual(Params["ContentType"], "image/jpeg")
+                if operation_name == "put_object":
+                    outer_self.assertEqual(Params["ContentType"], "image/jpeg")
                 outer_self.assertGreaterEqual(ExpiresIn, 60)
                 return "https://example-upload.local/presigned"
 
@@ -344,6 +345,12 @@ class TelegramSupportRoutesTest(unittest.TestCase):
                 self.assertEqual(send.status_code, 200)
                 self.assertEqual(send.json()["message"]["status"], "sent")
                 self.assertEqual(len(send.json()["message"]["attachments"]), 1)
+                attachment = send.json()["message"]["attachments"][0]
+                self.assertTrue(attachment.get("objectPath"))
+                self.assertTrue(attachment.get("publicUrl"))
+                self.assertEqual(attachment.get("contentType"), "image/jpeg")
+                self.assertEqual(attachment.get("fileName"), "issue-photo.jpg")
+                self.assertEqual(attachment.get("sizeBytes"), 1024)
         finally:
             telegram_support._build_support_upload_client = original_client_builder
             telegram_support._telegram_send_message = original_send

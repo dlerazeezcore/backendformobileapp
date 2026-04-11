@@ -34,8 +34,12 @@ ALLOWED_SUPPORT_UPLOAD_CONTENT_TYPES = {
 }
 MAX_SUPPORT_ATTACHMENTS = 5
 SUPPORT_MESSAGES_CACHE_TTL_SECONDS = 8.0
+SUPPORT_BUCKET_CACHE_TTL_SECONDS = 300.0
+SUPPORT_ATTACHMENT_URL_TTL_SECONDS = 1800
 _SUPPORT_MESSAGES_CACHE: dict[tuple[str, str, str, int, int], tuple[float, dict[str, Any]]] = {}
 _SUPPORT_MESSAGES_CACHE_LOCK = threading.Lock()
+_SUPPORT_BUCKET_CACHE: dict[str, tuple[float, str]] = {}
+_SUPPORT_BUCKET_CACHE_LOCK = threading.Lock()
 
 try:
     import boto3
@@ -133,6 +137,58 @@ def _build_support_upload_client(settings: Any):
     return client
 
 
+def _normalize_bucket_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def _resolve_support_bucket_name(*, settings: Any, client: Any | None = None) -> str:
+    configured_bucket = str(settings.support_uploads_bucket or "").strip()
+    if not configured_bucket:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Support uploads bucket is not configured on this deployment.",
+        )
+    cache_key = "|".join(
+        [
+            str(settings.support_uploads_s3_endpoint or "").strip(),
+            str(settings.support_uploads_access_key_id or "").strip(),
+            configured_bucket,
+        ]
+    )
+    now = time.monotonic()
+    with _SUPPORT_BUCKET_CACHE_LOCK:
+        cached = _SUPPORT_BUCKET_CACHE.get(cache_key)
+        if cached is not None and now < cached[0]:
+            return cached[1]
+
+    resolved_bucket = configured_bucket
+    s3_client = client or _build_support_upload_client(settings)
+    try:
+        buckets_response = s3_client.list_buckets()
+        available = [
+            str(item.get("Name") or "").strip()
+            for item in (buckets_response.get("Buckets") or [])
+            if str(item.get("Name") or "").strip()
+        ]
+        if available:
+            if configured_bucket in available:
+                resolved_bucket = configured_bucket
+            else:
+                lower_match = {name.lower(): name for name in available}
+                normalized_match = {_normalize_bucket_key(name): name for name in available}
+                resolved_bucket = (
+                    lower_match.get(configured_bucket.lower())
+                    or normalized_match.get(_normalize_bucket_key(configured_bucket))
+                    or configured_bucket
+                )
+    except Exception:  # pragma: no cover - transient upstream failure
+        resolved_bucket = configured_bucket
+
+    with _SUPPORT_BUCKET_CACHE_LOCK:
+        _SUPPORT_BUCKET_CACHE[cache_key] = (now + SUPPORT_BUCKET_CACHE_TTL_SECONDS, resolved_bucket)
+    return resolved_bucket
+
+
 def _sanitize_support_filename(name: str) -> str:
     value = str(name or "").strip().replace("\\", "_").replace("/", "_")
     value = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._")
@@ -163,18 +219,91 @@ def _build_support_public_url(*, settings: Any, bucket: str, object_path: str) -
     return f"{derived.rstrip('/')}/{encoded_bucket}/{encoded_object_path}"
 
 
+def _build_support_download_url(
+    *,
+    settings: Any,
+    object_path: str,
+    client: Any | None = None,
+    bucket: str | None = None,
+    expires_in_seconds: int = SUPPORT_ATTACHMENT_URL_TTL_SECONDS,
+) -> str | None:
+    resolved_object_path = str(object_path or "").strip()
+    if not resolved_object_path:
+        return None
+    s3_client = client or _build_support_upload_client(settings)
+    resolved_bucket = bucket or _resolve_support_bucket_name(settings=settings, client=s3_client)
+    ttl = max(60, min(int(expires_in_seconds), 3600))
+    return s3_client.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": resolved_bucket, "Key": resolved_object_path},
+        ExpiresIn=ttl,
+    )
+
+
+def _format_support_attachments_for_response(
+    *,
+    settings: Any,
+    attachments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not attachments:
+        return []
+    object_paths = [
+        str(item.get("objectPath") or "").strip()
+        for item in attachments
+        if isinstance(item, dict) and str(item.get("objectPath") or "").strip()
+    ]
+    s3_client: Any | None = None
+    resolved_bucket: str | None = None
+    if object_paths:
+        try:
+            s3_client = _build_support_upload_client(settings)
+            resolved_bucket = _resolve_support_bucket_name(settings=settings, client=s3_client)
+        except Exception:
+            s3_client = None
+            resolved_bucket = None
+
+    normalized: list[dict[str, Any]] = []
+    for item in attachments:
+        if not isinstance(item, dict):
+            continue
+        object_path = str(item.get("objectPath") or "").strip() or None
+        public_object_url = (
+            _build_support_public_url(settings=settings, bucket=resolved_bucket, object_path=object_path)
+            if object_path and resolved_bucket
+            else None
+        )
+        signed_url = None
+        if object_path and s3_client is not None and resolved_bucket is not None:
+            try:
+                signed_url = _build_support_download_url(
+                    settings=settings,
+                    object_path=object_path,
+                    client=s3_client,
+                    bucket=resolved_bucket,
+                )
+            except Exception:
+                signed_url = None
+        existing_public = str(item.get("publicUrl") or "").strip() or None
+        normalized.append(
+            {
+                "objectPath": object_path,
+                "publicUrl": signed_url or existing_public or public_object_url,
+                "contentType": str(item.get("contentType") or "").strip() or "application/octet-stream",
+                "fileName": str(item.get("fileName") or "").strip()
+                or (object_path.rsplit("/", 1)[-1] if object_path else "attachment"),
+                "sizeBytes": int(item.get("sizeBytes") or 0),
+            }
+        )
+    return normalized
+
+
 def _load_support_attachment_bytes(
     *,
     settings: Any,
     object_path: str,
 ) -> tuple[bytes, str | None]:
-    bucket = str(settings.support_uploads_bucket or "").strip()
-    if not bucket:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Support uploads bucket is not configured on this deployment.",
-        )
     client = _build_support_upload_client(settings)
+    bucket = _resolve_support_bucket_name(settings=settings, client=client)
     response = client.get_object(Bucket=bucket, Key=object_path)
     body = response["Body"].read()
     content_type = response.get("ContentType")
@@ -356,10 +485,8 @@ def _upload_support_file_bytes(
     file_bytes: bytes,
     content_type: str | None,
 ) -> str | None:
-    bucket = str(settings.support_uploads_bucket or "").strip()
-    if not bucket:
-        return None
     client = _build_support_upload_client(settings)
+    bucket = _resolve_support_bucket_name(settings=settings, client=client)
     params: dict[str, Any] = {
         "Bucket": bucket,
         "Key": object_path,
@@ -500,10 +627,11 @@ def register_telegram_support_routes(
         actor: AppUser | AdminUser = Depends(_require_active_actor),
         push_provider: PushNotificationService = Depends(get_push_provider),
     ) -> dict[str, Any]:
+        settings = get_settings()
         attachments = _normalize_support_attachments(payload.attachments)
+        response_attachments = _format_support_attachments_for_response(settings=settings, attachments=attachments)
         message_text = payload.message.strip()
         if isinstance(actor, AppUser):
-            settings = get_settings()
             bot_token = str(settings.telegram_support_bot_token or "").strip()
             if not bot_token:
                 raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Telegram support is not configured")
@@ -631,7 +759,7 @@ def register_telegram_support_routes(
                     "direction": row.direction,
                     "status": row.status,
                     "telegramMessageId": row.telegram_message_id,
-                    "attachments": attachments,
+                    "attachments": response_attachments,
                     "createdAt": row.created_at,
                 }
             }
@@ -687,7 +815,7 @@ def register_telegram_support_routes(
                 "direction": row.direction,
                 "status": row.status,
                 "pushDeliveryStatus": row.push_delivery_status,
-                "attachments": attachments,
+                "attachments": response_attachments,
                 "createdAt": row.created_at,
             }
         }
@@ -704,13 +832,6 @@ def register_telegram_support_routes(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=f"File is too large. Max allowed is {max_file_bytes} bytes.",
             )
-        bucket = str(settings.support_uploads_bucket or "").strip()
-        if not bucket:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Support uploads bucket is not configured on this deployment.",
-            )
-
         safe_name = _sanitize_support_filename(payload.file_name)
         subject_type = "admin" if isinstance(actor, AdminUser) else "user"
         date_prefix = utcnow().strftime("%Y/%m/%d")
@@ -721,17 +842,27 @@ def register_telegram_support_routes(
         )
         expires_in_seconds = max(60, min(int(settings.support_uploads_url_ttl_seconds), 3600))
         client = _build_support_upload_client(settings)
+        bucket = _resolve_support_bucket_name(settings=settings, client=client)
         upload_url = client.generate_presigned_url(
             "put_object",
             Params={"Bucket": bucket, "Key": object_path, "ContentType": payload.content_type},
             ExpiresIn=expires_in_seconds,
         )
-        public_url = _build_support_public_url(settings=settings, bucket=bucket, object_path=object_path)
+        public_object_url = _build_support_public_url(settings=settings, bucket=bucket, object_path=object_path)
+        download_url = _build_support_download_url(
+            settings=settings,
+            object_path=object_path,
+            client=client,
+            bucket=bucket,
+            expires_in_seconds=SUPPORT_ATTACHMENT_URL_TTL_SECONDS,
+        )
         return {
             "upload": {
                 "bucket": bucket,
                 "objectPath": object_path,
-                "publicUrl": public_url,
+                "publicUrl": download_url or public_object_url,
+                "publicObjectUrl": public_object_url,
+                "downloadUrl": download_url,
                 "uploadUrl": upload_url,
                 "method": "PUT",
                 "requiredHeaders": {"Content-Type": payload.content_type},
@@ -748,6 +879,7 @@ def register_telegram_support_routes(
         offset: int = Query(default=0, ge=0),
         user_id: str | None = Query(default=None, alias="userId"),
     ) -> dict[str, Any]:
+        settings = get_settings()
         cache_key = _support_messages_cache_key(
             actor=actor,
             user_id=(user_id if isinstance(actor, AdminUser) else actor.id),
@@ -774,10 +906,13 @@ def register_telegram_support_routes(
                     "direction": row.direction,
                     "status": row.status,
                     "message": row.message_text,
-                    "attachments": (
-                        row.provider_payload.get("attachments", [])
-                        if isinstance(row.provider_payload, dict)
-                        else []
+                    "attachments": _format_support_attachments_for_response(
+                        settings=settings,
+                        attachments=(
+                            row.provider_payload.get("attachments", [])
+                            if isinstance(row.provider_payload, dict)
+                            else []
+                        ),
                     ),
                     "createdAt": row.created_at,
                     "pushDeliveryStatus": row.push_delivery_status,
