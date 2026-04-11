@@ -766,6 +766,7 @@ def register_telegram_support_routes(
 
         rows = db.scalars(query.offset(offset).limit(limit)).all()
         response_payload = {
+            "success": True,
             "messages": [
                 {
                     "id": row.id,
@@ -784,6 +785,10 @@ def register_telegram_support_routes(
                 for row in rows
             ],
             "pagination": {"limit": limit, "offset": offset, "count": len(rows)},
+        }
+        response_payload["data"] = {
+            "messages": response_payload["messages"],
+            "pagination": response_payload["pagination"],
         }
         _support_messages_cache_set(cache_key, response_payload)
         return response_payload
