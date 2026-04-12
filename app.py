@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import inspect
 from typing import AsyncIterator
 
 from fastapi import FastAPI, Request
@@ -16,7 +17,7 @@ from config import (
     Settings,
     get_settings,
 )
-from dependencies import get_db, get_fib_provider, get_provider, get_push_provider
+from dependencies import get_db, get_fib_provider, get_provider, get_push_provider, get_twilio_provider
 from esim_access_api import (
     ESimAccessAPI,
     ESimAccessAPIError,
@@ -32,6 +33,7 @@ from fib_payment_api import (
 from push_notification import PushNotificationService, register_push_notification_routes
 from telegram_support import register_telegram_support_routes
 from supabase_store import create_database
+from twilio_whatsapp import TwilioVerifyAPIError, TwilioVerifyHTTPError, TwilioWhatsAppVerifyAPI
 from users import register_user_routes
 
 CORS_ALLOWED_ORIGINS = [
@@ -89,10 +91,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             service_account_json=cfg.firebase_service_account_json,
             default_channel_id=cfg.push_notification_default_channel_id or PUSH_NOTIFICATION_DEFAULT_CHANNEL_ID,
         )
+        app.state.twilio_whatsapp_api = None
+        if cfg.twilio_account_sid and cfg.twilio_auth_token and cfg.twilio_verify_service_sid:
+            app.state.twilio_whatsapp_api = TwilioWhatsAppVerifyAPI(
+                account_sid=cfg.twilio_account_sid,
+                auth_token=cfg.twilio_auth_token,
+                verify_service_sid=cfg.twilio_verify_service_sid,
+                base_url=cfg.twilio_verify_base_url,
+                timeout=cfg.twilio_verify_timeout_seconds,
+                rate_limit_per_second=cfg.twilio_verify_rate_limit_per_second,
+            )
         yield
         await app.state.esim_access_api.close()
         if app.state.fib_payment_api is not None:
             await app.state.fib_payment_api.close()
+        twilio_provider = getattr(app.state, "twilio_whatsapp_api", None)
+        if twilio_provider is not None:
+            close_method = getattr(twilio_provider, "close", None)
+            if callable(close_method):
+                close_result = close_method()
+                if inspect.isawaitable(close_result):
+                    await close_result
 
     app = FastAPI(title="backendformobileapp", version="0.1.0", lifespan=lifespan)
     app.add_middleware(
@@ -143,6 +162,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             },
         )
 
+    @app.exception_handler(TwilioVerifyHTTPError)
+    async def handle_twilio_http_error(request: Request, exc: TwilioVerifyHTTPError) -> JSONResponse:
+        _ = request
+        return JSONResponse(
+            status_code=502,
+            content={
+                "detail": str(exc),
+                "errorCode": "TWILIO_VERIFY_UPSTREAM_UNAVAILABLE",
+                "errorMessage": "Unable to reach Twilio Verify provider.",
+            },
+        )
+
+    @app.exception_handler(TwilioVerifyAPIError)
+    async def handle_twilio_api_error(request: Request, exc: TwilioVerifyAPIError) -> JSONResponse:
+        _ = request
+        mapped_status = exc.status_code if 400 <= exc.status_code < 600 else 502
+        return JSONResponse(
+            status_code=mapped_status,
+            content={
+                "detail": str(exc),
+                "errorCode": exc.error_code or "TWILIO_VERIFY_ERROR",
+                "errorMessage": exc.error_message or "Twilio Verify request failed.",
+                "providerPayload": exc.payload or {},
+            },
+        )
+
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
@@ -153,7 +198,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return Response(status_code=204)
 
     register_user_routes(app, get_db)
-    register_auth_routes(app, get_db)
+    register_auth_routes(app, get_db, get_twilio_provider)
     register_esim_access_routes(app, get_db, get_provider)
     register_fib_payment_routes(app, get_fib_provider, get_db)
     register_push_notification_routes(app, get_push_provider, get_db)

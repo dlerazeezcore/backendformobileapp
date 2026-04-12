@@ -8,8 +8,8 @@ import os
 import time
 from typing import Any, Callable
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
-from pydantic import BaseModel, Field
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -17,18 +17,43 @@ from sqlalchemy.orm import Session
 from config import get_settings
 from phone_utils import normalize_phone, phone_lookup_candidates
 from supabase_store import AdminUser, AppUser, utcnow
+from twilio_whatsapp import TwilioWhatsAppVerifyAPI
 
 
 class LoginPayload(BaseModel):
     phone: str
-    password: str = Field(min_length=8)
+    password: str | None = Field(default=None, min_length=8)
     otp_code: str | None = Field(default=None, alias="otpCode")
+
+    @model_validator(mode="after")
+    def validate_auth_factor(self) -> "LoginPayload":
+        if self.password or self.otp_code:
+            return self
+        raise ValueError("password or otpCode is required")
 
 
 class SignupPayload(BaseModel):
     phone: str
     name: str = Field(min_length=2, max_length=255)
-    password: str = Field(min_length=8)
+    password: str | None = Field(default=None, min_length=8)
+    otp_code: str | None = Field(default=None, alias="otpCode")
+
+    @model_validator(mode="after")
+    def validate_signup_factor(self) -> "SignupPayload":
+        if self.password or self.otp_code:
+            return self
+        raise ValueError("password or otpCode is required")
+
+
+class OTPRequestPayload(BaseModel):
+    phone: str
+    channel: str = Field(default="whatsapp")
+
+
+class OTPVerifyPayload(BaseModel):
+    phone: str
+    code: str = Field(min_length=4, max_length=10)
+    name: str | None = Field(default=None, max_length=255)
 
 
 class LogoutPayload(BaseModel):
@@ -241,10 +266,128 @@ def _normalize_and_validate_signup_phone(phone: str) -> str:
     return normalized
 
 
-def register_auth_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
+async def _verify_twilio_user_otp(
+    *,
+    provider: TwilioWhatsAppVerifyAPI,
+    phone: str,
+    code: str,
+) -> None:
+    result = await provider.check_verification(phone=phone, code=code)
+    status_value = str(result.get("status") or "").strip().lower()
+    if status_value != "approved":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired OTP code.",
+        )
+
+
+def _issue_user_session(user_row: AppUser) -> dict[str, Any]:
+    token_payload = _issue_token(user_row, subject_type="user")
+    return {
+        **token_payload,
+        "userId": user_row.id,
+        "id": user_row.id,
+        "phone": user_row.phone,
+        "name": user_row.name,
+        "subjectType": "user",
+    }
+
+
+def register_auth_routes(
+    app: FastAPI,
+    get_db: Callable[..., Any],
+    get_twilio_provider: Callable[..., Any],
+) -> None:
+    def _get_optional_twilio_provider(request: Request) -> TwilioWhatsAppVerifyAPI | None:
+        return getattr(request.app.state, "twilio_whatsapp_api", None)
+
+    def _require_twilio_provider(provider: TwilioWhatsAppVerifyAPI | None) -> TwilioWhatsAppVerifyAPI:
+        if provider is not None:
+            return provider
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Twilio WhatsApp OTP service is not configured on this deployment.",
+        )
+
+    @app.post("/api/v1/auth/user/otp/request")
+    async def request_user_otp(
+        payload: OTPRequestPayload,
+        provider: TwilioWhatsAppVerifyAPI = Depends(get_twilio_provider),
+    ) -> dict[str, Any]:
+        normalized_phone = _normalize_and_validate_signup_phone(payload.phone)
+        channel = str(payload.channel or "whatsapp").strip().lower() or "whatsapp"
+        if channel not in {"whatsapp", "sms"}:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="Unsupported OTP channel. Allowed channels: whatsapp, sms.",
+            )
+        result = await provider.start_verification(phone=normalized_phone, channel=channel)
+        return {
+            "success": True,
+            "data": {
+                "to": normalized_phone,
+                "channel": channel,
+                "status": str(result.get("status") or "pending"),
+                "sid": result.get("sid"),
+            },
+        }
+
+    @app.post("/api/v1/auth/user/otp/verify")
+    async def verify_user_otp(
+        payload: OTPVerifyPayload,
+        db: Session = Depends(get_db),
+        provider: TwilioWhatsAppVerifyAPI = Depends(get_twilio_provider),
+    ) -> dict[str, Any]:
+        normalized_phone = _normalize_and_validate_signup_phone(payload.phone)
+        await _verify_twilio_user_otp(provider=provider, phone=normalized_phone, code=payload.code)
+
+        user_row = _lookup_user_by_phone(db, normalized_phone)
+        if user_row is None:
+            existing_admin = _lookup_admin_by_phone(db, normalized_phone)
+            if existing_admin is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="This phone is already used by an admin account.",
+                )
+            normalized_name = str(payload.name or "").strip()
+            if len(normalized_name) < 2:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail="Name must be at least 2 characters for first-time signup.",
+                )
+            user_row = AppUser(
+                phone=normalized_phone,
+                name=normalized_name,
+                status="active",
+                password_hash=None,
+                last_login_at=utcnow(),
+            )
+            db.add(user_row)
+            try:
+                db.commit()
+            except IntegrityError as exc:
+                db.rollback()
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="User account already exists for this phone. Please try again.",
+                ) from exc
+            db.refresh(user_row)
+            return _issue_user_session(user_row)
+
+        if not _is_row_active(user_row):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="User account exists but is not active. Please contact support.",
+            )
+        user_row.last_login_at = utcnow()
+        db.commit()
+        return _issue_user_session(user_row)
+
     @app.post("/api/v1/auth/admin/login")
     async def admin_login(payload: LoginPayload, db: Session = Depends(get_db)) -> dict[str, Any]:
         row = _lookup_admin_by_phone(db, payload.phone)
+        if payload.password is None:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="password is required")
         if row is None or not _is_row_active(row) or not verify_password(payload.password, row.password_hash):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid phone or password")
         row.last_login_at = utcnow()
@@ -252,15 +395,41 @@ def register_auth_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return _issue_token(row, subject_type="admin")
 
     @app.post("/api/v1/auth/user/login")
-    async def user_login(payload: LoginPayload, db: Session = Depends(get_db)) -> dict[str, Any]:
-        user_row = _lookup_user_by_phone(db, payload.phone)
+    async def user_login(
+        payload: LoginPayload,
+        db: Session = Depends(get_db),
+        provider: TwilioWhatsAppVerifyAPI | None = Depends(_get_optional_twilio_provider),
+    ) -> dict[str, Any]:
+        normalized_phone = _normalize_and_validate_signup_phone(payload.phone)
+        if payload.otp_code:
+            required_provider = _require_twilio_provider(provider)
+            await _verify_twilio_user_otp(provider=required_provider, phone=normalized_phone, code=payload.otp_code)
+            user_row = _lookup_user_by_phone(db, normalized_phone)
+            if user_row is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="User account not found. Please sign up first.",
+                )
+            if not _is_row_active(user_row):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="User account exists but is not active. Please contact support.",
+                )
+            user_row.last_login_at = utcnow()
+            db.commit()
+            return _issue_token(user_row, subject_type="user")
+
+        if payload.password is None:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="password or otpCode is required")
+
+        user_row = _lookup_user_by_phone(db, normalized_phone)
         if user_row is not None and _is_row_active(user_row) and verify_password(payload.password, user_row.password_hash):
             user_row.last_login_at = utcnow()
             db.commit()
             return _issue_token(user_row, subject_type="user")
 
         # Compatibility path for frontends using a single login endpoint.
-        admin_row = _lookup_admin_by_phone(db, payload.phone)
+        admin_row = _lookup_admin_by_phone(db, normalized_phone)
         if admin_row is not None and _is_row_active(admin_row) and verify_password(payload.password, admin_row.password_hash):
             admin_row.last_login_at = utcnow()
             db.commit()
@@ -270,7 +439,11 @@ def register_auth_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
 
     @app.post("/api/v1/auth/user/register")
     @app.post("/api/v1/auth/user/signup")
-    async def user_signup(payload: SignupPayload, db: Session = Depends(get_db)) -> dict[str, Any]:
+    async def user_signup(
+        payload: SignupPayload,
+        db: Session = Depends(get_db),
+        provider: TwilioWhatsAppVerifyAPI | None = Depends(_get_optional_twilio_provider),
+    ) -> dict[str, Any]:
         normalized_phone = _normalize_and_validate_signup_phone(payload.phone)
         normalized_name = str(payload.name or "").strip()
         if len(normalized_name) < 2:
@@ -298,11 +471,20 @@ def register_auth_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
                 detail="This phone is already used by an admin account.",
             )
 
+        if payload.otp_code:
+            required_provider = _require_twilio_provider(provider)
+            await _verify_twilio_user_otp(provider=required_provider, phone=normalized_phone, code=payload.otp_code)
+        elif payload.password is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="password or otpCode is required",
+            )
+
         user_row = AppUser(
             phone=normalized_phone,
             name=normalized_name,
             status="active",
-            password_hash=hash_password(payload.password),
+            password_hash=hash_password(payload.password) if payload.password else None,
             last_login_at=utcnow(),
         )
         db.add(user_row)
@@ -316,15 +498,7 @@ def register_auth_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
             ) from exc
         db.refresh(user_row)
 
-        token_payload = _issue_token(user_row, subject_type="user")
-        return {
-            **token_payload,
-            "userId": user_row.id,
-            "id": user_row.id,
-            "phone": user_row.phone,
-            "name": user_row.name,
-            "subjectType": "user",
-        }
+        return _issue_user_session(user_row)
 
     @app.get("/api/v1/auth/me")
     @app.get("/auth/me")

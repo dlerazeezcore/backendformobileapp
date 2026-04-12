@@ -554,6 +554,73 @@ These routes are intended for mobile app read flows and do not require admin sco
 - `POST /api/v1/esim-access/profiles/install/my` (user/admin token, ownership checks)
 - `POST /api/v1/esim-access/profiles/activate/my` (user/admin token, ownership checks)
 
+### Passwordless WhatsApp OTP auth routes
+
+These routes support passwordless mobile auth using Twilio Verify. Existing password-based login/signup remains supported and backward-compatible.
+
+- `POST /api/v1/auth/user/otp/request`
+- `POST /api/v1/auth/user/otp/verify`
+- `POST /api/v1/auth/user/login` now accepts `otpCode` as an alternative to `password`
+- `POST /api/v1/auth/user/signup` now accepts `otpCode` as an alternative to `password`
+
+Required env vars:
+
+- `TWILIO_ACCOUNT_SID`
+- `TWILIO_AUTH_TOKEN`
+- `TWILIO_VERIFY_SERVICE_SID`
+
+Optional env vars:
+
+- `TWILIO_VERIFY_BASE_URL` (default: `https://verify.twilio.com`)
+- `TWILIO_VERIFY_TIMEOUT_SECONDS` (default: `20`)
+- `TWILIO_VERIFY_RATE_LIMIT_PER_SECOND` (default: `5`)
+
+Request OTP example:
+
+```bash
+curl -X POST "$BASE_URL/api/v1/auth/user/otp/request" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "phone": "+9647507343635",
+    "channel": "whatsapp"
+  }'
+```
+
+Verify OTP and create/login user session:
+
+```bash
+curl -X POST "$BASE_URL/api/v1/auth/user/otp/verify" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "phone": "+9647507343635",
+    "code": "123456",
+    "name": "Laveen"
+  }'
+```
+
+Login with OTP (existing user):
+
+```bash
+curl -X POST "$BASE_URL/api/v1/auth/user/login" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "phone": "+9647507343635",
+    "otpCode": "123456"
+  }'
+```
+
+Signup with OTP (passwordless):
+
+```bash
+curl -X POST "$BASE_URL/api/v1/auth/user/signup" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "phone": "+9647507343635",
+    "name": "Laveen",
+    "otpCode": "123456"
+  }'
+```
+
 ### Push notification routes
 
 User token/device routes:
