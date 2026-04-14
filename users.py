@@ -62,6 +62,19 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         assert isinstance(row, (AdminUser, AppUser))
         return row
 
+    def _soft_delete_user_row(user: AppUser) -> dict[str, Any]:
+        if user.deleted_at is None or user.status != "deleted":
+            user.status = "deleted"
+            user.deleted_at = user.deleted_at or utcnow()
+            user.updated_at = utcnow()
+        return {
+            "deleted": True,
+            "id": user.id,
+            "userId": user.id,
+            "status": "deleted",
+            "deletedAt": user.deleted_at,
+        }
+
     @app.post("/api/v1/admin/users")
     async def save_user(
         payload: UserPayload,
@@ -109,10 +122,13 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
         search: str | None = Query(default=None),
+        include_deleted: bool = Query(default=False, alias="includeDeleted"),
         actor: AdminUser | AppUser = Depends(_require_active_actor),
     ) -> dict[str, Any]:
         if isinstance(actor, AdminUser):
             query = select(AppUser).order_by(AppUser.updated_at.desc(), AppUser.created_at.desc())
+            if not include_deleted:
+                query = query.where(AppUser.deleted_at.is_(None), AppUser.status != "deleted")
             normalized_search = str(search or "").strip()
             if normalized_search:
                 compact = normalized_search.replace(" ", "").replace("-", "")
@@ -167,6 +183,44 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
                 }
             )
         return {"users": normalized_rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
+
+    @app.delete("/api/v1/admin/users/{user_id}")
+    @app.delete("/admin/users/{user_id}")
+    async def delete_user_by_id(
+        user_id: str,
+        db: Session = Depends(get_db),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
+        user_row = db.scalar(select(AppUser).where(AppUser.id == user_id))
+        if user_row is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+        payload = _soft_delete_user_row(user_row)
+        db.commit()
+        return payload
+
+    @app.delete("/api/v1/admin/users")
+    @app.delete("/admin/users")
+    async def delete_user_by_lookup(
+        user_id: str | None = Query(default=None, alias="userId"),
+        phone: str | None = Query(default=None),
+        db: Session = Depends(get_db),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
+        user_row: AppUser | None = None
+        if user_id:
+            user_row = db.scalar(select(AppUser).where(AppUser.id == user_id))
+        elif phone:
+            user_row = db.scalar(select(AppUser).where(AppUser.phone.in_(phone_lookup_candidates(phone))))
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Either userId or phone is required",
+            )
+        if user_row is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+        payload = _soft_delete_user_row(user_row)
+        db.commit()
+        return payload
 
     @app.post("/api/v1/admin/admin-users")
     async def save_admin_user(

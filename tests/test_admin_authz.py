@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from auth import create_access_token, hash_password
@@ -91,6 +91,33 @@ class AdminAuthorizationTest(unittest.TestCase):
             payload = response.json()
             self.assertIn("users", payload)
             self.assertEqual(payload["users"][0].get("id"), payload["users"][0].get("userId"))
+
+    def test_admin_login_returns_subject_metadata(self) -> None:
+        with TestClient(create_app()) as client:
+            response = client.post(
+                "/api/v1/auth/admin/login",
+                json={"phone": "+9647700000001", "password": "StrongPass123"},
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertEqual(payload.get("subjectType"), "admin")
+            self.assertEqual(payload.get("isAdmin"), True)
+            self.assertEqual(payload.get("id"), payload.get("adminUserId"))
+            self.assertEqual(payload.get("phone"), "+9647700000001")
+            self.assertTrue(payload.get("accessToken"))
+
+    def test_user_login_with_admin_credentials_returns_admin_subject(self) -> None:
+        with TestClient(create_app()) as client:
+            response = client.post(
+                "/api/v1/auth/user/login",
+                json={"phone": "+9647700000001", "password": "StrongPass123"},
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertEqual(payload.get("subjectType"), "admin")
+            self.assertEqual(payload.get("isAdmin"), True)
+            self.assertEqual(payload.get("id"), payload.get("adminUserId"))
+            self.assertTrue(payload.get("accessToken"))
 
     def test_user_delete_allows_admin_token_for_self_delete(self) -> None:
         token = create_access_token(
@@ -247,6 +274,90 @@ class AdminAuthorizationTest(unittest.TestCase):
             self.assertIn("isLoyalty", row)
             self.assertIn("blockedAt", row)
             self.assertIn("deletedAt", row)
+
+    def test_admin_can_delete_user_by_id(self) -> None:
+        token = create_access_token(
+            subject_id="11111111-1111-1111-1111-111111111111",
+            phone="+9647700000001",
+            subject_type="admin",
+            secret_key="test-auth-secret",
+            ttl_seconds=3600,
+        )
+        with TestClient(create_app()) as client:
+            delete_response = client.delete(
+                "/api/v1/admin/users/22222222-2222-2222-2222-222222222222",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            self.assertEqual(delete_response.status_code, 200)
+            payload = delete_response.json()
+            self.assertTrue(payload.get("deleted"))
+            self.assertEqual(payload.get("id"), "22222222-2222-2222-2222-222222222222")
+            self.assertEqual(payload.get("id"), payload.get("userId"))
+            self.assertEqual(payload.get("status"), "deleted")
+            self.assertTrue(payload.get("deletedAt"))
+
+            list_response = client.get(
+                "/api/v1/admin/users?limit=20&offset=0",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            self.assertEqual(list_response.status_code, 200)
+            user_ids = {row.get("id") for row in list_response.json().get("users", [])}
+            self.assertNotIn("22222222-2222-2222-2222-222222222222", user_ids)
+
+            include_deleted_response = client.get(
+                "/api/v1/admin/users?limit=20&offset=0&includeDeleted=true",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            self.assertEqual(include_deleted_response.status_code, 200)
+            deleted_rows = [
+                row
+                for row in include_deleted_response.json().get("users", [])
+                if row.get("id") == "22222222-2222-2222-2222-222222222222"
+            ]
+            self.assertEqual(len(deleted_rows), 1)
+            self.assertEqual(deleted_rows[0].get("status"), "deleted")
+
+        with TestClient(create_app()) as client:
+            with client.app.state.db_session_factory() as session:
+                row = session.scalar(select(AppUser).where(AppUser.id == "22222222-2222-2222-2222-222222222222"))
+                self.assertIsNotNone(row)
+                assert row is not None
+                self.assertEqual(row.status, "deleted")
+                self.assertIsNotNone(row.deleted_at)
+
+    def test_admin_can_delete_user_by_collection_route_query_param(self) -> None:
+        token = create_access_token(
+            subject_id="11111111-1111-1111-1111-111111111111",
+            phone="+9647700000001",
+            subject_type="admin",
+            secret_key="test-auth-secret",
+            ttl_seconds=3600,
+        )
+        with TestClient(create_app()) as client:
+            response = client.delete(
+                "/api/v1/admin/users",
+                params={"userId": "33333333-3333-3333-3333-333333333333"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertTrue(payload.get("deleted"))
+            self.assertEqual(payload.get("userId"), "33333333-3333-3333-3333-333333333333")
+
+    def test_admin_user_delete_requires_admin_token(self) -> None:
+        user_token = create_access_token(
+            subject_id="22222222-2222-2222-2222-222222222222",
+            phone="+9647700000002",
+            subject_type="user",
+            secret_key="test-auth-secret",
+            ttl_seconds=3600,
+        )
+        with TestClient(create_app()) as client:
+            response = client.delete(
+                "/api/v1/admin/users/33333333-3333-3333-3333-333333333333",
+                headers={"Authorization": f"Bearer {user_token}"},
+            )
+            self.assertEqual(response.status_code, 403)
 
 
 if __name__ == "__main__":

@@ -122,6 +122,9 @@ class TelegramSupportRoutesTest(unittest.TestCase):
                 self.assertEqual(response.status_code, 200)
                 payload = response.json()
                 self.assertEqual(payload["message"]["status"], "sent")
+                self.assertEqual(payload["message"]["direction"], "user_to_admin")
+                self.assertEqual(payload["message"]["senderType"], "user")
+                self.assertEqual(payload["message"]["isFromCurrentActor"], True)
         finally:
             telegram_support._telegram_send_message = original
             telegram_support._ensure_telegram_webhook = original_ensure
@@ -152,10 +155,48 @@ class TelegramSupportRoutesTest(unittest.TestCase):
             self.assertEqual(payload["direction"], "admin_to_user")
             self.assertEqual(payload["status"], "sent")
             self.assertEqual(payload["pushDeliveryStatus"], "sent")
+            self.assertEqual(payload["senderType"], "admin")
+            self.assertEqual(payload["isFromCurrentActor"], True)
+            self.assertEqual(payload["adminUserId"], "11111111-1111-1111-1111-111111111111")
 
         self.assertEqual(captured["tokens"], ["push-token-1"])
         self.assertEqual(captured["title"], "Support reply")
         self.assertEqual(captured["channel_id"], "support")
+
+    def test_admin_can_send_support_reply_using_support_message_id(self) -> None:
+        app = create_app()
+
+        def fake_push(*, tokens, title, body, data, channel_id, image=None):
+            _ = (title, body, data, channel_id, image)
+            self.assertEqual(tokens, ["push-token-1"])
+            return {"successCount": 1, "failureCount": 0, "invalidTokens": []}
+
+        with TestClient(app) as client:
+            with client.app.state.db_session_factory() as session:
+                source = TelegramSupportMessage(
+                    user_id="22222222-2222-2222-2222-222222222222",
+                    direction="user_to_admin",
+                    status="sent",
+                    message_text="Original user message",
+                    telegram_chat_id=-5169340336,
+                    telegram_message_id=111,
+                )
+                session.add(source)
+                session.commit()
+                support_message_id = source.id
+
+            client.app.state.push_notification_service.send_push_notification = fake_push
+            response = client.post(
+                "/api/v1/support/telegram/messages",
+                headers={"Authorization": f"Bearer {self._admin_token()}"},
+                json={"supportMessageId": support_message_id, "message": "Reply via support message context."},
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()["message"]
+            self.assertEqual(payload["userId"], "22222222-2222-2222-2222-222222222222")
+            self.assertEqual(payload["direction"], "admin_to_user")
+            self.assertEqual(payload["senderType"], "admin")
+            self.assertTrue(payload["isFromCurrentActor"])
 
     def test_admin_can_list_support_messages(self) -> None:
         import telegram_support
@@ -189,6 +230,9 @@ class TelegramSupportRoutesTest(unittest.TestCase):
                 payload = response.json()
                 self.assertGreaterEqual(payload["pagination"]["count"], 1)
                 self.assertEqual(payload["messages"][0]["userId"], "22222222-2222-2222-2222-222222222222")
+                self.assertIn("senderType", payload["messages"][0])
+                self.assertIn("isFromCurrentActor", payload["messages"][0])
+                self.assertIn("adminUserId", payload["messages"][0])
         finally:
             telegram_support._telegram_send_message = original
             telegram_support._ensure_telegram_webhook = original_ensure

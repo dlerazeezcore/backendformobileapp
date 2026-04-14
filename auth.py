@@ -282,14 +282,29 @@ async def _verify_twilio_user_otp(
 
 
 def _issue_user_session(user_row: AppUser) -> dict[str, Any]:
-    token_payload = _issue_token(user_row, subject_type="user")
+    return _issue_subject_session(user_row, subject_type="user")
+
+
+def _issue_subject_session(row: AppUser | AdminUser, *, subject_type: str) -> dict[str, Any]:
+    token_payload = _issue_token(row, subject_type=subject_type)
+    if subject_type == "admin":
+        return {
+            **token_payload,
+            "adminUserId": row.id,
+            "id": row.id,
+            "phone": row.phone,
+            "name": row.name,
+            "subjectType": "admin",
+            "isAdmin": True,
+        }
     return {
         **token_payload,
-        "userId": user_row.id,
-        "id": user_row.id,
-        "phone": user_row.phone,
-        "name": user_row.name,
+        "userId": row.id,
+        "id": row.id,
+        "phone": row.phone,
+        "name": row.name,
         "subjectType": "user",
+        "isAdmin": False,
     }
 
 
@@ -392,7 +407,7 @@ def register_auth_routes(
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid phone or password")
         row.last_login_at = utcnow()
         db.commit()
-        return _issue_token(row, subject_type="admin")
+        return _issue_subject_session(row, subject_type="admin")
 
     @app.post("/api/v1/auth/user/login")
     async def user_login(
@@ -417,7 +432,7 @@ def register_auth_routes(
                 )
             user_row.last_login_at = utcnow()
             db.commit()
-            return _issue_token(user_row, subject_type="user")
+            return _issue_subject_session(user_row, subject_type="user")
 
         if payload.password is None:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="password or otpCode is required")
@@ -426,14 +441,14 @@ def register_auth_routes(
         if user_row is not None and _is_row_active(user_row) and verify_password(payload.password, user_row.password_hash):
             user_row.last_login_at = utcnow()
             db.commit()
-            return _issue_token(user_row, subject_type="user")
+            return _issue_subject_session(user_row, subject_type="user")
 
         # Compatibility path for frontends using a single login endpoint.
         admin_row = _lookup_admin_by_phone(db, normalized_phone)
         if admin_row is not None and _is_row_active(admin_row) and verify_password(payload.password, admin_row.password_hash):
             admin_row.last_login_at = utcnow()
             db.commit()
-            return _issue_token(admin_row, subject_type="admin")
+            return _issue_subject_session(admin_row, subject_type="admin")
 
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid phone or password")
 

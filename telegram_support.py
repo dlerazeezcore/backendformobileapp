@@ -62,6 +62,11 @@ class SupportAttachmentPayload(BaseModel):
 class SupportMessagePayload(BaseModel):
     message: str = Field(default="", max_length=4000)
     user_id: str | None = Field(default=None, alias="userId")
+    target_user_id: str | None = Field(default=None, alias="targetUserId")
+    thread_user_id: str | None = Field(default=None, alias="threadUserId")
+    conversation_user_id: str | None = Field(default=None, alias="conversationUserId")
+    support_message_id: str | None = Field(default=None, alias="supportMessageId")
+    reply_to_telegram_message_id: int | None = Field(default=None, alias="replyToTelegramMessageId")
     attachments: list[SupportAttachmentPayload] = Field(default_factory=list, max_length=MAX_SUPPORT_ATTACHMENTS)
 
     @model_validator(mode="after")
@@ -609,6 +614,49 @@ def _support_messages_cache_clear() -> None:
         _SUPPORT_MESSAGES_CACHE.clear()
 
 
+def _serialize_support_message_response(
+    *,
+    row: TelegramSupportMessage,
+    settings: Any,
+    actor: AppUser | AdminUser | None = None,
+) -> dict[str, Any]:
+    attachments = _format_support_attachments_for_response(
+        settings=settings,
+        attachments=(
+            row.provider_payload.get("attachments", [])
+            if isinstance(row.provider_payload, dict)
+            else []
+        ),
+    )
+    if row.direction == "user_to_admin":
+        sender_type = "user"
+    elif row.direction == "admin_to_user":
+        sender_type = "admin" if row.admin_user_id else "support"
+    else:
+        sender_type = "system"
+
+    is_from_current_actor = False
+    if actor is not None:
+        if isinstance(actor, AppUser):
+            is_from_current_actor = bool(row.user_id == actor.id and row.direction == "user_to_admin")
+        else:
+            is_from_current_actor = bool(row.admin_user_id == actor.id and row.direction == "admin_to_user")
+
+    return {
+        "id": row.id,
+        "userId": row.user_id,
+        "adminUserId": row.admin_user_id,
+        "direction": row.direction,
+        "senderType": sender_type,
+        "isFromCurrentActor": is_from_current_actor,
+        "status": row.status,
+        "message": row.message_text,
+        "attachments": attachments,
+        "createdAt": row.created_at,
+        "pushDeliveryStatus": row.push_delivery_status,
+    }
+
+
 def register_telegram_support_routes(
     app: FastAPI,
     get_db: Callable[..., Any],
@@ -629,7 +677,6 @@ def register_telegram_support_routes(
     ) -> dict[str, Any]:
         settings = get_settings()
         attachments = _normalize_support_attachments(payload.attachments)
-        response_attachments = _format_support_attachments_for_response(settings=settings, attachments=attachments)
         message_text = payload.message.strip()
         if isinstance(actor, AppUser):
             bot_token = str(settings.telegram_support_bot_token or "").strip()
@@ -754,19 +801,44 @@ def register_telegram_support_routes(
             _support_messages_cache_clear()
             return {
                 "message": {
-                    "id": row.id,
-                    "userId": row.user_id,
-                    "direction": row.direction,
-                    "status": row.status,
+                    **_serialize_support_message_response(row=row, settings=settings, actor=actor),
                     "telegramMessageId": row.telegram_message_id,
-                    "attachments": response_attachments,
-                    "createdAt": row.created_at,
                 }
             }
 
-        target_user_id = payload.user_id
+        target_user_id = (
+            str(
+                payload.user_id
+                or payload.target_user_id
+                or payload.thread_user_id
+                or payload.conversation_user_id
+                or ""
+            ).strip()
+            or None
+        )
+        if not target_user_id and payload.support_message_id:
+            parent = db.scalar(select(TelegramSupportMessage).where(TelegramSupportMessage.id == payload.support_message_id))
+            if parent is not None and parent.user_id:
+                target_user_id = parent.user_id
+        if not target_user_id and payload.reply_to_telegram_message_id is not None:
+            parent = db.scalar(
+                select(TelegramSupportMessage).where(
+                    TelegramSupportMessage.telegram_message_id == int(payload.reply_to_telegram_message_id)
+                )
+            )
+            if parent is not None and parent.user_id:
+                target_user_id = parent.user_id
         if not target_user_id:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="userId is required for admin messages")
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    "userId is required for admin messages "
+                    "(or provide targetUserId/threadUserId/conversationUserId/supportMessageId/replyToTelegramMessageId)."
+                ),
+            )
+        target_user = db.scalar(select(AppUser).where(AppUser.id == target_user_id))
+        if target_user is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target user not found")
 
         row = TelegramSupportMessage(
             user_id=target_user_id,
@@ -809,15 +881,7 @@ def register_telegram_support_routes(
         db.refresh(row)
         _support_messages_cache_clear()
         return {
-            "message": {
-                "id": row.id,
-                "userId": row.user_id,
-                "direction": row.direction,
-                "status": row.status,
-                "pushDeliveryStatus": row.push_delivery_status,
-                "attachments": response_attachments,
-                "createdAt": row.created_at,
-            }
+            "message": _serialize_support_message_response(row=row, settings=settings, actor=actor)
         }
 
     @app.post("/api/v1/support/uploads/presign")
@@ -897,28 +961,13 @@ def register_telegram_support_routes(
             query = query.where(TelegramSupportMessage.user_id == user_id)
 
         rows = db.scalars(query.offset(offset).limit(limit)).all()
+        serialized_messages = [
+            _serialize_support_message_response(row=row, settings=settings, actor=actor)
+            for row in rows
+        ]
         response_payload = {
             "success": True,
-            "messages": [
-                {
-                    "id": row.id,
-                    "userId": row.user_id,
-                    "direction": row.direction,
-                    "status": row.status,
-                    "message": row.message_text,
-                    "attachments": _format_support_attachments_for_response(
-                        settings=settings,
-                        attachments=(
-                            row.provider_payload.get("attachments", [])
-                            if isinstance(row.provider_payload, dict)
-                            else []
-                        ),
-                    ),
-                    "createdAt": row.created_at,
-                    "pushDeliveryStatus": row.push_delivery_status,
-                }
-                for row in rows
-            ],
+            "messages": serialized_messages,
             "pagination": {"limit": limit, "offset": offset, "count": len(rows)},
         }
         response_payload["data"] = {

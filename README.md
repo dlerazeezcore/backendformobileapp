@@ -646,6 +646,8 @@ Admin delivery routes:
 
 - `POST /api/v1/admin/users`
 - `GET /api/v1/admin/users`
+- `DELETE /api/v1/admin/users/{userId}`
+- `DELETE /api/v1/admin/users?userId=...` (compatibility form)
 - `POST /api/v1/admin/admin-users`
 - `GET /api/v1/admin/admin-users`
 - `POST /api/v1/admin/profiles/refund`
@@ -681,6 +683,7 @@ Admin routes above remain unchanged; mobile/user flows should use user-scoped re
 - `POST /api/v1/auth/user/signup` (public, no auth)
 - `POST /api/v1/auth/user/register` (public alias, same behavior)
 - `GET /api/v1/auth/me`
+- `DELETE /api/v1/auth/me` (self-delete for current authenticated subject)
 
 Compatibility behavior:
 
@@ -739,8 +742,31 @@ Use `GET /api/v1/admin/users` to list B2C app users.
 Optional query params:
 
 - `search` (matches phone prefix and case-insensitive name)
+- `includeDeleted` (default `false`; set `true` to include soft-deleted users)
 - `limit` (default 100, max 500)
 - `offset` (default 0)
+
+### Delete an app user (admin flow)
+
+`DELETE /api/v1/admin/users/{userId}`
+
+Compatibility form:
+
+`DELETE /api/v1/admin/users?userId=<uuid>`
+
+Response:
+
+```json
+{
+  "deleted": true,
+  "id": "user-uuid",
+  "userId": "user-uuid",
+  "status": "deleted",
+  "deletedAt": "2026-04-15T12:34:56.000000+03:00"
+}
+```
+
+Deletion is soft-delete (`status=deleted`, `deletedAt` set). Deleted rows are hidden from `GET /api/v1/admin/users` unless `includeDeleted=true`.
 
 ### Create or update an admin user
 
@@ -852,6 +878,8 @@ Validation and conflict behavior:
 ### Current authenticated user
 
 `GET /api/v1/auth/me`
+
+`DELETE /api/v1/auth/me`
 
 Pass the token in `Authorization: Bearer <accessToken>`.
 
@@ -1737,8 +1765,23 @@ Supported `contentType` values:
 }
 ```
 
+- admin reply targeting:
+  - recommended: `userId`
+  - fallback aliases accepted: `targetUserId`, `threadUserId`, `conversationUserId`
+  - thread-context fallbacks accepted: `supportMessageId`, `replyToTelegramMessageId`
+
 - when `message` is empty, at least one `attachments[]` item is required.
-- response includes `message.attachments`.
+- response includes stable sender metadata:
+  - `message.direction` (`user_to_admin` | `admin_to_user`)
+  - `message.senderType` (`user` | `admin` | `support` | `system`)
+  - `message.isFromCurrentActor` (boolean)
+  - `message.userId`
+  - `message.adminUserId`
+  - `message.attachments`
+
+`GET /api/v1/support/telegram/messages`
+
+- each row in `messages[]` and `data.messages[]` includes the same sender metadata fields above.
 
 Required env vars for support uploads:
 

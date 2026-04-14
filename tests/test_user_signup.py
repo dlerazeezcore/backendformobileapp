@@ -92,7 +92,12 @@ class PublicUserSignupTest(unittest.TestCase):
                 json={"phone": "+9647700000100", "password": "StrongPass123"},
             )
             self.assertEqual(login_response.status_code, 200)
-            self.assertTrue(login_response.json().get("accessToken"))
+            login_payload = login_response.json()
+            self.assertTrue(login_payload.get("accessToken"))
+            self.assertEqual(login_payload.get("subjectType"), "user")
+            self.assertEqual(login_payload.get("isAdmin"), False)
+            self.assertEqual(login_payload.get("id"), login_payload.get("userId"))
+            self.assertEqual(login_payload.get("phone"), "+9647700000100")
 
         with self.session_factory() as session:
             row = session.scalar(select(AppUser).where(AppUser.phone == "+9647700000100"))
