@@ -1769,6 +1769,7 @@ Supported `contentType` values:
   - recommended: `userId`
   - fallback aliases accepted: `targetUserId`, `threadUserId`, `conversationUserId`
   - thread-context fallbacks accepted: `supportMessageId`, `replyToTelegramMessageId`
+  - if none of the targeting fields are provided by an admin, backend treats the message as an admin-to-support conversation (`direction=admin_to_support`) instead of rejecting it.
 
 - when `message` is empty, at least one `attachments[]` item is required.
 - response includes stable sender metadata:
@@ -1782,6 +1783,9 @@ Supported `contentType` values:
 `GET /api/v1/support/telegram/messages`
 
 - each row in `messages[]` and `data.messages[]` includes the same sender metadata fields above.
+- admin list scope defaults to own conversation messages (`admin_user_id == current admin`) unless:
+  - `userId` is provided (loads that user thread), or
+  - `allUsers=true` is provided (loads all support messages, admin-wide view).
 
 Required env vars for support uploads:
 

@@ -24,6 +24,7 @@ from supabase_store import AdminUser, AppUser, PushDevice, TelegramSupportMessag
 
 TELEGRAM_SUPPORT_CHAT_ID = -5169340336
 USER_ID_PATTERN = re.compile(r"User ID:\s*([0-9a-fA-F-]{36})")
+ADMIN_ID_PATTERN = re.compile(r"Admin ID:\s*([0-9a-fA-F-]{36})")
 PHONE_PATTERN = re.compile(r"Phone:\s*(\+?[0-9][0-9\s\-]{6,})")
 ALLOWED_SUPPORT_UPLOAD_CONTENT_TYPES = {
     "image/jpeg",
@@ -464,6 +465,113 @@ def _render_user_message_for_telegram(*, actor: AppUser, text: str, attachments:
     )
 
 
+def _render_admin_message_for_telegram(*, actor: AdminUser, text: str, attachments: list[dict[str, Any]]) -> str:
+    body_text = text.strip()
+    if not body_text:
+        body_text = "[Attachment only]"
+    attachment_lines: list[str] = []
+    for index, attachment in enumerate(attachments, start=1):
+        url = str(attachment.get("publicUrl") or "").strip()
+        object_path = str(attachment.get("objectPath") or "").strip()
+        label = str(attachment.get("fileName") or "").strip() or f"Attachment {index}"
+        destination = url or object_path
+        if not destination:
+            continue
+        attachment_lines.append(f"{label}: {destination}")
+    attachment_block = ""
+    if attachment_lines:
+        attachment_block = "\n\nAttachments:\n" + "\n".join(attachment_lines)
+    return (
+        "📩 Admin support message\n"
+        f"Admin ID: {actor.id}\n"
+        f"Phone: {actor.phone}\n"
+        f"Name: {actor.name}\n"
+        "\n"
+        f"{body_text}{attachment_block}"
+    )
+
+
+async def _send_support_message_to_telegram(
+    *,
+    settings: Any,
+    bot_token: str,
+    chat_id: int,
+    message_text: str,
+    attachments: list[dict[str, Any]],
+    render_text: Callable[[str, list[dict[str, Any]]], str],
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    image_attachments = [
+        attachment
+        for attachment in attachments
+        if _is_image_attachment(attachment)
+    ]
+    non_image_attachments = [attachment for attachment in attachments if attachment not in image_attachments]
+    base_text = render_text(message_text, [])
+    sent_responses: list[dict[str, Any]] = []
+    photo_send_errors: list[dict[str, str]] = []
+    failed_image_attachments: list[dict[str, Any]] = []
+    if image_attachments:
+        for index, attachment in enumerate(image_attachments):
+            caption = base_text if index == 0 else None
+            sent: dict[str, Any] | None = None
+            object_path = str(attachment.get("objectPath") or "").strip()
+            try:
+                if object_path:
+                    photo_bytes, content_type = _load_support_attachment_bytes(
+                        settings=settings,
+                        object_path=object_path,
+                    )
+                    sent = await _telegram_send_photo(
+                        bot_token=bot_token,
+                        chat_id=chat_id,
+                        photo_bytes=photo_bytes,
+                        photo_filename=str(attachment.get("fileName") or "support-image.jpg"),
+                        photo_content_type=content_type or str(attachment.get("contentType") or "").strip() or None,
+                        caption=caption,
+                    )
+                else:
+                    sent = await _telegram_send_photo(
+                        bot_token=bot_token,
+                        chat_id=chat_id,
+                        photo_url=str(attachment.get("publicUrl")),
+                        caption=caption,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                photo_send_errors.append(
+                    {
+                        "attachment": str(attachment.get("fileName") or attachment.get("publicUrl") or "unknown"),
+                        "error": str(exc),
+                    }
+                )
+                failed_image_attachments.append(attachment)
+            if sent is not None:
+                sent_responses.append(sent)
+
+        remaining_attachments = [*non_image_attachments, *failed_image_attachments]
+        if remaining_attachments or not sent_responses:
+            other_text = render_text(
+                message_text if not sent_responses else "[Additional attachments]",
+                remaining_attachments,
+            )
+            sent_responses.append(
+                await _telegram_send_message(
+                    bot_token=bot_token,
+                    chat_id=chat_id,
+                    text=other_text,
+                )
+            )
+    else:
+        outbound_text = render_text(message_text, non_image_attachments)
+        sent_responses.append(
+            await _telegram_send_message(
+                bot_token=bot_token,
+                chat_id=chat_id,
+                text=outbound_text,
+            )
+        )
+    return sent_responses, photo_send_errors
+
+
 def _extract_message_text_content(message: dict[str, Any]) -> str:
     return str(message.get("text") or message.get("caption") or "").strip()
 
@@ -546,6 +654,13 @@ def _extract_user_id_from_text(text: str) -> str | None:
     return match.group(1)
 
 
+def _extract_admin_id_from_text(text: str) -> str | None:
+    match = ADMIN_ID_PATTERN.search(text)
+    if match is None:
+        return None
+    return match.group(1)
+
+
 def _extract_phone_from_text(text: str) -> str | None:
     match = PHONE_PATTERN.search(text)
     if match is None:
@@ -558,6 +673,13 @@ def _find_user_by_phone(db: Session, phone: str) -> AppUser | None:
     if not candidates:
         return None
     return db.scalar(select(AppUser).where(AppUser.phone.in_(candidates)))
+
+
+def _find_admin_by_phone(db: Session, phone: str) -> AdminUser | None:
+    candidates = phone_lookup_candidates(phone)
+    if not candidates:
+        return None
+    return db.scalar(select(AdminUser).where(AdminUser.phone.in_(candidates)))
 
 
 def _is_valid_webhook_secret(
@@ -630,8 +752,10 @@ def _serialize_support_message_response(
     )
     if row.direction == "user_to_admin":
         sender_type = "user"
-    elif row.direction == "admin_to_user":
+    elif row.direction in {"admin_to_user", "admin_to_support"}:
         sender_type = "admin" if row.admin_user_id else "support"
+    elif row.direction == "support_to_admin":
+        sender_type = "support"
     else:
         sender_type = "system"
 
@@ -640,7 +764,9 @@ def _serialize_support_message_response(
         if isinstance(actor, AppUser):
             is_from_current_actor = bool(row.user_id == actor.id and row.direction == "user_to_admin")
         else:
-            is_from_current_actor = bool(row.admin_user_id == actor.id and row.direction == "admin_to_user")
+            is_from_current_actor = bool(
+                row.admin_user_id == actor.id and row.direction in {"admin_to_user", "admin_to_support"}
+            )
 
     return {
         "id": row.id,
@@ -701,81 +827,19 @@ def register_telegram_support_routes(
             db.add(row)
             db.flush()
 
-            image_attachments = [
-                attachment
-                for attachment in attachments
-                if _is_image_attachment(attachment)
-            ]
-            non_image_attachments = [attachment for attachment in attachments if attachment not in image_attachments]
-            base_text = _render_user_message_for_telegram(actor=actor, text=message_text, attachments=[])
             try:
-                sent_responses: list[dict[str, Any]] = []
-                photo_send_errors: list[dict[str, str]] = []
-                failed_image_attachments: list[dict[str, Any]] = []
-                if image_attachments:
-                    for index, attachment in enumerate(image_attachments):
-                        caption = base_text if index == 0 else None
-                        sent: dict[str, Any] | None = None
-                        object_path = str(attachment.get("objectPath") or "").strip()
-                        try:
-                            if object_path:
-                                photo_bytes, content_type = _load_support_attachment_bytes(
-                                    settings=settings,
-                                    object_path=object_path,
-                                )
-                                sent = await _telegram_send_photo(
-                                    bot_token=bot_token,
-                                    chat_id=TELEGRAM_SUPPORT_CHAT_ID,
-                                    photo_bytes=photo_bytes,
-                                    photo_filename=str(attachment.get("fileName") or "support-image.jpg"),
-                                    photo_content_type=content_type or str(attachment.get("contentType") or "").strip() or None,
-                                    caption=caption,
-                                )
-                            else:
-                                sent = await _telegram_send_photo(
-                                    bot_token=bot_token,
-                                    chat_id=TELEGRAM_SUPPORT_CHAT_ID,
-                                    photo_url=str(attachment.get("publicUrl")),
-                                    caption=caption,
-                                )
-                        except Exception as exc:  # noqa: BLE001
-                            photo_send_errors.append(
-                                {
-                                    "attachment": str(attachment.get("fileName") or attachment.get("publicUrl") or "unknown"),
-                                    "error": str(exc),
-                                }
-                            )
-                            failed_image_attachments.append(attachment)
-                        if sent is not None:
-                            sent_responses.append(sent)
-
-                    remaining_attachments = [*non_image_attachments, *failed_image_attachments]
-                    if remaining_attachments or not sent_responses:
-                        other_text = _render_user_message_for_telegram(
-                            actor=actor,
-                            text=message_text if not sent_responses else "[Additional attachments]",
-                            attachments=remaining_attachments,
-                        )
-                        sent_responses.append(
-                            await _telegram_send_message(
-                                bot_token=bot_token,
-                                chat_id=TELEGRAM_SUPPORT_CHAT_ID,
-                                text=other_text,
-                            )
-                        )
-                else:
-                    outbound_text = _render_user_message_for_telegram(
+                sent_responses, photo_send_errors = await _send_support_message_to_telegram(
+                    settings=settings,
+                    bot_token=bot_token,
+                    chat_id=TELEGRAM_SUPPORT_CHAT_ID,
+                    message_text=message_text,
+                    attachments=attachments,
+                    render_text=lambda text, atts: _render_user_message_for_telegram(
                         actor=actor,
-                        text=message_text,
-                        attachments=non_image_attachments,
-                    )
-                    sent_responses.append(
-                        await _telegram_send_message(
-                            bot_token=bot_token,
-                            chat_id=TELEGRAM_SUPPORT_CHAT_ID,
-                            text=outbound_text,
-                        )
-                    )
+                        text=text,
+                        attachments=atts,
+                    ),
+                )
                 first_result = (sent_responses[0].get("result") or {}) if sent_responses else {}
                 row.telegram_message_id = (
                     int(first_result.get("message_id"))
@@ -828,14 +892,71 @@ def register_telegram_support_routes(
             )
             if parent is not None and parent.user_id:
                 target_user_id = parent.user_id
+
         if not target_user_id:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=(
-                    "userId is required for admin messages "
-                    "(or provide targetUserId/threadUserId/conversationUserId/supportMessageId/replyToTelegramMessageId)."
-                ),
+            bot_token = str(settings.telegram_support_bot_token or "").strip()
+            if not bot_token:
+                raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Telegram support is not configured")
+            webhook_secret = str(settings.telegram_support_webhook_secret or "").strip() or None
+            webhook_base_url = str(settings.telegram_support_webhook_base_url or "").strip()
+            await _ensure_telegram_webhook(
+                bot_token=bot_token,
+                webhook_secret=webhook_secret,
+                webhook_base_url=webhook_base_url,
             )
+            row = TelegramSupportMessage(
+                admin_user_id=actor.id,
+                direction="admin_to_support",
+                status="pending",
+                message_text=message_text or "[Attachment only]",
+                telegram_chat_id=TELEGRAM_SUPPORT_CHAT_ID,
+                provider_payload={"attachments": attachments},
+            )
+            db.add(row)
+            db.flush()
+            try:
+                sent_responses, photo_send_errors = await _send_support_message_to_telegram(
+                    settings=settings,
+                    bot_token=bot_token,
+                    chat_id=TELEGRAM_SUPPORT_CHAT_ID,
+                    message_text=message_text,
+                    attachments=attachments,
+                    render_text=lambda text, atts: _render_admin_message_for_telegram(
+                        actor=actor,
+                        text=text,
+                        attachments=atts,
+                    ),
+                )
+                first_result = (sent_responses[0].get("result") or {}) if sent_responses else {}
+                row.telegram_message_id = (
+                    int(first_result.get("message_id"))
+                    if first_result.get("message_id") is not None
+                    else None
+                )
+                row.provider_payload = {
+                    "telegramResponses": sent_responses,
+                    "attachments": attachments,
+                    "photoSendErrors": photo_send_errors,
+                }
+                row.status = "sent"
+            except HTTPException as exc:
+                row.status = "failed"
+                row.error_message = str(exc.detail)
+                row.updated_at = utcnow()
+                db.commit()
+                raise
+
+            row.updated_at = utcnow()
+            db.commit()
+            db.refresh(row)
+            _support_messages_cache_clear()
+            return {
+                "message": {
+                    **_serialize_support_message_response(row=row, settings=settings, actor=actor),
+                    "telegramMessageId": row.telegram_message_id,
+                }
+            }
+
         target_user = db.scalar(select(AppUser).where(AppUser.id == target_user_id))
         if target_user is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target user not found")
@@ -942,6 +1063,7 @@ def register_telegram_support_routes(
         limit: int = Query(default=50, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
         user_id: str | None = Query(default=None, alias="userId"),
+        all_users: bool = Query(default=False, alias="allUsers"),
     ) -> dict[str, Any]:
         settings = get_settings()
         cache_key = _support_messages_cache_key(
@@ -959,6 +1081,8 @@ def register_telegram_support_routes(
             query = query.where(TelegramSupportMessage.user_id == actor.id)
         elif user_id is not None:
             query = query.where(TelegramSupportMessage.user_id == user_id)
+        elif not all_users:
+            query = query.where(TelegramSupportMessage.admin_user_id == actor.id)
 
         rows = db.scalars(query.offset(offset).limit(limit)).all()
         serialized_messages = [
@@ -1054,51 +1178,74 @@ def register_telegram_support_routes(
                 }
 
         user_id: str | None = None
+        admin_user_id: str | None = None
         reply_block = message.get("reply_to_message") if isinstance(message.get("reply_to_message"), dict) else None
         if reply_block is not None:
             reply_id = int(reply_block.get("message_id")) if reply_block.get("message_id") is not None else None
             if reply_id is not None:
                 parent = db.scalar(select(TelegramSupportMessage).where(TelegramSupportMessage.telegram_message_id == reply_id))
-                if parent is not None and parent.user_id:
-                    user_id = parent.user_id
-            if user_id is None:
+                if parent is not None:
+                    if parent.user_id:
+                        user_id = parent.user_id
+                    elif parent.admin_user_id:
+                        admin_user_id = parent.admin_user_id
+            if user_id is None and admin_user_id is None:
                 reply_text = _extract_message_text_content(reply_block)
                 user_id = _extract_user_id_from_text(reply_text)
+                if user_id is None:
+                    admin_user_id = _extract_admin_id_from_text(reply_text)
 
-        if user_id is None:
+        if user_id is None and admin_user_id is None:
             user_id = _extract_user_id_from_text(text)
+            if user_id is None:
+                admin_user_id = _extract_admin_id_from_text(text)
 
-        if user_id is None and reply_block is not None:
+        if user_id is None and admin_user_id is None and reply_block is not None:
             reply_phone = _extract_phone_from_text(str(reply_block.get("text") or ""))
             if reply_phone:
                 mapped_user = _find_user_by_phone(db, reply_phone)
                 if mapped_user is not None:
                     user_id = mapped_user.id
+                else:
+                    mapped_admin = _find_admin_by_phone(db, reply_phone)
+                    if mapped_admin is not None:
+                        admin_user_id = mapped_admin.id
 
-        if user_id is None:
+        if user_id is None and admin_user_id is None:
             phone_from_text = _extract_phone_from_text(text)
             if phone_from_text:
                 mapped_user = _find_user_by_phone(db, phone_from_text)
                 if mapped_user is not None:
                     user_id = mapped_user.id
+                else:
+                    mapped_admin = _find_admin_by_phone(db, phone_from_text)
+                    if mapped_admin is not None:
+                        admin_user_id = mapped_admin.id
 
-        if user_id is None:
+        if user_id is None and admin_user_id is None:
             recent_thread = db.scalar(
                 select(TelegramSupportMessage)
                 .where(
                     TelegramSupportMessage.telegram_chat_id == chat_id,
-                    TelegramSupportMessage.direction == "user_to_admin",
-                    TelegramSupportMessage.user_id.is_not(None),
+                    TelegramSupportMessage.direction.in_(["user_to_admin", "admin_to_support"]),
                 )
                 .order_by(TelegramSupportMessage.created_at.desc())
                 .limit(1)
             )
-            if recent_thread is not None and recent_thread.user_id:
-                user_id = recent_thread.user_id
+            if recent_thread is not None:
+                if recent_thread.user_id:
+                    user_id = recent_thread.user_id
+                elif recent_thread.admin_user_id:
+                    admin_user_id = recent_thread.admin_user_id
+
+        direction = "admin_to_user"
+        if user_id is None and admin_user_id is not None:
+            direction = "support_to_admin"
 
         row = TelegramSupportMessage(
             user_id=user_id,
-            direction="admin_to_user",
+            admin_user_id=admin_user_id,
+            direction=direction,
             status="received",
             message_text=text or "[Attachment only]",
             telegram_chat_id=chat_id,
@@ -1128,35 +1275,47 @@ def register_telegram_support_routes(
             tokens = db.scalars(
                 select(PushDevice.token).where(PushDevice.user_id == user_id, PushDevice.active.is_(True))
             ).all()
-            if tokens:
-                try:
-                    send_result = push_provider.send_push_notification(
-                        tokens=tokens,
-                        title="Support reply",
-                        body=(text or "Support sent an image.")[:2000],
-                        data={
-                            "type": "support_reply",
-                            "supportMessageId": row.id,
-                            "attachmentCount": len(mirrored_attachments),
-                        },
-                        channel_id="support",
-                    )
-                    if int(send_result.get("successCount") or 0) > 0:
-                        row.push_delivery_status = "sent"
-                    else:
-                        row.push_delivery_status = "failed"
-                except Exception as exc:  # pragma: no cover - provider runtime failure
+        elif admin_user_id:
+            tokens = db.scalars(
+                select(PushDevice.token).where(PushDevice.admin_user_id == admin_user_id, PushDevice.active.is_(True))
+            ).all()
+        else:
+            tokens = []
+        if tokens:
+            try:
+                send_result = push_provider.send_push_notification(
+                    tokens=tokens,
+                    title="Support reply",
+                    body=(text or "Support sent an image.")[:2000],
+                    data={
+                        "type": "support_reply",
+                        "supportMessageId": row.id,
+                        "attachmentCount": len(mirrored_attachments),
+                    },
+                    channel_id="support",
+                )
+                if int(send_result.get("successCount") or 0) > 0:
+                    row.push_delivery_status = "sent"
+                else:
                     row.push_delivery_status = "failed"
-                    row.error_message = str(exc)
-            else:
-                row.push_delivery_status = "no_devices"
+            except Exception as exc:  # pragma: no cover - provider runtime failure
+                row.push_delivery_status = "failed"
+                row.error_message = str(exc)
+        elif user_id or admin_user_id:
+            row.push_delivery_status = "no_devices"
         else:
             row.push_delivery_status = "unmapped"
 
         row.updated_at = utcnow()
         db.commit()
         _support_messages_cache_clear()
-        return {"ok": True, "messageId": row.id, "userId": user_id, "pushDeliveryStatus": row.push_delivery_status}
+        return {
+            "ok": True,
+            "messageId": row.id,
+            "userId": user_id,
+            "adminUserId": admin_user_id,
+            "pushDeliveryStatus": row.push_delivery_status,
+        }
 
     @app.post("/api/v1/support/telegram/webhook")
     async def telegram_webhook(
