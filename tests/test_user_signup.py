@@ -203,6 +203,43 @@ class PublicUserSignupTest(unittest.TestCase):
             self.assertEqual(row.status, "deleted")
             self.assertIsNotNone(row.deleted_at)
 
+    def test_authenticated_user_can_update_own_name_via_auth_me_patch(self) -> None:
+        with TestClient(create_app()) as client:
+            signup_response = client.post(
+                "/api/v1/auth/user/signup",
+                json={
+                    "phone": "+9647700000201",
+                    "name": "Before Name",
+                    "password": "StrongPass123",
+                },
+            )
+            self.assertEqual(signup_response.status_code, 200)
+            access_token = signup_response.json()["accessToken"]
+
+            update_response = client.patch(
+                "/api/v1/auth/me",
+                headers={"Authorization": f"Bearer {access_token}"},
+                json={"name": "After Name"},
+            )
+            self.assertEqual(update_response.status_code, 200)
+            payload = update_response.json()
+            self.assertEqual(payload.get("subjectType"), "user")
+            self.assertEqual(payload.get("name"), "After Name")
+            self.assertEqual(payload.get("id"), payload.get("userId"))
+
+            me_response = client.get(
+                "/api/v1/auth/me",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            self.assertEqual(me_response.status_code, 200)
+            self.assertEqual(me_response.json().get("name"), "After Name")
+
+        with self.session_factory() as session:
+            row = session.scalar(select(AppUser).where(AppUser.phone == "+9647700000201"))
+            self.assertIsNotNone(row)
+            assert row is not None
+            self.assertEqual(row.name, "After Name")
+
 
 if __name__ == "__main__":
     unittest.main()

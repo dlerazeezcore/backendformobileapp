@@ -60,6 +60,10 @@ class LogoutPayload(BaseModel):
     refresh_token: str | None = Field(default=None, alias="refreshToken")
 
 
+class AuthMeUpdatePayload(BaseModel):
+    name: str = Field(min_length=2, max_length=255)
+
+
 class TokenResponse(BaseModel):
     access_token: str = Field(alias="accessToken")
     token_type: str = Field(default="bearer", alias="tokenType")
@@ -550,6 +554,54 @@ def register_auth_routes(
         return {
             "subjectType": "user",
             "id": row.id,
+            "phone": row.phone,
+            "name": row.name,
+            "status": row.status,
+            "isLoyalty": row.is_loyalty,
+        }
+
+    @app.patch("/api/v1/auth/me")
+    @app.patch("/auth/me")
+    async def update_auth_me(
+        payload: AuthMeUpdatePayload,
+        claims: dict[str, Any] = Depends(get_token_claims),
+        db: Session = Depends(get_db),
+    ) -> dict[str, Any]:
+        row = require_active_subject(db, claims=claims)
+        normalized_name = str(payload.name or "").strip()
+        if len(normalized_name) < 2:
+            raise _api_error(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                "AUTH_INVALID_NAME",
+                "Name must be at least 2 characters",
+            )
+
+        row.name = normalized_name
+        row.updated_at = utcnow()
+        db.commit()
+        db.refresh(row)
+
+        if isinstance(row, AdminUser):
+            return {
+                "subjectType": "admin",
+                "id": row.id,
+                "adminUserId": row.id,
+                "phone": row.phone,
+                "name": row.name,
+                "status": row.status,
+                "role": row.role,
+                "permissions": {
+                    "canManageUsers": row.can_manage_users,
+                    "canManageOrders": row.can_manage_orders,
+                    "canManagePricing": row.can_manage_pricing,
+                    "canManageContent": row.can_manage_content,
+                    "canSendPush": row.can_send_push,
+                },
+            }
+        return {
+            "subjectType": "user",
+            "id": row.id,
+            "userId": row.id,
             "phone": row.phone,
             "name": row.name,
             "status": row.status,

@@ -683,6 +683,7 @@ Admin routes above remain unchanged; mobile/user flows should use user-scoped re
 - `POST /api/v1/auth/user/signup` (public, no auth)
 - `POST /api/v1/auth/user/register` (public alias, same behavior)
 - `GET /api/v1/auth/me`
+- `PATCH /api/v1/auth/me` (update current authenticated subject profile fields)
 - `DELETE /api/v1/auth/me` (self-delete for current authenticated subject)
 
 Compatibility behavior:
@@ -878,6 +879,23 @@ Validation and conflict behavior:
 ### Current authenticated user
 
 `GET /api/v1/auth/me`
+
+`PATCH /api/v1/auth/me`
+
+Request:
+
+```json
+{
+  "name": "Updated Display Name"
+}
+```
+
+Behavior:
+
+- requires `Authorization: Bearer <accessToken>`
+- supports both user and admin tokens
+- updates `name` in database (`app_users` for users, `admin_users` for admins)
+- returns updated subject payload with the same shape as `GET /api/v1/auth/me`
 
 `DELETE /api/v1/auth/me`
 

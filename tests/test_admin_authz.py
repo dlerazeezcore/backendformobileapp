@@ -134,6 +134,33 @@ class AdminAuthorizationTest(unittest.TestCase):
             self.assertTrue(payload.get("deleted"))
             self.assertEqual(payload.get("subjectType"), "admin")
 
+    def test_admin_can_update_own_name_via_auth_me_patch(self) -> None:
+        token = create_access_token(
+            subject_id="11111111-1111-1111-1111-111111111111",
+            phone="+9647700000001",
+            subject_type="admin",
+            secret_key="test-auth-secret",
+            ttl_seconds=3600,
+        )
+        with TestClient(create_app()) as client:
+            update_response = client.patch(
+                "/api/v1/auth/me",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"name": "Updated Admin Name"},
+            )
+            self.assertEqual(update_response.status_code, 200)
+            payload = update_response.json()
+            self.assertEqual(payload.get("subjectType"), "admin")
+            self.assertEqual(payload.get("id"), payload.get("adminUserId"))
+            self.assertEqual(payload.get("name"), "Updated Admin Name")
+
+            me_response = client.get(
+                "/api/v1/auth/me",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            self.assertEqual(me_response.status_code, 200)
+            self.assertEqual(me_response.json().get("name"), "Updated Admin Name")
+
     def test_users_save_with_user_token_updates_only_self(self) -> None:
         token = create_access_token(
             subject_id="22222222-2222-2222-2222-222222222222",
