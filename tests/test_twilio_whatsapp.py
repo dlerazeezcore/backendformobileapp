@@ -16,13 +16,19 @@ from supabase_store import AdminUser, AppUser, Base, normalize_database_url
 
 
 class _FakeTwilioVerifyProvider:
+    def __init__(self) -> None:
+        self._channel_by_phone: dict[str, str] = {}
+
     async def start_verification(self, *, phone: str, channel: str = "sms"):
+        self._channel_by_phone[phone] = channel
         return {"sid": "VE123", "status": "pending", "to": phone, "channel": channel}
 
-    async def check_verification(self, *, phone: str, code: str):
+    async def check_verification(self, *, phone: str, code: str, verification_sid: str | None = None):
+        _ = verification_sid
+        channel = self._channel_by_phone.get(phone, "sms")
         if code != "123456":
-            return {"sid": "VE123", "status": "pending", "to": phone}
-        return {"sid": "VE123", "status": "approved", "to": phone}
+            return {"sid": "VE123", "status": "pending", "to": phone, "channel": channel}
+        return {"sid": "VE123", "status": "approved", "to": phone, "channel": channel}
 
     async def close(self) -> None:
         return None
@@ -149,6 +155,37 @@ class TwilioWhatsAppAuthTest(unittest.TestCase):
             self.assertTrue(payload.get("accessToken"))
             self.assertEqual(payload.get("tokenType"), "bearer")
 
+    def test_user_login_otp_channel_match_allows_whatsapp(self) -> None:
+        with self._client_with_fake_twilio() as client:
+            fake_provider = _FakeTwilioVerifyProvider()
+            client.app.dependency_overrides[get_twilio_provider] = lambda: fake_provider
+            client.app.state.twilio_whatsapp_api = fake_provider
+            client.post(
+                "/api/v1/auth/user/otp/request",
+                json={"phone": "+9647700000002", "channel": "whatsapp"},
+            )
+            response = client.post(
+                "/api/v1/auth/user/login",
+                json={"phone": "+9647700000002", "otpCode": "123456", "otpChannel": "whatsapp"},
+            )
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(response.json().get("accessToken"))
+
+    def test_user_login_otp_channel_mismatch_returns_401(self) -> None:
+        with self._client_with_fake_twilio() as client:
+            fake_provider = _FakeTwilioVerifyProvider()
+            client.app.dependency_overrides[get_twilio_provider] = lambda: fake_provider
+            client.app.state.twilio_whatsapp_api = fake_provider
+            client.post(
+                "/api/v1/auth/user/otp/request",
+                json={"phone": "+9647700000002", "channel": "whatsapp"},
+            )
+            response = client.post(
+                "/api/v1/auth/user/login",
+                json={"phone": "+9647700000002", "otpCode": "123456", "otpChannel": "sms"},
+            )
+            self.assertEqual(response.status_code, 401)
+
     def test_user_login_accepts_local_iraq_phone(self) -> None:
         with self._client_with_fake_twilio() as client:
             response = client.post(
@@ -158,6 +195,22 @@ class TwilioWhatsAppAuthTest(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             payload = response.json()
             self.assertEqual(payload.get("phone"), "+9647700000002")
+
+    def test_user_login_password_returns_404_when_user_not_found(self) -> None:
+        with self._client_with_fake_twilio() as client:
+            response = client.post(
+                "/api/v1/auth/user/login",
+                json={"phone": "+9647700000999", "password": "StrongPass123"},
+            )
+            self.assertEqual(response.status_code, 404)
+
+    def test_user_login_otp_returns_404_when_user_not_found(self) -> None:
+        with self._client_with_fake_twilio() as client:
+            response = client.post(
+                "/api/v1/auth/user/login",
+                json={"phone": "+9647700000999", "otpCode": "123456", "otpChannel": "sms"},
+            )
+            self.assertEqual(response.status_code, 404)
 
     def test_signup_supports_otp_without_password(self) -> None:
         with self._client_with_fake_twilio() as client:

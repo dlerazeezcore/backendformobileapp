@@ -110,11 +110,20 @@ class TwilioWhatsAppVerifyAPI:
             },
         )
 
-    async def check_verification(self, *, phone: str, code: str) -> dict[str, Any]:
+    async def check_verification(
+        self,
+        *,
+        phone: str,
+        code: str,
+        verification_sid: str | None = None,
+    ) -> dict[str, Any]:
+        payload = {
+            "To": phone,
+            "Code": str(code).strip(),
+        }
+        if verification_sid:
+            payload["VerificationSid"] = verification_sid.strip()
         return await self._post_form(
             f"/v2/Services/{self.verify_service_sid}/VerificationCheck",
-            {
-                "To": phone,
-                "Code": str(code).strip(),
-            },
+            payload,
         )
