@@ -762,7 +762,15 @@ def _normalize_support_direction(row: TelegramSupportMessage) -> str:
         return "support_to_user"
     if direction in CANONICAL_SUPPORT_DIRECTIONS:
         return direction
-    return "system"
+    # Legacy/unknown rows are normalized to canonical values so frontend can rely
+    # on a strict finite direction set.
+    if row.user_id and row.admin_user_id:
+        return "support_to_user" if row.status == "received" else "admin_to_user"
+    if row.user_id:
+        return "support_to_user" if row.status == "received" else "user_to_support"
+    if row.admin_user_id:
+        return "support_to_admin" if row.status == "received" else "admin_to_support"
+    return "support_to_user"
 
 
 def _serialize_support_message_response(
@@ -781,7 +789,7 @@ def _serialize_support_message_response(
     )
     direction = _normalize_support_direction(row)
 
-    if direction in {"user_to_admin", "user_to_support"}:
+    if direction == "user_to_support":
         sender_type = "user"
     elif direction in {"admin_to_user", "admin_to_support"}:
         sender_type = "admin"

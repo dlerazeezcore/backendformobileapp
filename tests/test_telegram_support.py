@@ -360,6 +360,30 @@ class TelegramSupportRoutesTest(unittest.TestCase):
             self.assertNotIn(other_admin_row_id, message_ids)
             self.assertNotIn(admin_reply_row_id, message_ids)
 
+    def test_list_normalizes_legacy_unknown_direction_to_canonical_values(self) -> None:
+        with TestClient(create_app()) as client:
+            with client.app.state.db_session_factory() as session:
+                legacy_row = TelegramSupportMessage(
+                    user_id="22222222-2222-2222-2222-222222222222",
+                    direction="legacy_unknown_direction",
+                    status="sent",
+                    message_text="Legacy row",
+                )
+                session.add(legacy_row)
+                session.commit()
+                legacy_row_id = legacy_row.id
+
+            response = client.get(
+                "/api/v1/support/telegram/messages?limit=200&offset=0&allUsers=true",
+                headers={"Authorization": f"Bearer {self._admin_token()}"},
+            )
+            self.assertEqual(response.status_code, 200)
+            row = next((item for item in response.json().get("messages", []) if item.get("id") == legacy_row_id), None)
+            self.assertIsNotNone(row)
+            self.assertEqual(row["direction"], "user_to_support")
+            self.assertEqual(row["senderType"], "user")
+            self.assertTrue(str(row["conversationId"]).startswith("user:"))
+
     def test_webhook_reply_records_message_and_sends_push(self) -> None:
         app = create_app()
 
