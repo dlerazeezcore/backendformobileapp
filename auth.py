@@ -89,7 +89,7 @@ class TokenResponse(BaseModel):
 
 
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-LOGGER = logging.getLogger(__name__)
+LOGGER = logging.getLogger("uvicorn.error")
 
 
 def _api_error(status_code: int, code: str, message: str) -> HTTPException:
@@ -250,16 +250,34 @@ def require_active_subject(
 
 def _lookup_admin_by_phone(db: Session, phone: str) -> AdminUser | None:
     candidates = phone_lookup_candidates(phone)
-    if not candidates:
+    if candidates:
+        row = db.scalar(select(AdminUser).where(AdminUser.phone.in_(candidates)))
+        if row is not None:
+            return row
+    canonical = normalize_phone(phone)
+    if not canonical:
         return None
-    return db.scalar(select(AdminUser).where(AdminUser.phone.in_(candidates)))
+    for row in db.scalars(select(AdminUser)):
+        if normalize_phone(row.phone or "") == canonical:
+            LOGGER.info("auth.lookup.admin fallback-normalized-match canonical=%s stored=%s", canonical, row.phone)
+            return row
+    return None
 
 
 def _lookup_user_by_phone(db: Session, phone: str) -> AppUser | None:
     candidates = phone_lookup_candidates(phone)
-    if not candidates:
+    if candidates:
+        row = db.scalar(select(AppUser).where(AppUser.phone.in_(candidates)))
+        if row is not None:
+            return row
+    canonical = normalize_phone(phone)
+    if not canonical:
         return None
-    return db.scalar(select(AppUser).where(AppUser.phone.in_(candidates)))
+    for row in db.scalars(select(AppUser)):
+        if normalize_phone(row.phone or "") == canonical:
+            LOGGER.info("auth.lookup.user fallback-normalized-match canonical=%s stored=%s", canonical, row.phone)
+            return row
+    return None
 
 
 def _issue_token(row: AppUser | AdminUser, *, subject_type: str) -> dict[str, Any]:

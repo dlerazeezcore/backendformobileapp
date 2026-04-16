@@ -106,6 +106,23 @@ class PublicUserSignupTest(unittest.TestCase):
             self.assertEqual(row.status, "active")
             self.assertTrue(verify_password("StrongPass123", row.password_hash))
 
+    def test_login_matches_user_stored_in_legacy_formatted_phone(self) -> None:
+        with self.session_factory() as session:
+            legacy_user = session.scalar(select(AppUser).where(AppUser.phone == "+9647700000002"))
+            self.assertIsNotNone(legacy_user)
+            assert legacy_user is not None
+            legacy_user.phone = "0750 000 0002"
+            session.commit()
+
+        with TestClient(create_app()) as client:
+            response = client.post(
+                "/api/v1/auth/user/login",
+                json={"phone": "+9647500000002", "password": "StrongPass123"},
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertEqual(payload.get("subjectType"), "user")
+
     def test_user_register_alias_works(self) -> None:
         with TestClient(create_app()) as client:
             response = client.post(
