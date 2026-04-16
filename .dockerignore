@@ -1,0 +1,13 @@
+.git
+.gitignore
+.venv
+__pycache__
+.pytest_cache
+.DS_Store
+*.pyc
+*.pyo
+*.pyd
+*.db
+tests/
+alembic/
+alembic.ini
