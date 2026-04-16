@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 import inspect
 from typing import AsyncIterator
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 
@@ -50,7 +50,7 @@ CORS_ALLOWED_ORIGINS = [
     "http://127.0.0.1:5173",
 ]
 CORS_ALLOWED_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
-CORS_ALLOWED_HEADERS = ["*"]
+CORS_ALLOWED_HEADERS = ["Authorization", "Content-Type"]
 CORS_ALLOW_ORIGIN_REGEX = r"^https://([a-zA-Z0-9-]+\.)?figma\.site$"
 FIB_PAYMENT_BASE_URL = "https://fib.prod.fib.iq"
 FIB_PAYMENT_TIMEOUT_SECONDS = 30.0
@@ -125,6 +125,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_methods=CORS_ALLOWED_METHODS,
         allow_headers=CORS_ALLOWED_HEADERS,
     )
+
+    @app.middleware("http")
+    async def reject_duplicate_api_prefix(request: Request, call_next):
+        path = request.url.path
+        if path == "/api/v1/api/v1" or path.startswith("/api/v1/api/v1/"):
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "Invalid API path: duplicate '/api/v1' prefix."},
+            )
+        return await call_next(request)
+
+    @app.exception_handler(HTTPException)
+    async def handle_http_exception(request: Request, exc: HTTPException) -> JSONResponse:
+        _ = request
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
     @app.exception_handler(ESimAccessHTTPError)
     async def handle_http_error(request: Request, exc: ESimAccessHTTPError) -> JSONResponse:
