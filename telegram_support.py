@@ -42,6 +42,14 @@ _SUPPORT_MESSAGES_CACHE_LOCK = threading.Lock()
 _SUPPORT_BUCKET_CACHE: dict[str, tuple[float, str]] = {}
 _SUPPORT_BUCKET_CACHE_LOCK = threading.Lock()
 
+CANONICAL_SUPPORT_DIRECTIONS = {
+    "admin_to_user",
+    "user_to_support",
+    "support_to_user",
+    "admin_to_support",
+    "support_to_admin",
+}
+
 try:
     import boto3
     import botocore.handlers
@@ -736,6 +744,27 @@ def _support_messages_cache_clear() -> None:
         _SUPPORT_MESSAGES_CACHE.clear()
 
 
+def _conversation_id_for_message(row: TelegramSupportMessage) -> str:
+    if row.user_id:
+        return f"user:{row.user_id}"
+    if row.admin_user_id:
+        return f"admin:{row.admin_user_id}"
+    if row.telegram_chat_id is not None:
+        return f"telegram:{row.telegram_chat_id}"
+    return f"message:{row.id}"
+
+
+def _normalize_support_direction(row: TelegramSupportMessage) -> str:
+    direction = str(row.direction or "").strip()
+    if direction == "user_to_admin":
+        return "user_to_support"
+    if direction == "admin_to_user" and row.admin_user_id is None:
+        return "support_to_user"
+    if direction in CANONICAL_SUPPORT_DIRECTIONS:
+        return direction
+    return "system"
+
+
 def _serialize_support_message_response(
     *,
     row: TelegramSupportMessage,
@@ -750,29 +779,34 @@ def _serialize_support_message_response(
             else []
         ),
     )
-    if row.direction == "user_to_admin":
+    direction = _normalize_support_direction(row)
+
+    if direction in {"user_to_admin", "user_to_support"}:
         sender_type = "user"
-    elif row.direction in {"admin_to_user", "admin_to_support"}:
-        sender_type = "admin" if row.admin_user_id else "support"
-    elif row.direction == "support_to_admin":
+    elif direction in {"admin_to_user", "admin_to_support"}:
+        sender_type = "admin"
+    elif direction in {"support_to_user", "support_to_admin"}:
         sender_type = "support"
     else:
         sender_type = "system"
 
+    sender_user_id = row.user_id if sender_type == "user" else None
+    sender_admin_user_id = row.admin_user_id if sender_type == "admin" else None
     is_from_current_actor = False
     if actor is not None:
         if isinstance(actor, AppUser):
-            is_from_current_actor = bool(row.user_id == actor.id and row.direction == "user_to_admin")
+            is_from_current_actor = bool(sender_type == "user" and sender_user_id == actor.id)
         else:
-            is_from_current_actor = bool(
-                row.admin_user_id == actor.id and row.direction in {"admin_to_user", "admin_to_support"}
-            )
+            is_from_current_actor = bool(sender_type == "admin" and sender_admin_user_id == actor.id)
 
     return {
         "id": row.id,
+        "conversationId": _conversation_id_for_message(row),
         "userId": row.user_id,
         "adminUserId": row.admin_user_id,
-        "direction": row.direction,
+        "senderUserId": sender_user_id,
+        "senderAdminUserId": sender_admin_user_id,
+        "direction": direction,
         "senderType": sender_type,
         "isFromCurrentActor": is_from_current_actor,
         "status": row.status,
@@ -818,7 +852,7 @@ def register_telegram_support_routes(
 
             row = TelegramSupportMessage(
                 user_id=actor.id,
-                direction="user_to_admin",
+                direction="user_to_support",
                 status="pending",
                 message_text=message_text or "[Attachment only]",
                 telegram_chat_id=TELEGRAM_SUPPORT_CHAT_ID,
@@ -870,30 +904,54 @@ def register_telegram_support_routes(
                 }
             }
 
-        target_user_id = (
-            str(
-                payload.user_id
-                or payload.target_user_id
-                or payload.thread_user_id
-                or payload.conversation_user_id
-                or ""
-            ).strip()
-            or None
+        target_candidates = [
+            payload.user_id,
+            payload.target_user_id,
+            payload.thread_user_id,
+            payload.conversation_user_id,
+        ]
+        target_user_id: str | None = None
+        for candidate in target_candidates:
+            if candidate is None:
+                continue
+            cleaned = str(candidate).strip()
+            if cleaned:
+                target_user_id = cleaned
+                break
+        support_message_id = str(payload.support_message_id or "").strip() or None
+        target_fields_provided = any(candidate is not None for candidate in target_candidates)
+        reply_mode_requested = any(
+            [
+                target_fields_provided,
+                payload.support_message_id is not None,
+                payload.reply_to_telegram_message_id is not None,
+            ]
         )
-        if not target_user_id and payload.support_message_id:
-            parent = db.scalar(select(TelegramSupportMessage).where(TelegramSupportMessage.id == payload.support_message_id))
-            if parent is not None and parent.user_id:
-                target_user_id = parent.user_id
+        if not target_user_id and support_message_id:
+            parent = db.scalar(select(TelegramSupportMessage).where(TelegramSupportMessage.id == support_message_id))
+            if parent is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target thread not found")
+            if not parent.user_id:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target user thread not found")
+            target_user_id = parent.user_id
         if not target_user_id and payload.reply_to_telegram_message_id is not None:
             parent = db.scalar(
                 select(TelegramSupportMessage).where(
                     TelegramSupportMessage.telegram_message_id == int(payload.reply_to_telegram_message_id)
                 )
             )
-            if parent is not None and parent.user_id:
-                target_user_id = parent.user_id
+            if parent is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target thread not found")
+            if not parent.user_id:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target user thread not found")
+            target_user_id = parent.user_id
 
         if not target_user_id:
+            if reply_mode_requested:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="userId is required for admin reply mode.",
+                )
             bot_token = str(settings.telegram_support_bot_token or "").strip()
             if not bot_token:
                 raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Telegram support is not configured")
@@ -1066,9 +1124,15 @@ def register_telegram_support_routes(
         all_users: bool = Query(default=False, alias="allUsers"),
     ) -> dict[str, Any]:
         settings = get_settings()
+        cache_scope_user_id = actor.id
+        if isinstance(actor, AdminUser):
+            if all_users:
+                cache_scope_user_id = "__all__"
+            elif user_id is not None:
+                cache_scope_user_id = user_id
         cache_key = _support_messages_cache_key(
             actor=actor,
-            user_id=(user_id if isinstance(actor, AdminUser) else actor.id),
+            user_id=cache_scope_user_id,
             limit=limit,
             offset=offset,
         )
@@ -1082,7 +1146,10 @@ def register_telegram_support_routes(
         elif user_id is not None:
             query = query.where(TelegramSupportMessage.user_id == user_id)
         elif not all_users:
-            query = query.where(TelegramSupportMessage.admin_user_id == actor.id)
+            query = query.where(
+                TelegramSupportMessage.admin_user_id == actor.id,
+                TelegramSupportMessage.user_id.is_(None),
+            )
 
         rows = db.scalars(query.offset(offset).limit(limit)).all()
         serialized_messages = [
@@ -1090,7 +1157,6 @@ def register_telegram_support_routes(
             for row in rows
         ]
         response_payload = {
-            "success": True,
             "messages": serialized_messages,
             "pagination": {"limit": limit, "offset": offset, "count": len(rows)},
         }
@@ -1174,6 +1240,7 @@ def register_telegram_support_routes(
                     "duplicate": True,
                     "messageId": existing.id,
                     "userId": existing.user_id,
+                    "adminUserId": existing.admin_user_id,
                     "pushDeliveryStatus": existing.push_delivery_status,
                 }
 
@@ -1227,7 +1294,7 @@ def register_telegram_support_routes(
                 select(TelegramSupportMessage)
                 .where(
                     TelegramSupportMessage.telegram_chat_id == chat_id,
-                    TelegramSupportMessage.direction.in_(["user_to_admin", "admin_to_support"]),
+                    TelegramSupportMessage.direction.in_(["user_to_admin", "user_to_support", "admin_to_support"]),
                 )
                 .order_by(TelegramSupportMessage.created_at.desc())
                 .limit(1)
@@ -1238,7 +1305,7 @@ def register_telegram_support_routes(
                 elif recent_thread.admin_user_id:
                     admin_user_id = recent_thread.admin_user_id
 
-        direction = "admin_to_user"
+        direction = "support_to_user"
         if user_id is None and admin_user_id is not None:
             direction = "support_to_admin"
 
@@ -1267,6 +1334,7 @@ def register_telegram_support_routes(
                         "duplicate": True,
                         "messageId": existing.id,
                         "userId": existing.user_id,
+                        "adminUserId": existing.admin_user_id,
                         "pushDeliveryStatus": existing.push_delivery_status,
                     }
             raise

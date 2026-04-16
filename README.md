@@ -1769,23 +1769,71 @@ Supported `contentType` values:
   - recommended: `userId`
   - fallback aliases accepted: `targetUserId`, `threadUserId`, `conversationUserId`
   - thread-context fallbacks accepted: `supportMessageId`, `replyToTelegramMessageId`
-  - if none of the targeting fields are provided by an admin, backend treats the message as an admin-to-support conversation (`direction=admin_to_support`) instead of rejecting it.
+  - if none of the targeting fields are provided by an admin, backend treats the message as admin self-support mode (`direction=admin_to_support`), not admin-to-user reply mode.
+  - if any reply-mode targeting field is present but cannot resolve a target user thread, backend returns:
+    - `404` when referenced thread/user is missing
+    - `422` (`userId is required for admin reply mode.`) when reply mode is requested without a resolvable target
 
 - when `message` is empty, at least one `attachments[]` item is required.
-- response includes stable sender metadata:
-  - `message.direction` (`user_to_admin` | `admin_to_user`)
-  - `message.senderType` (`user` | `admin` | `support` | `system`)
-  - `message.isFromCurrentActor` (boolean)
-  - `message.userId`
-  - `message.adminUserId`
-  - `message.attachments`
+- canonical direction values returned by API:
+  - `user_to_support`
+  - `admin_to_user`
+  - `support_to_user`
+  - `admin_to_support`
+  - `support_to_admin`
+  - legacy stored `user_to_admin` rows are normalized to `user_to_support` in API responses.
+
+- POST success payload shape:
+
+```json
+{
+  "message": {
+    "id": "uuid",
+    "conversationId": "user:<uuid> or admin:<uuid>",
+    "senderType": "user | admin | support | system",
+    "direction": "user_to_support | admin_to_user | support_to_user | admin_to_support | support_to_admin",
+    "isFromCurrentActor": true,
+    "userId": "uuid or null",
+    "adminUserId": "uuid or null",
+    "senderUserId": "uuid or null",
+    "senderAdminUserId": "uuid or null",
+    "status": "sent | pending | failed | received",
+    "message": "text",
+    "attachments": [],
+    "createdAt": "ISO datetime",
+    "pushDeliveryStatus": "sent | failed | no_devices | pending | unmapped | null"
+  }
+}
+```
 
 `GET /api/v1/support/telegram/messages`
 
-- each row in `messages[]` and `data.messages[]` includes the same sender metadata fields above.
-- admin list scope defaults to own conversation messages (`admin_user_id == current admin`) unless:
-  - `userId` is provided (loads that user thread), or
-  - `allUsers=true` is provided (loads all support messages, admin-wide view).
+- canonical response shape:
+
+```json
+{
+  "messages": [],
+  "pagination": {
+    "limit": 50,
+    "offset": 0,
+    "count": 0
+  }
+}
+```
+
+- compatibility mirror is also provided under `data.messages` and `data.pagination`.
+- each row in `messages[]` includes all sender/ownership fields from POST success shape.
+- conversation scoping:
+  - app user (default): own thread only (`userId == current user`)
+  - admin with no `userId` and no `allUsers=true`: admin self-support thread only (`adminUserId == current admin` and no `userId`)
+  - admin with `userId=<userId>`: real admin reply mode for that user thread
+  - admin with `allUsers=true`: admin-wide listing across threads
+
+- stable error contract:
+  - `401`: invalid/expired auth
+  - `403`: authenticated but forbidden (including account state restrictions)
+  - `404`: target user/thread not found in reply mode
+  - `422`: reply mode requested without resolvable target user/thread (self-support mode is still allowed when no targeting fields are sent)
 
 Required env vars for support uploads:
 
