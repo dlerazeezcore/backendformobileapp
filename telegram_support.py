@@ -1132,21 +1132,6 @@ def register_telegram_support_routes(
         all_users: bool = Query(default=False, alias="allUsers"),
     ) -> dict[str, Any]:
         settings = get_settings()
-        cache_scope_user_id = actor.id
-        if isinstance(actor, AdminUser):
-            if all_users:
-                cache_scope_user_id = "__all__"
-            elif user_id is not None:
-                cache_scope_user_id = user_id
-        cache_key = _support_messages_cache_key(
-            actor=actor,
-            user_id=cache_scope_user_id,
-            limit=limit,
-            offset=offset,
-        )
-        cached = _support_messages_cache_get(cache_key)
-        if cached is not None:
-            return cached
 
         query = select(TelegramSupportMessage).order_by(TelegramSupportMessage.created_at.desc())
         if isinstance(actor, AppUser):
@@ -1172,7 +1157,6 @@ def register_telegram_support_routes(
             "messages": response_payload["messages"],
             "pagination": response_payload["pagination"],
         }
-        _support_messages_cache_set(cache_key, response_payload)
         return response_payload
 
     async def _process_telegram_webhook(
