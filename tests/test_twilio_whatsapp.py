@@ -107,6 +107,17 @@ class TwilioWhatsAppAuthTest(unittest.TestCase):
             self.assertEqual(payload["data"]["status"], "pending")
             self.assertEqual(payload["data"]["channel"], "sms")
 
+    def test_request_user_otp_normalizes_plus964_trunk_zero(self) -> None:
+        with self._client_with_fake_twilio() as client:
+            response = client.post(
+                "/api/v1/auth/user/otp/request",
+                json={"phone": "+96407700000002"},
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertTrue(payload["success"])
+            self.assertEqual(payload["data"]["to"], "+9647700000002")
+
     def test_verify_user_otp_creates_new_user(self) -> None:
         with self._client_with_fake_twilio() as client:
             client.app.state.twilio_whatsapp_api = _FakeTwilioVerifyProvider()
@@ -138,6 +149,16 @@ class TwilioWhatsAppAuthTest(unittest.TestCase):
             self.assertTrue(payload.get("accessToken"))
             self.assertEqual(payload.get("tokenType"), "bearer")
 
+    def test_user_login_accepts_local_iraq_phone(self) -> None:
+        with self._client_with_fake_twilio() as client:
+            response = client.post(
+                "/api/v1/auth/user/login",
+                json={"phone": "07700000002", "password": "StrongPass123"},
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertEqual(payload.get("phone"), "+9647700000002")
+
     def test_signup_supports_otp_without_password(self) -> None:
         with self._client_with_fake_twilio() as client:
             client.app.state.twilio_whatsapp_api = _FakeTwilioVerifyProvider()
@@ -153,6 +174,21 @@ class TwilioWhatsAppAuthTest(unittest.TestCase):
             payload = response.json()
             self.assertTrue(payload.get("accessToken"))
             self.assertEqual(payload.get("phone"), "+9647700000101")
+
+    def test_signup_normalizes_local_iraq_phone_to_e164(self) -> None:
+        with self._client_with_fake_twilio() as client:
+            client.app.state.twilio_whatsapp_api = _FakeTwilioVerifyProvider()
+            response = client.post(
+                "/api/v1/auth/user/signup",
+                json={
+                    "phone": "07700000105",
+                    "name": "Local Signup User",
+                    "otpCode": "123456",
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertEqual(payload.get("phone"), "+9647700000105")
 
     def test_invalid_otp_rejected(self) -> None:
         with self._client_with_fake_twilio() as client:
@@ -189,6 +225,18 @@ class TwilioWhatsAppAuthTest(unittest.TestCase):
             self.assertIsNotNone(row)
             assert row is not None
             self.assertTrue(verify_password("EvenStronger123", row.password_hash))
+
+    def test_forgot_password_reset_accepts_local_iraq_phone(self) -> None:
+        with self._client_with_fake_twilio() as client:
+            response = client.post(
+                "/api/v1/auth/user/password/forgot/reset",
+                json={
+                    "phone": "07700000002",
+                    "otpCode": "123456",
+                    "newPassword": "EvenStronger123",
+                },
+            )
+            self.assertEqual(response.status_code, 200)
 
     def test_forgot_password_reset_requires_valid_otp(self) -> None:
         with self._client_with_fake_twilio() as client:

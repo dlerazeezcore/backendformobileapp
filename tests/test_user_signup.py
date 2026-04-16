@@ -147,12 +147,12 @@ class PublicUserSignupTest(unittest.TestCase):
             self.assertEqual(response.status_code, 409)
             self.assertIn("admin", str(response.json().get("detail", "")).lower())
 
-    def test_signup_invalid_phone_returns_422(self) -> None:
+    def test_signup_too_short_local_phone_returns_422(self) -> None:
         with TestClient(create_app()) as client:
             response = client.post(
                 "/api/v1/auth/user/signup",
                 json={
-                    "phone": "07700000123",
+                    "phone": "0770000123",
                     "name": "Invalid Phone",
                     "password": "StrongPass123",
                 },
