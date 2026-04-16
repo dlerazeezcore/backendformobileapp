@@ -58,6 +58,9 @@ FIB_PAYMENT_RATE_LIMIT_PER_SECOND = 8.0
 FIB_PAYMENT_STATUS_CALLBACK_URL = "https://mean-lettie-corevia-0bd7cc91.koyeb.app/api/v1/payments/fib/webhook"
 FIB_PAYMENT_REDIRECT_URI = "tulip://payment/result"
 PUSH_NOTIFICATION_DEFAULT_CHANNEL_ID = "general"
+TWILIO_VERIFY_BASE_URL = "https://verify.twilio.com"
+TWILIO_VERIFY_TIMEOUT_SECONDS = 20.0
+TWILIO_VERIFY_RATE_LIMIT_PER_SECOND = 5.0
 # Optional hardcoded fallback when env var is not set.
 FIB_PAYMENT_WEBHOOK_SECRET: str | None = None
 
@@ -97,9 +100,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 account_sid=cfg.twilio_account_sid,
                 auth_token=cfg.twilio_auth_token,
                 verify_service_sid=cfg.twilio_verify_service_sid,
-                base_url=cfg.twilio_verify_base_url,
-                timeout=cfg.twilio_verify_timeout_seconds,
-                rate_limit_per_second=cfg.twilio_verify_rate_limit_per_second,
+                base_url=TWILIO_VERIFY_BASE_URL,
+                timeout=TWILIO_VERIFY_TIMEOUT_SECONDS,
+                rate_limit_per_second=TWILIO_VERIFY_RATE_LIMIT_PER_SECOND,
             )
         yield
         await app.state.esim_access_api.close()

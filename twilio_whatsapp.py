@@ -93,8 +93,8 @@ class TwilioWhatsAppVerifyAPI:
             )
         return body
 
-    async def start_verification(self, *, phone: str, channel: str = "whatsapp") -> dict[str, Any]:
-        normalized_channel = str(channel or "whatsapp").strip().lower()
+    async def start_verification(self, *, phone: str, channel: str = "sms") -> dict[str, Any]:
+        normalized_channel = str(channel or "sms").strip().lower()
         if normalized_channel not in {"whatsapp", "sms"}:
             raise TwilioVerifyAPIError(
                 status_code=422,
@@ -118,4 +118,3 @@ class TwilioWhatsAppVerifyAPI:
                 "Code": str(code).strip(),
             },
         )
-

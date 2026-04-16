@@ -9,14 +9,14 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from app import create_app
-from auth import hash_password
+from auth import hash_password, verify_password
 from config import get_settings
 from dependencies import get_twilio_provider
 from supabase_store import AdminUser, AppUser, Base, normalize_database_url
 
 
 class _FakeTwilioVerifyProvider:
-    async def start_verification(self, *, phone: str, channel: str = "whatsapp"):
+    async def start_verification(self, *, phone: str, channel: str = "sms"):
         return {"sid": "VE123", "status": "pending", "to": phone, "channel": channel}
 
     async def check_verification(self, *, phone: str, code: str):
@@ -95,6 +95,18 @@ class TwilioWhatsAppAuthTest(unittest.TestCase):
             self.assertEqual(payload["data"]["status"], "pending")
             self.assertEqual(payload["data"]["channel"], "whatsapp")
 
+    def test_request_user_otp_defaults_to_sms(self) -> None:
+        with self._client_with_fake_twilio() as client:
+            response = client.post(
+                "/api/v1/auth/user/otp/request",
+                json={"phone": "+9647700000002"},
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertTrue(payload["success"])
+            self.assertEqual(payload["data"]["status"], "pending")
+            self.assertEqual(payload["data"]["channel"], "sms")
+
     def test_verify_user_otp_creates_new_user(self) -> None:
         with self._client_with_fake_twilio() as client:
             client.app.state.twilio_whatsapp_api = _FakeTwilioVerifyProvider()
@@ -150,6 +162,57 @@ class TwilioWhatsAppAuthTest(unittest.TestCase):
                 json={"phone": "+9647700000002", "code": "000000"},
             )
             self.assertEqual(response.status_code, 401)
+
+    def test_forgot_password_reset_with_otp_updates_password(self) -> None:
+        with self._client_with_fake_twilio() as client:
+            response = client.post(
+                "/api/v1/auth/user/password/forgot/reset",
+                json={
+                    "phone": "+9647700000002",
+                    "otpCode": "123456",
+                    "newPassword": "EvenStronger123",
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertTrue(payload.get("accessToken"))
+            self.assertEqual(payload.get("subjectType"), "user")
+
+            login_response = client.post(
+                "/api/v1/auth/user/login",
+                json={"phone": "+9647700000002", "password": "EvenStronger123"},
+            )
+            self.assertEqual(login_response.status_code, 200)
+
+        with self.session_factory() as session:
+            row = session.scalar(select(AppUser).where(AppUser.phone == "+9647700000002"))
+            self.assertIsNotNone(row)
+            assert row is not None
+            self.assertTrue(verify_password("EvenStronger123", row.password_hash))
+
+    def test_forgot_password_reset_requires_valid_otp(self) -> None:
+        with self._client_with_fake_twilio() as client:
+            response = client.post(
+                "/api/v1/auth/user/password/forgot/reset",
+                json={
+                    "phone": "+9647700000002",
+                    "otpCode": "000000",
+                    "newPassword": "EvenStronger123",
+                },
+            )
+            self.assertEqual(response.status_code, 401)
+
+    def test_forgot_password_reset_requires_existing_user(self) -> None:
+        with self._client_with_fake_twilio() as client:
+            response = client.post(
+                "/api/v1/auth/user/password/forgot/reset",
+                json={
+                    "phone": "+9647700000999",
+                    "otpCode": "123456",
+                    "newPassword": "EvenStronger123",
+                },
+            )
+            self.assertEqual(response.status_code, 404)
 
 
 if __name__ == "__main__":

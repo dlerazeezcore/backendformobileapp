@@ -554,12 +554,14 @@ These routes are intended for mobile app read flows and do not require admin sco
 - `POST /api/v1/esim-access/profiles/install/my` (user/admin token, ownership checks)
 - `POST /api/v1/esim-access/profiles/activate/my` (user/admin token, ownership checks)
 
-### Passwordless WhatsApp OTP auth routes
+### Passwordless OTP auth routes (SMS default)
 
 These routes support passwordless mobile auth using Twilio Verify. Existing password-based login/signup remains supported and backward-compatible.
+Backend now defaults OTP delivery channel to `sms` when channel is not provided.
 
 - `POST /api/v1/auth/user/otp/request`
 - `POST /api/v1/auth/user/otp/verify`
+- `POST /api/v1/auth/user/password/forgot/reset` (OTP + new password reset)
 - `POST /api/v1/auth/user/login` now accepts `otpCode` as an alternative to `password`
 - `POST /api/v1/auth/user/signup` now accepts `otpCode` as an alternative to `password`
 
@@ -571,9 +573,10 @@ Required env vars:
 
 Optional env vars:
 
-- `TWILIO_VERIFY_BASE_URL` (default: `https://verify.twilio.com`)
-- `TWILIO_VERIFY_TIMEOUT_SECONDS` (default: `20`)
-- `TWILIO_VERIFY_RATE_LIMIT_PER_SECOND` (default: `5`)
+- none for Verify transport tuning. Backend hardcodes:
+  - `TWILIO_VERIFY_BASE_URL=https://verify.twilio.com`
+  - `TWILIO_VERIFY_TIMEOUT_SECONDS=20`
+  - `TWILIO_VERIFY_RATE_LIMIT_PER_SECOND=5`
 
 Request OTP example:
 
@@ -582,9 +585,13 @@ curl -X POST "$BASE_URL/api/v1/auth/user/otp/request" \
   -H "Content-Type: application/json" \
   -d '{
     "phone": "+9647507343635",
-    "channel": "whatsapp"
+    "channel": "sms"
   }'
 ```
+
+Twilio Verify service recommendation:
+
+- set Verify Service Friendly Name to `Tulip Booking` so the OTP message brand label matches the app.
 
 Verify OTP and create/login user session:
 
@@ -618,6 +625,18 @@ curl -X POST "$BASE_URL/api/v1/auth/user/signup" \
     "phone": "+9647507343635",
     "name": "Laveen",
     "otpCode": "123456"
+  }'
+```
+
+Forgot password reset with OTP:
+
+```bash
+curl -X POST "$BASE_URL/api/v1/auth/user/password/forgot/reset" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "phone": "+9647507343635",
+    "otpCode": "123456",
+    "newPassword": "StrongPass123"
   }'
 ```
 

@@ -48,6 +48,6 @@ def get_twilio_provider(request: Request) -> TwilioWhatsAppVerifyAPI:
     if provider is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Twilio WhatsApp OTP service is not configured on this deployment.",
+            detail="Twilio OTP service is not configured on this deployment.",
         )
     return provider

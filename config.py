@@ -37,9 +37,6 @@ class Settings(BaseSettings):
     twilio_account_sid: str | None = Field(default=None, alias="TWILIO_ACCOUNT_SID")
     twilio_auth_token: str | None = Field(default=None, alias="TWILIO_AUTH_TOKEN")
     twilio_verify_service_sid: str | None = Field(default=None, alias="TWILIO_VERIFY_SERVICE_SID")
-    twilio_verify_base_url: str = Field(default="https://verify.twilio.com", alias="TWILIO_VERIFY_BASE_URL")
-    twilio_verify_timeout_seconds: float = Field(default=20.0, alias="TWILIO_VERIFY_TIMEOUT_SECONDS")
-    twilio_verify_rate_limit_per_second: float = Field(default=5.0, alias="TWILIO_VERIFY_RATE_LIMIT_PER_SECOND")
     support_uploads_s3_endpoint: str | None = Field(
         default="https://splzxivzahitxmjcqstn.storage.supabase.co/storage/v1/s3",
         alias="SUPPORT_UPLOADS_S3_ENDPOINT",
