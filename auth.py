@@ -5,12 +5,13 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import time
 from typing import Any, Callable
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field, model_validator
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -61,7 +62,8 @@ class LogoutPayload(BaseModel):
 
 
 class AuthMeUpdatePayload(BaseModel):
-    name: str = Field(min_length=2, max_length=255)
+    name: str | None = Field(default=None, max_length=255)
+    email: str | None = Field(default=None, max_length=255)
 
 
 class TokenResponse(BaseModel):
@@ -69,6 +71,9 @@ class TokenResponse(BaseModel):
     token_type: str = Field(default="bearer", alias="tokenType")
     expires_in: int | None = Field(default=None, alias="expiresIn")
     refresh_token: str | None = Field(default=None, alias="refreshToken")
+
+
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 def _api_error(status_code: int, code: str, message: str) -> HTTPException:
@@ -538,6 +543,7 @@ def register_auth_routes(
                 "id": row.id,
                 "phone": row.phone,
                 "name": row.name,
+                "email": row.email,
                 "status": row.status,
                 "role": row.role,
                 "permissions": {
@@ -556,6 +562,7 @@ def register_auth_routes(
             "id": row.id,
             "phone": row.phone,
             "name": row.name,
+            "email": row.email,
             "status": row.status,
             "isLoyalty": row.is_loyalty,
         }
@@ -568,15 +575,52 @@ def register_auth_routes(
         db: Session = Depends(get_db),
     ) -> dict[str, Any]:
         row = require_active_subject(db, claims=claims)
-        normalized_name = str(payload.name or "").strip()
-        if len(normalized_name) < 2:
+        provided_fields = set(payload.model_fields_set)
+        if not provided_fields:
             raise _api_error(
                 status.HTTP_422_UNPROCESSABLE_CONTENT,
-                "AUTH_INVALID_NAME",
-                "Name must be at least 2 characters",
+                "AUTH_INVALID_PROFILE_PATCH",
+                "At least one profile field is required",
             )
 
-        row.name = normalized_name
+        if "name" in provided_fields:
+            normalized_name = str(payload.name or "").strip()
+            if len(normalized_name) < 2:
+                raise _api_error(
+                    status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    "AUTH_INVALID_NAME",
+                    "Name must be at least 2 characters",
+                )
+            row.name = normalized_name
+
+        if "email" in provided_fields:
+            normalized_email = str(payload.email or "").strip().lower() if payload.email is not None else None
+            if normalized_email == "":
+                normalized_email = None
+            if normalized_email is not None and not EMAIL_PATTERN.fullmatch(normalized_email):
+                raise _api_error(
+                    status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    "AUTH_INVALID_EMAIL",
+                    "Invalid email format",
+                )
+
+            if normalized_email is not None:
+                existing_user = db.scalar(select(AppUser).where(func.lower(AppUser.email) == normalized_email))
+                if existing_user is not None and (not isinstance(row, AppUser) or existing_user.id != row.id):
+                    raise _api_error(
+                        status.HTTP_409_CONFLICT,
+                        "AUTH_EMAIL_CONFLICT",
+                        "Email already in use",
+                    )
+                existing_admin = db.scalar(select(AdminUser).where(func.lower(AdminUser.email) == normalized_email))
+                if existing_admin is not None and (not isinstance(row, AdminUser) or existing_admin.id != row.id):
+                    raise _api_error(
+                        status.HTTP_409_CONFLICT,
+                        "AUTH_EMAIL_CONFLICT",
+                        "Email already in use",
+                    )
+            row.email = normalized_email
+
         row.updated_at = utcnow()
         db.commit()
         db.refresh(row)
@@ -588,6 +632,7 @@ def register_auth_routes(
                 "adminUserId": row.id,
                 "phone": row.phone,
                 "name": row.name,
+                "email": row.email,
                 "status": row.status,
                 "role": row.role,
                 "permissions": {
@@ -604,6 +649,7 @@ def register_auth_routes(
             "userId": row.id,
             "phone": row.phone,
             "name": row.name,
+            "email": row.email,
             "status": row.status,
             "isLoyalty": row.is_loyalty,
         }

@@ -886,7 +886,8 @@ Request:
 
 ```json
 {
-  "name": "Updated Display Name"
+  "name": "Updated Display Name",
+  "email": "user@example.com"
 }
 ```
 
@@ -894,7 +895,12 @@ Behavior:
 
 - requires `Authorization: Bearer <accessToken>`
 - supports both user and admin tokens
-- updates `name` in database (`app_users` for users, `admin_users` for admins)
+- supports partial updates:
+  - `{ "name": "..." }`
+  - `{ "email": "..." }`
+  - `{ "name": "...", "email": "..." }`
+  - `{ "email": null }` (clear email)
+- updates profile fields in database (`app_users` for users, `admin_users` for admins)
 - returns updated subject payload with the same shape as `GET /api/v1/auth/me`
 
 `DELETE /api/v1/auth/me`

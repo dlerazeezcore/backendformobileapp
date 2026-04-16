@@ -240,6 +240,71 @@ class PublicUserSignupTest(unittest.TestCase):
             assert row is not None
             self.assertEqual(row.name, "After Name")
 
+    def test_auth_me_patch_supports_email_only_and_clear_email(self) -> None:
+        with TestClient(create_app()) as client:
+            signup_response = client.post(
+                "/api/v1/auth/user/signup",
+                json={
+                    "phone": "+9647700000202",
+                    "name": "Email User",
+                    "password": "StrongPass123",
+                },
+            )
+            self.assertEqual(signup_response.status_code, 200)
+            access_token = signup_response.json()["accessToken"]
+
+            add_email = client.patch(
+                "/api/v1/auth/me",
+                headers={"Authorization": f"Bearer {access_token}"},
+                json={"email": "Email.User@Example.com"},
+            )
+            self.assertEqual(add_email.status_code, 200)
+            add_payload = add_email.json()
+            self.assertEqual(add_payload.get("email"), "email.user@example.com")
+
+            me_after_add = client.get(
+                "/api/v1/auth/me",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            self.assertEqual(me_after_add.status_code, 200)
+            self.assertEqual(me_after_add.json().get("email"), "email.user@example.com")
+
+            clear_email = client.patch(
+                "/api/v1/auth/me",
+                headers={"Authorization": f"Bearer {access_token}"},
+                json={"email": None},
+            )
+            self.assertEqual(clear_email.status_code, 200)
+            self.assertIsNone(clear_email.json().get("email"))
+
+        with self.session_factory() as session:
+            row = session.scalar(select(AppUser).where(AppUser.phone == "+9647700000202"))
+            self.assertIsNotNone(row)
+            assert row is not None
+            self.assertIsNone(row.email)
+
+    def test_auth_me_patch_invalid_email_returns_422(self) -> None:
+        with TestClient(create_app()) as client:
+            signup_response = client.post(
+                "/api/v1/auth/user/signup",
+                json={
+                    "phone": "+9647700000203",
+                    "name": "Invalid Email User",
+                    "password": "StrongPass123",
+                },
+            )
+            self.assertEqual(signup_response.status_code, 200)
+            access_token = signup_response.json()["accessToken"]
+
+            invalid_email = client.patch(
+                "/api/v1/auth/me",
+                headers={"Authorization": f"Bearer {access_token}"},
+                json={"email": "not-an-email"},
+            )
+            self.assertEqual(invalid_email.status_code, 422)
+            detail = invalid_email.json().get("detail") or {}
+            self.assertEqual(detail.get("code"), "AUTH_INVALID_EMAIL")
+
 
 if __name__ == "__main__":
     unittest.main()
