@@ -770,6 +770,8 @@ class PushNotificationRoutesTest(unittest.TestCase):
         self.assertIn("activePushDevicesByPlatform", payload)
         self.assertIn("activePushDevicesWithUserId", payload)
         self.assertIn("activePushDevicesWithoutUserId", payload)
+        self.assertIn("activePushDevicesWithAdminUserId", payload)
+        self.assertIn("activeAnonymousPushDevices", payload)
         self.assertIn("sampleLatestDevices", payload)
         self.assertTrue(isinstance(payload["sampleLatestDevices"], list))
         self.assertLessEqual(len(payload["sampleLatestDevices"]), 10)
@@ -780,6 +782,8 @@ class PushNotificationRoutesTest(unittest.TestCase):
             self.assertIn("active", sample)
             self.assertIn("tokenPrefix", sample)
             self.assertIn("userId", sample)
+            self.assertIn("adminUserId", sample)
+            self.assertIn("subjectType", sample)
             self.assertIn("updatedAt", sample)
 
 

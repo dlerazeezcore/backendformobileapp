@@ -643,6 +643,7 @@ def register_push_notification_routes(
         store_tokens_count = len(store_tokens)
         deduped_tokens_count = len(deduped_tokens)
         merged_target_user_ids_count = len(merged_target_user_ids)
+        deduped_token_summary = store.summarize_push_tokens(tokens=deduped_tokens)
         debug_payload = {
             "payload.audience": payload.audience,
             "payload.send_to_all_active": payload.send_to_all_active,
@@ -659,6 +660,9 @@ def register_push_notification_routes(
             "matchedAudienceUserIdsCount": audience_user_ids_count,
             "matchedDirectUserTokensCount": store_tokens_count,
             "totalDedupedTokens": deduped_tokens_count,
+            "matchedTokenPlatforms": deduped_token_summary["platformCounts"],
+            "matchedTokenOwners": deduped_token_summary["ownerCounts"],
+            "matchedTokenPrefixes": deduped_token_summary["tokenPrefixes"],
         }
         logger.info(
             "push.send.post_resolution requested_user_ids_count=%s audience_user_ids_count=%s store_tokens_count=%s deduped_tokens_count=%s merged_target_user_ids_count=%s",
@@ -679,6 +683,12 @@ def register_push_notification_routes(
                 deduped_tokens_count,
                 sorted(str(key) for key in normalized_data.keys()),
             )
+        logger.info(
+            "push.send.token_summary recipient_scope=%s owners=%s platforms=%s",
+            recipient_scope,
+            deduped_token_summary["ownerCounts"],
+            deduped_token_summary["platformCounts"],
+        )
 
         if not deduped_tokens:
             return JSONResponse(

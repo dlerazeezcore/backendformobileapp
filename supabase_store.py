@@ -1302,6 +1302,35 @@ class SupabaseStore:
                 counts[platform] += 1
         return counts
 
+    def summarize_push_tokens(self, *, tokens: list[str]) -> dict[str, Any]:
+        normalized_tokens = [str(item).strip() for item in tokens if str(item or "").strip()]
+        summary = {
+            "platformCounts": {"ios": 0, "android": 0, "web": 0},
+            "ownerCounts": {"user": 0, "admin": 0, "anonymous": 0},
+            "tokenPrefixes": [],
+        }
+        if not normalized_tokens:
+            return summary
+        rows = self.session.scalars(select(PushDevice).where(PushDevice.token.in_(normalized_tokens))).all()
+        seen: set[str] = set()
+        for row in rows:
+            token = str(row.token or "").strip()
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            platform = str(row.platform or "").strip().lower()
+            if platform in summary["platformCounts"]:
+                summary["platformCounts"][platform] += 1
+            if row.user_id is not None:
+                summary["ownerCounts"]["user"] += 1
+            elif row.admin_user_id is not None:
+                summary["ownerCounts"]["admin"] += 1
+            else:
+                summary["ownerCounts"]["anonymous"] += 1
+            summary["tokenPrefixes"].append(self._token_prefix(token))
+        summary["tokenPrefixes"].sort()
+        return summary
+
     def list_push_user_ids_for_audience(
         self,
         *,
@@ -1509,6 +1538,25 @@ class SupabaseStore:
             )
             or 0
         )
+        active_with_admin_user_id = int(
+            self.session.scalar(
+                select(func.count(PushDevice.id)).where(
+                    PushDevice.active.is_(True),
+                    PushDevice.admin_user_id.is_not(None),
+                )
+            )
+            or 0
+        )
+        active_anonymous_devices = int(
+            self.session.scalar(
+                select(func.count(PushDevice.id)).where(
+                    PushDevice.active.is_(True),
+                    PushDevice.user_id.is_(None),
+                    PushDevice.admin_user_id.is_(None),
+                )
+            )
+            or 0
+        )
         latest_rows = self.session.scalars(
             select(PushDevice).order_by(PushDevice.updated_at.desc()).limit(limit)
         ).all()
@@ -1519,6 +1567,14 @@ class SupabaseStore:
                 "active": row.active,
                 "tokenPrefix": self._token_prefix(row.token),
                 "userId": row.user_id,
+                "adminUserId": row.admin_user_id,
+                "subjectType": (
+                    "user"
+                    if row.user_id is not None
+                    else "admin"
+                    if row.admin_user_id is not None
+                    else str((row.custom_fields or {}).get("subjectType") or "anonymous").strip().lower()
+                ),
                 "updatedAt": row.updated_at,
             }
             for row in latest_rows
@@ -1533,6 +1589,8 @@ class SupabaseStore:
             },
             "activePushDevicesWithUserId": active_with_user_id,
             "activePushDevicesWithoutUserId": active_without_user_id,
+            "activePushDevicesWithAdminUserId": active_with_admin_user_id,
+            "activeAnonymousPushDevices": active_anonymous_devices,
             "sampleLatestDevices": sample_latest_devices,
         }
 
