@@ -1379,7 +1379,7 @@ class SupabaseStore:
     ) -> tuple[list[str], list[str]]:
         normalized_audience = str(audience or "").strip().lower()
         if normalized_audience == "all":
-            return self.list_non_admin_push_tokens(active_only=True, limit=limit), []
+            return self.list_all_push_tokens(active_only=True, limit=limit), []
         if normalized_audience == "admins":
             return self.list_admin_push_tokens(active_only=True, limit=limit), []
         if normalized_audience == "all_devices":

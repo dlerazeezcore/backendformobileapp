@@ -333,7 +333,7 @@ class PushNotificationRoutesTest(unittest.TestCase):
             self.assertIsNone(row.user_id)
             self.assertIsNone(row.admin_user_id)
 
-    def test_send_to_all_active_excludes_admin_registered_devices(self) -> None:
+    def test_send_to_all_active_includes_admin_registered_devices(self) -> None:
         self.client.post(
             "/api/v1/push-notifications/devices/register",
             json={"token": "user-token-only", "platform": "android"},
@@ -356,9 +356,9 @@ class PushNotificationRoutesTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         # Baseline test fixture already has one active blocked-user token.
-        # Expect exactly 2 user-owned tokens (blocked + newly registered), not admin token.
-        self.assertEqual(payload["delivery"]["requestedTokens"], 2)
-        self.assertEqual(payload["delivery"]["successCount"], 2)
+        # "all" now truly means all active devices, including admin-owned tokens.
+        self.assertEqual(payload["delivery"]["requestedTokens"], 3)
+        self.assertEqual(payload["delivery"]["successCount"], 3)
 
     def test_send_to_all_active_includes_anonymous_devices(self) -> None:
         self.client.post(
