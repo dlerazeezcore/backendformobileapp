@@ -134,7 +134,15 @@ class PushNotificationService:
                         "apns-priority": "10",
                         "apns-push-type": "alert",
                     },
-                    payload=messaging.APNSPayload(aps=messaging.Aps(sound="default")),
+                    payload=messaging.APNSPayload(
+                        aps=messaging.Aps(
+                            alert=messaging.ApsAlert(
+                                title=str(title or "").strip(),
+                                body=str(body or "").strip(),
+                            ),
+                            sound="default",
+                        )
+                    ),
                 ),
             )
             response = messaging.send_each_for_multicast(message, app=app)
@@ -190,6 +198,15 @@ class SendPushNotificationPayload(Model):
     channel_id: str | None = Field(default=None, alias="channelId")
     image: str | None = None
     dry_run: bool = Field(default=False, alias="dryRun")
+    kind: str | None = None
+    type: str | None = None
+    notification_type: str | None = Field(default=None, alias="notificationType")
+    app_store_url: str | None = Field(default=None, alias="appStoreUrl")
+    play_store_url: str | None = Field(default=None, alias="playStoreUrl")
+    ios_external_url: str | None = Field(default=None, alias="iosExternalUrl")
+    android_external_url: str | None = Field(default=None, alias="androidExternalUrl")
+    ios_url: str | None = Field(default=None, alias="iosUrl")
+    android_url: str | None = Field(default=None, alias="androidUrl")
 
     @model_validator(mode="after")
     def validate_targets(self) -> "SendPushNotificationPayload":
@@ -211,6 +228,10 @@ class SendPushNotificationPayload(Model):
 class SendAppUpdateNotificationPayload(Model):
     app_store_url: str = Field(alias="appStoreUrl", min_length=1)
     play_store_url: str = Field(alias="playStoreUrl", min_length=1)
+    ios_external_url: str | None = Field(default=None, alias="iosExternalUrl")
+    android_external_url: str | None = Field(default=None, alias="androidExternalUrl")
+    ios_url: str | None = Field(default=None, alias="iosUrl")
+    android_url: str | None = Field(default=None, alias="androidUrl")
     title: str = Field(default="Update Available", min_length=1, max_length=255)
     body: str = Field(
         default="A new version is available. Please update to continue with the best experience.",
@@ -238,6 +259,66 @@ class SendAppUpdateNotificationPayload(Model):
         self.app_store_url = app_store_url
         self.play_store_url = play_store_url
         return self
+
+
+def _clean_optional_string(value: Any) -> str | None:
+    cleaned = str(value or "").strip()
+    return cleaned or None
+
+
+def _merge_app_update_fields(
+    *,
+    data: dict[str, Any] | None,
+    kind: Any = None,
+    type_value: Any = None,
+    notification_type: Any = None,
+    app_store_url: Any = None,
+    play_store_url: Any = None,
+    ios_external_url: Any = None,
+    android_external_url: Any = None,
+    ios_url: Any = None,
+    android_url: Any = None,
+) -> tuple[dict[str, Any], bool]:
+    merged = dict(data or {})
+    markers = {
+        value.lower()
+        for value in (
+            _clean_optional_string(kind),
+            _clean_optional_string(type_value),
+            _clean_optional_string(notification_type),
+            _clean_optional_string(merged.get("kind")),
+            _clean_optional_string(merged.get("type")),
+            _clean_optional_string(merged.get("notificationType")),
+        )
+        if value
+    }
+    if "app_update" not in markers:
+        return merged, False
+
+    def _pick_value(*values: Any) -> str | None:
+        for candidate in values:
+            cleaned = _clean_optional_string(candidate)
+            if cleaned:
+                return cleaned
+        return None
+
+    merged["kind"] = "app_update"
+    merged["type"] = "app_update"
+    merged["notificationType"] = "app_update"
+    merged["action"] = _pick_value(merged.get("action"), "open_store_update")
+
+    optional_fields = {
+        "appStoreUrl": _pick_value(app_store_url, merged.get("appStoreUrl")),
+        "playStoreUrl": _pick_value(play_store_url, merged.get("playStoreUrl")),
+        "iosExternalUrl": _pick_value(ios_external_url, merged.get("iosExternalUrl")),
+        "androidExternalUrl": _pick_value(android_external_url, merged.get("androidExternalUrl")),
+        "iosUrl": _pick_value(ios_url, merged.get("iosUrl")),
+        "androidUrl": _pick_value(android_url, merged.get("androidUrl")),
+    }
+    for key, value in optional_fields.items():
+        if value:
+            merged[key] = value
+    return merged, True
 
 
 def _serialize_push_device(row: PushDevice) -> dict[str, Any]:
@@ -429,6 +510,18 @@ def register_push_notification_routes(
         admin_user: AdminUser = Depends(_require_admin_sender),
     ) -> Any:
         store = SupabaseStore(db)
+        normalized_data, is_app_update = _merge_app_update_fields(
+            data=payload.data,
+            kind=payload.kind,
+            type_value=payload.type,
+            notification_type=payload.notification_type,
+            app_store_url=payload.app_store_url,
+            play_store_url=payload.play_store_url,
+            ios_external_url=payload.ios_external_url,
+            android_external_url=payload.android_external_url,
+            ios_url=payload.ios_url,
+            android_url=payload.android_url,
+        )
         requested_user_ids = PushNotificationService._normalize_tokens(
             [str(item).strip() for item in payload.user_ids if str(item).strip()]
         )
@@ -504,6 +597,17 @@ def register_push_notification_routes(
             deduped_tokens_count,
             merged_target_user_ids_count,
         )
+        if is_app_update:
+            token_platform_counts = store.count_push_tokens_by_platform(tokens=deduped_tokens)
+            logger.info(
+                "push.app_update.resolution audience=%s ios_tokens=%s android_tokens=%s web_tokens=%s final_tokens=%s payload_keys=%s",
+                audience or None,
+                token_platform_counts.get("ios", 0),
+                token_platform_counts.get("android", 0),
+                token_platform_counts.get("web", 0),
+                deduped_tokens_count,
+                sorted(str(key) for key in normalized_data.keys()),
+            )
 
         if not deduped_tokens:
             return JSONResponse(
@@ -535,7 +639,7 @@ def register_push_notification_routes(
             image_url=payload.image,
             sent_by_admin_id=admin_user.id,
             target_user_ids=merged_target_user_ids,
-            data_payload=payload.data,
+            data_payload=normalized_data,
             provider_response={
                 "requestedTokens": len(deduped_tokens),
                 "audience": audience or None,
@@ -584,7 +688,7 @@ def register_push_notification_routes(
                 tokens=deduped_tokens,
                 title=payload.title,
                 body=payload.body,
-                data=payload.data,
+                data=normalized_data,
                 channel_id=payload.channel_id,
                 image=payload.image,
             )
@@ -601,6 +705,17 @@ def register_push_notification_routes(
             ) from exc
 
         invalid_tokens = PushNotificationService._normalize_tokens(result.get("invalidTokens", []))
+        if is_app_update:
+            invalid_platform_counts = store.count_push_tokens_by_platform(tokens=invalid_tokens)
+            logger.info(
+                "push.app_update.delivery success_count=%s failure_count=%s invalid_ios=%s invalid_android=%s invalid_web=%s invalid_total=%s",
+                int(result.get("successCount", 0)),
+                int(result.get("failureCount", 0)),
+                invalid_platform_counts.get("ios", 0),
+                invalid_platform_counts.get("android", 0),
+                invalid_platform_counts.get("web", 0),
+                len(invalid_tokens),
+            )
         if invalid_tokens:
             store.deactivate_push_devices_by_tokens(invalid_tokens)
 
@@ -647,12 +762,23 @@ def register_push_notification_routes(
         merged_data = dict(payload.data or {})
         merged_data.update(
             {
+                "kind": "app_update",
                 "type": "app_update",
+                "notificationType": "app_update",
                 "action": "open_store_update",
                 "appStoreUrl": payload.app_store_url,
                 "playStoreUrl": payload.play_store_url,
             }
         )
+        optional_app_update_fields = {
+            "iosExternalUrl": payload.ios_external_url,
+            "androidExternalUrl": payload.android_external_url,
+            "iosUrl": payload.ios_url,
+            "androidUrl": payload.android_url,
+        }
+        for key, value in optional_app_update_fields.items():
+            if value:
+                merged_data[key] = value
         send_payload = SendPushNotificationPayload(
             title=payload.title,
             body=payload.body,

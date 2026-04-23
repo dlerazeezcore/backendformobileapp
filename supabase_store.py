@@ -1285,6 +1285,23 @@ class SupabaseStore:
             raise ValueError("subject_type must be either 'user' or 'admin'")
         return int(self.session.scalar(query) or 0)
 
+    def count_push_tokens_by_platform(self, *, tokens: list[str]) -> dict[str, int]:
+        normalized_tokens = [str(item).strip() for item in tokens if str(item or "").strip()]
+        counts = {"ios": 0, "android": 0, "web": 0}
+        if not normalized_tokens:
+            return counts
+        rows = self.session.scalars(select(PushDevice).where(PushDevice.token.in_(normalized_tokens))).all()
+        seen: set[str] = set()
+        for row in rows:
+            token = str(row.token or "").strip()
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            platform = str(row.platform or "").strip().lower()
+            if platform in counts:
+                counts[platform] += 1
+        return counts
+
     def list_push_user_ids_for_audience(
         self,
         *,

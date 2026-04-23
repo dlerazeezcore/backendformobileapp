@@ -445,6 +445,10 @@ class PushNotificationRoutesTest(unittest.TestCase):
                 "body": "A new update is available.",
                 "appStoreUrl": "https://apps.apple.com/app/id000000000",
                 "playStoreUrl": "https://play.google.com/store/apps/details?id=com.tulip.app",
+                "iosExternalUrl": "https://example.com/ios-external",
+                "androidExternalUrl": "https://example.com/android-external",
+                "iosUrl": "tulip://ios-update",
+                "androidUrl": "tulip://android-update",
                 "audience": "all",
             },
             headers=self.admin_headers,
@@ -455,13 +459,58 @@ class PushNotificationRoutesTest(unittest.TestCase):
         self.assertEqual(payload["notification"]["recipientScope"], "audience:all")
         self.assertEqual(len(self.provider.sent_payloads), 1)
         sent_data = self.provider.sent_payloads[0]["data"]
+        self.assertEqual(sent_data.get("kind"), "app_update")
         self.assertEqual(sent_data.get("type"), "app_update")
+        self.assertEqual(sent_data.get("notificationType"), "app_update")
         self.assertEqual(sent_data.get("action"), "open_store_update")
         self.assertEqual(sent_data.get("appStoreUrl"), "https://apps.apple.com/app/id000000000")
         self.assertEqual(
             sent_data.get("playStoreUrl"),
             "https://play.google.com/store/apps/details?id=com.tulip.app",
         )
+        self.assertEqual(sent_data.get("iosExternalUrl"), "https://example.com/ios-external")
+        self.assertEqual(sent_data.get("androidExternalUrl"), "https://example.com/android-external")
+        self.assertEqual(sent_data.get("iosUrl"), "tulip://ios-update")
+        self.assertEqual(sent_data.get("androidUrl"), "tulip://android-update")
+
+    def test_admin_send_generic_app_update_preserves_top_level_fields(self) -> None:
+        self.client.post(
+            "/api/v1/push-notifications/devices/register",
+            json={"token": "ios-generic-update", "platform": "ios"},
+        )
+        response = self.client.post(
+            "/api/v1/admin/push-notifications/send",
+            json={
+                "title": "Update now",
+                "body": "Important app update.",
+                "audience": "all",
+                "kind": "app_update",
+                "type": "app_update",
+                "notificationType": "app_update",
+                "appStoreUrl": "https://apps.apple.com/app/id111111111",
+                "playStoreUrl": "https://play.google.com/store/apps/details?id=com.tulip.generic",
+                "iosExternalUrl": "https://example.com/generic-ios-external",
+                "androidExternalUrl": "https://example.com/generic-android-external",
+                "iosUrl": "tulip://generic-ios-update",
+                "androidUrl": "tulip://generic-android-update",
+            },
+            headers=self.admin_headers,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(self.provider.sent_payloads), 1)
+        sent_data = self.provider.sent_payloads[0]["data"]
+        self.assertEqual(sent_data.get("kind"), "app_update")
+        self.assertEqual(sent_data.get("type"), "app_update")
+        self.assertEqual(sent_data.get("notificationType"), "app_update")
+        self.assertEqual(sent_data.get("appStoreUrl"), "https://apps.apple.com/app/id111111111")
+        self.assertEqual(
+            sent_data.get("playStoreUrl"),
+            "https://play.google.com/store/apps/details?id=com.tulip.generic",
+        )
+        self.assertEqual(sent_data.get("iosExternalUrl"), "https://example.com/generic-ios-external")
+        self.assertEqual(sent_data.get("androidExternalUrl"), "https://example.com/generic-android-external")
+        self.assertEqual(sent_data.get("iosUrl"), "tulip://generic-ios-update")
+        self.assertEqual(sent_data.get("androidUrl"), "tulip://generic-android-update")
 
     def test_no_eligible_tokens_returns_diagnostics(self) -> None:
         response = self.client.post(
