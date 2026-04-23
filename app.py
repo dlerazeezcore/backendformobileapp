@@ -35,6 +35,7 @@ from telegram_support import register_telegram_support_routes
 from supabase_store import create_database
 from twilio_whatsapp import TwilioVerifyAPIError, TwilioVerifyHTTPError, TwilioWhatsAppVerifyAPI
 from users import register_user_routes
+from wings_api import register_wings_routes
 
 CORS_ALLOWED_ORIGINS = [
     "capacitor://localhost",
@@ -222,6 +223,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     register_push_notification_routes(app, get_push_provider, get_db)
     register_telegram_support_routes(app, get_db, get_push_provider)
     register_admin_routes(app, get_db)
+    register_wings_routes(app)
 
     return app
 
