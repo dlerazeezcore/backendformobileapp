@@ -512,6 +512,20 @@ class PushNotificationRoutesTest(unittest.TestCase):
         self.assertEqual(sent_data.get("iosUrl"), "tulip://generic-ios-update")
         self.assertEqual(sent_data.get("androidUrl"), "tulip://generic-android-update")
 
+    def test_inactive_token_error_detection_handles_requested_entity_not_found(self) -> None:
+        self.assertEqual(
+            PushNotificationService._is_inactive_token_error(RuntimeError("Requested entity was not found.")),
+            True,
+        )
+        self.assertEqual(
+            PushNotificationService._is_inactive_token_error(RuntimeError("Sender ID mismatch.")),
+            True,
+        )
+        self.assertEqual(
+            PushNotificationService._is_inactive_token_error(RuntimeError("Temporarily unavailable.")),
+            False,
+        )
+
     def test_no_eligible_tokens_returns_diagnostics(self) -> None:
         response = self.client.post(
             "/api/v1/admin/push-notifications/send",

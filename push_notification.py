@@ -91,6 +91,52 @@ class PushNotificationService:
         for index in range(0, len(values), size):
             yield values[index : index + size]
 
+    @staticmethod
+    def _token_prefix(token: str, *, size: int = 8) -> str:
+        cleaned = str(token or "").strip()
+        if not cleaned:
+            return ""
+        prefix = cleaned[:size]
+        if len(cleaned) <= size:
+            return prefix
+        return f"{prefix}..."
+
+    @staticmethod
+    def _exception_code(error: Any) -> str:
+        value = str(getattr(error, "code", "") or "").strip().lower()
+        if value:
+            return value
+        value = str(getattr(error, "_code", "") or "").strip().lower()
+        if value:
+            return value
+        return str(error.__class__.__name__ if error is not None else "").strip().lower()
+
+    @classmethod
+    def _is_inactive_token_error(cls, error: Any) -> bool:
+        error_text = str(error or "").strip().lower()
+        error_code = cls._exception_code(error)
+        invalid_code_markers = {
+            "unregisterederror",
+            "unregistered",
+            "registration-token-not-registered",
+            "invalidargumenterror",
+            "invalid-registration-token",
+            "invalidregistrationtokenerror",
+            "senderidmismatcherror",
+            "sender-id-mismatch",
+        }
+        invalid_text_markers = (
+            "not registered",
+            "invalid registration token",
+            "requested entity was not found",
+            "no matching registration token",
+            "registration token is not a valid",
+            "sender id mismatch",
+        )
+        if error_code in invalid_code_markers:
+            return True
+        return any(marker in error_text for marker in invalid_text_markers)
+
     def send_push_notification(
         self,
         *,
@@ -115,6 +161,8 @@ class PushNotificationService:
         success_count = 0
         failure_count = 0
         invalid_tokens: list[str] = []
+        token_results: list[dict[str, Any]] = []
+        failure_reasons: dict[str, int] = {}
 
         for batch in self._chunked(normalized_tokens, 500):
             message = messaging.MulticastMessage(
@@ -149,16 +197,39 @@ class PushNotificationService:
             success_count += int(response.success_count)
             failure_count += int(response.failure_count)
             for index, item in enumerate(response.responses):
+                token = batch[index]
                 if item.success:
+                    token_results.append(
+                        {
+                            "tokenPrefix": self._token_prefix(token),
+                            "success": True,
+                        }
+                    )
                     continue
-                error_text = str(item.exception or "").lower()
-                if "not registered" in error_text or "invalid registration token" in error_text:
-                    invalid_tokens.append(batch[index])
+                error = item.exception
+                error_text = str(error or "").strip()
+                error_code = self._exception_code(error)
+                reason_key = error_code or error_text or "unknown_error"
+                failure_reasons[reason_key] = int(failure_reasons.get(reason_key, 0)) + 1
+                inactive_token = self._is_inactive_token_error(error)
+                if inactive_token:
+                    invalid_tokens.append(token)
+                token_results.append(
+                    {
+                        "tokenPrefix": self._token_prefix(token),
+                        "success": False,
+                        "errorCode": error_code or None,
+                        "errorMessage": error_text or None,
+                        "inactiveToken": inactive_token,
+                    }
+                )
 
         return {
             "successCount": success_count,
             "failureCount": failure_count,
             "invalidTokens": self._normalize_tokens(invalid_tokens),
+            "failureReasons": failure_reasons,
+            "tokenResults": token_results,
         }
 
 
@@ -716,6 +787,14 @@ def register_push_notification_routes(
                 invalid_platform_counts.get("web", 0),
                 len(invalid_tokens),
             )
+        failure_reasons = result.get("failureReasons", {})
+        token_results = result.get("tokenResults", [])
+        if failure_reasons:
+            logger.info(
+                "push.send.failure_reasons recipient_scope=%s reasons=%s",
+                recipient_scope,
+                failure_reasons,
+            )
         if invalid_tokens:
             store.deactivate_push_devices_by_tokens(invalid_tokens)
 
@@ -734,7 +813,10 @@ def register_push_notification_routes(
             success_count=success_count,
             failure_count=failure_count,
             invalid_tokens=invalid_tokens,
-            provider_response=result,
+            provider_response={
+                **result,
+                "tokenResults": token_results,
+            },
             sent_at=utcnow(),
         )
         db.commit()
@@ -747,8 +829,12 @@ def register_push_notification_routes(
                 "failureCount": failure_count,
                 "invalidTokenCount": len(invalid_tokens),
                 "invalidTokens": invalid_tokens,
+                "failureReasons": failure_reasons,
             },
-            "data": {"debug": debug_payload},
+            "data": {
+                "debug": debug_payload,
+                "tokenResults": token_results,
+            },
         }
 
     @app.post("/api/esim-app/push/admin/send-app-update", response_model=None)
