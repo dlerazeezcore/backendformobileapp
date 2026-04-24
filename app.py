@@ -51,7 +51,14 @@ CORS_ALLOWED_ORIGINS = [
     "http://127.0.0.1:5173",
 ]
 CORS_ALLOWED_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
-CORS_ALLOWED_HEADERS = ["Authorization", "Content-Type"]
+CORS_ALLOWED_HEADERS = [
+    "Authorization",
+    "Content-Type",
+    "Baggage",
+    "Sentry-Trace",
+    "X-Client-Info",
+    "Apikey",
+]
 CORS_ALLOW_ORIGIN_REGEX = r"^https://([a-zA-Z0-9-]+\.)?figma\.site$"
 FIB_PAYMENT_BASE_URL = "https://fib.prod.fib.iq"
 FIB_PAYMENT_TIMEOUT_SECONDS = 30.0
@@ -80,6 +87,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         app.state.fib_payment_api = None
         if cfg.fib_payment_client_id and cfg.fib_payment_client_secret:
+            if not cfg.fib_payment_webhook_secret and not FIB_PAYMENT_WEBHOOK_SECRET:
+                raise RuntimeError("FIB_PAYMENT_WEBHOOK_SECRET is required when FIB payments are configured.")
             app.state.fib_payment_api = FIBPaymentAPI(
                 client_id=cfg.fib_payment_client_id,
                 client_secret=cfg.fib_payment_client_secret,

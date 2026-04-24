@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,6 +18,7 @@ class Settings(BaseSettings):
 
     esim_access_access_code: str = Field(alias="ESIM_ACCESS_ACCESS_CODE")
     esim_access_secret_key: str = Field(alias="ESIM_ACCESS_SECRET_KEY")
+    esim_access_webhook_secret: str | None = Field(default=None, alias="ESIM_ACCESS_WEBHOOK_SECRET")
     fib_payment_client_id: str | None = Field(default=None, alias="FIB_PAYMENT_CLIENT_ID")
     fib_payment_client_secret: str | None = Field(default=None, alias="FIB_PAYMENT_CLIENT_SECRET")
     fib_payment_webhook_secret: str | None = Field(default=None, alias="FIB_PAYMENT_WEBHOOK_SECRET")
@@ -58,6 +59,14 @@ class Settings(BaseSettings):
         default="https://splzxivzahitxmjcqstn.storage.supabase.co/storage/v1/object/public",
         alias="SUPPORT_UPLOADS_PUBLIC_BASE_URL",
     )
+
+    @model_validator(mode="after")
+    def validate_production_secrets(self) -> "Settings":
+        if not self.auth_secret_key or self.auth_secret_key == DEFAULT_AUTH_SECRET_KEY:
+            raise ValueError("AUTH_SECRET_KEY must be set to a strong deployment-specific value.")
+        if self.fib_payment_client_id and self.fib_payment_client_secret and not self.fib_payment_webhook_secret:
+            raise ValueError("FIB_PAYMENT_WEBHOOK_SECRET is required when FIB payment credentials are configured.")
+        return self
 
 
 @lru_cache

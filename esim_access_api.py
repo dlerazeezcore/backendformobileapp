@@ -13,12 +13,13 @@ from typing import Any, Callable, Generic, TypeVar
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from auth import get_token_claims, require_active_subject
+from config import get_settings
 from supabase_store import AdminUser, AppUser, ESimProfile, PaymentAttempt, SupabaseStore, utcnow
 from users import UserPayload
 
@@ -1018,11 +1019,63 @@ def _resolve_or_create_payment_for_managed_order(
     return attempt
 
 
+def _require_valid_esim_webhook_secret(
+    *,
+    header_secret: str | None,
+    alternate_header_secret: str | None,
+    query_secret: str | None,
+    path_secret: str | None = None,
+) -> None:
+    configured_secret = str(get_settings().esim_access_webhook_secret or "").strip()
+    if not configured_secret:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="eSIM Access webhook secret is not configured on this deployment.",
+        )
+    candidates = [
+        str(header_secret or ""),
+        str(alternate_header_secret or ""),
+        str(query_secret or ""),
+        str(path_secret or ""),
+    ]
+    if not any(candidate and hmac.compare_digest(candidate, configured_secret) for candidate in candidates):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid eSIM Access webhook secret.")
+
+
 def register_esim_access_routes(
     app: FastAPI,
     get_db: Callable[..., Any],
     get_provider: Callable[..., ESimAccessAPI],
 ) -> None:
+    async def _require_admin_actor(
+        claims: dict[str, Any] = Depends(get_token_claims),
+        db: Session = Depends(get_db),
+    ) -> AdminUser:
+        row = require_active_subject(db, claims=claims, subject_type="admin")
+        assert isinstance(row, AdminUser)
+        return row
+
+    async def _require_active_actor(
+        claims: dict[str, Any] = Depends(get_token_claims),
+        db: Session = Depends(get_db),
+    ) -> AppUser | AdminUser:
+        row = require_active_subject(db, claims=claims)
+        assert isinstance(row, (AppUser, AdminUser))
+        return row
+
+    def _require_topup_profile_access(db: Session, actor: AppUser | AdminUser, request: TopUpRequest) -> None:
+        if isinstance(actor, AdminUser):
+            return
+        profile = None
+        if request.iccid:
+            profile = db.scalar(select(ESimProfile).where(ESimProfile.iccid == request.iccid))
+        elif request.esim_tran_no:
+            profile = db.scalar(select(ESimProfile).where(ESimProfile.esim_tran_no == request.esim_tran_no))
+        if profile is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found.")
+        if profile.user_id != actor.id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Profile ownership mismatch.")
+
     @app.post("/api/v1/esim-access/packages/query")
     async def query_packages(
         payload: PackageQueryRequest,
@@ -1036,6 +1089,7 @@ def register_esim_access_routes(
     async def create_order(
         payload: OrderProfilesRequest,
         provider: ESimAccessAPI = Depends(get_provider),
+        _: AdminUser = Depends(_require_admin_actor),
     ) -> ESimAccessResponse[OrderResult]:
         return await provider.order_profiles(payload)
 
@@ -1141,6 +1195,7 @@ def register_esim_access_routes(
     async def query_profiles(
         payload: ProfileQueryRequest,
         provider: ESimAccessAPI = Depends(get_provider),
+        _: AdminUser = Depends(_require_admin_actor),
     ) -> dict[str, Any]:
         provider_response = await provider.query_profiles(payload)
         raw_payload = provider_response.model_dump(by_alias=True, exclude_none=True)
@@ -1151,6 +1206,7 @@ def register_esim_access_routes(
         payload: ManagedProfileSyncPayload,
         provider: ESimAccessAPI = Depends(get_provider),
         db: Session = Depends(get_db),
+        _: AdminUser = Depends(_require_admin_actor),
     ) -> dict[str, Any]:
         provider_response = await provider.query_profiles(payload.provider_request)
         store = SupabaseStore(db)
@@ -1169,6 +1225,7 @@ def register_esim_access_routes(
     async def cancel_profile(
         payload: EsimTranNoRequest,
         provider: ESimAccessAPI = Depends(get_provider),
+        _: AdminUser = Depends(_require_admin_actor),
     ) -> ESimAccessResponse[EmptyResult]:
         return await provider.cancel_profile(payload)
 
@@ -1177,6 +1234,7 @@ def register_esim_access_routes(
         payload: ManagedEsimTranActionPayload,
         provider: ESimAccessAPI = Depends(get_provider),
         db: Session = Depends(get_db),
+        _: AdminUser = Depends(_require_admin_actor),
     ) -> dict[str, Any]:
         provider_response = await provider.cancel_profile(payload.provider_request)
         profile = SupabaseStore(db).apply_profile_action(
@@ -1194,6 +1252,7 @@ def register_esim_access_routes(
     async def suspend_profile(
         payload: ICCIDRequest,
         provider: ESimAccessAPI = Depends(get_provider),
+        _: AdminUser = Depends(_require_admin_actor),
     ) -> ESimAccessResponse[EmptyResult]:
         return await provider.suspend_profile(payload)
 
@@ -1202,6 +1261,7 @@ def register_esim_access_routes(
         payload: ManagedIccidActionPayload,
         provider: ESimAccessAPI = Depends(get_provider),
         db: Session = Depends(get_db),
+        _: AdminUser = Depends(_require_admin_actor),
     ) -> dict[str, Any]:
         provider_response = await provider.suspend_profile(payload.provider_request)
         profile = SupabaseStore(db).apply_profile_action(
@@ -1219,6 +1279,7 @@ def register_esim_access_routes(
     async def unsuspend_profile(
         payload: ICCIDRequest,
         provider: ESimAccessAPI = Depends(get_provider),
+        _: AdminUser = Depends(_require_admin_actor),
     ) -> ESimAccessResponse[EmptyResult]:
         return await provider.unsuspend_profile(payload)
 
@@ -1227,6 +1288,7 @@ def register_esim_access_routes(
         payload: ManagedIccidActionPayload,
         provider: ESimAccessAPI = Depends(get_provider),
         db: Session = Depends(get_db),
+        _: AdminUser = Depends(_require_admin_actor),
     ) -> dict[str, Any]:
         provider_response = await provider.unsuspend_profile(payload.provider_request)
         profile = SupabaseStore(db).apply_profile_action(
@@ -1244,6 +1306,7 @@ def register_esim_access_routes(
     async def revoke_profile(
         payload: ICCIDRequest,
         provider: ESimAccessAPI = Depends(get_provider),
+        _: AdminUser = Depends(_require_admin_actor),
     ) -> ESimAccessResponse[EmptyResult]:
         return await provider.revoke_profile(payload)
 
@@ -1252,6 +1315,7 @@ def register_esim_access_routes(
         payload: ManagedIccidActionPayload,
         provider: ESimAccessAPI = Depends(get_provider),
         db: Session = Depends(get_db),
+        _: AdminUser = Depends(_require_admin_actor),
     ) -> dict[str, Any]:
         provider_response = await provider.revoke_profile(payload.provider_request)
         profile = SupabaseStore(db).apply_profile_action(
@@ -1268,6 +1332,7 @@ def register_esim_access_routes(
     @app.post("/api/v1/esim-access/balance/query")
     async def query_balance(
         provider: ESimAccessAPI = Depends(get_provider),
+        _: AdminUser = Depends(_require_admin_actor),
     ) -> ESimAccessResponse[BalanceResult]:
         return await provider.balance_query()
 
@@ -1276,6 +1341,7 @@ def register_esim_access_routes(
     async def top_up(
         payload: TopUpRequest,
         provider: ESimAccessAPI = Depends(get_provider),
+        _: AdminUser = Depends(_require_admin_actor),
     ) -> Any:
         try:
             return await provider.top_up(payload)
@@ -1288,7 +1354,9 @@ def register_esim_access_routes(
         payload: ManagedTopUpPayload,
         provider: ESimAccessAPI = Depends(get_provider),
         db: Session = Depends(get_db),
+        actor: AppUser | AdminUser = Depends(_require_active_actor),
     ) -> Any:
+        _require_topup_profile_access(db, actor, payload.provider_request)
         try:
             provider_response = await provider.top_up(payload.provider_request)
         except Exception as exc:
@@ -1329,6 +1397,7 @@ def register_esim_access_routes(
     async def configure_webhook(
         payload: WebhookConfigRequest,
         provider: ESimAccessAPI = Depends(get_provider),
+        _: AdminUser = Depends(_require_admin_actor),
     ) -> ESimAccessResponse[EmptyResult]:
         return await provider.set_webhook(payload)
 
@@ -1336,6 +1405,7 @@ def register_esim_access_routes(
     async def send_sms(
         payload: SendSmsRequest,
         provider: ESimAccessAPI = Depends(get_provider),
+        _: AdminUser = Depends(_require_admin_actor),
     ) -> ESimAccessResponse[EmptyResult]:
         return await provider.send_sms(payload)
 
@@ -1343,6 +1413,7 @@ def register_esim_access_routes(
     async def query_usage(
         payload: UsageCheckRequest,
         provider: ESimAccessAPI = Depends(get_provider),
+        _: AdminUser = Depends(_require_admin_actor),
     ) -> ESimAccessResponse[UsageResult]:
         return await provider.usage_check(payload)
 
@@ -1351,6 +1422,7 @@ def register_esim_access_routes(
         payload: ManagedUsageSyncPayload,
         provider: ESimAccessAPI = Depends(get_provider),
         db: Session = Depends(get_db),
+        _: AdminUser = Depends(_require_admin_actor),
     ) -> dict[str, Any]:
         provider_response = await provider.usage_check(payload.provider_request)
         profiles = SupabaseStore(db).sync_usage_records(
@@ -1528,6 +1600,24 @@ def register_esim_access_routes(
 
     @app.post("/api/v1/esim-access/webhooks/events")
     @app.post("/api/v1/esim-access/webhook/events")
-    async def receive_webhook(event: WebhookEvent, db: Session = Depends(get_db)) -> dict[str, Any]:
+    @app.post("/api/v1/esim-access/webhooks/events/{path_secret}")
+    @app.post("/api/v1/esim-access/webhook/events/{path_secret}")
+    async def receive_webhook(
+        event: WebhookEvent,
+        db: Session = Depends(get_db),
+        x_esim_access_webhook_secret: str | None = Header(
+            default=None,
+            alias="X-ESIM-ACCESS-WEBHOOK-SECRET",
+        ),
+        x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
+        query_secret: str | None = Query(default=None, alias="secret"),
+        path_secret: str | None = None,
+    ) -> dict[str, Any]:
+        _require_valid_esim_webhook_secret(
+            header_secret=x_esim_access_webhook_secret,
+            alternate_header_secret=x_webhook_secret,
+            query_secret=query_secret,
+            path_secret=path_secret,
+        )
         lifecycle_event = SupabaseStore(db).record_webhook(event.model_dump(by_alias=True, exclude_none=True))
         return {"status": "accepted", "eventId": lifecycle_event.id}

@@ -1,12 +1,20 @@
 from __future__ import annotations
 
+import os
 import unittest
-from typing import Iterator
+import uuid
+from typing import Generator
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
 
+from auth import create_access_token
+from config import get_settings
 from esim_access_api import ESimAccessAPIError, register_esim_access_routes
+from supabase_store import AdminUser, Base, normalize_database_url
 
 
 class _FailingTopUpProvider:
@@ -24,15 +32,55 @@ def _get_provider() -> _FailingTopUpProvider:
     return _FailingTopUpProvider()
 
 
-def _get_db() -> Iterator[object]:
-    yield object()
-
-
 class ManagedTopUpErrorHandlingTest(unittest.TestCase):
     def setUp(self) -> None:
+        os.environ["AUTH_SECRET_KEY"] = "test-auth-secret"
+        get_settings.cache_clear()
+        self.engine = create_engine(
+            normalize_database_url("sqlite://"),
+            future=True,
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(self.engine)
+        self.session_factory = sessionmaker(bind=self.engine, autoflush=False, autocommit=False, future=True)
+        self.admin_id = str(uuid.uuid4())
+        with self.session_factory() as session:
+            session.add(
+                AdminUser(
+                    id=self.admin_id,
+                    phone="+9647700000888",
+                    name="Topup Admin",
+                    status="active",
+                    role="admin",
+                )
+            )
+            session.commit()
+
+        def _get_db() -> Generator[Session, None, None]:
+            session = self.session_factory()
+            try:
+                yield session
+            finally:
+                session.close()
+
         app = FastAPI()
         register_esim_access_routes(app, _get_db, _get_provider)
         self.client = TestClient(app)
+        self.admin_headers = {
+            "Authorization": "Bearer "
+            + create_access_token(
+                subject_id=self.admin_id,
+                phone="+9647700000888",
+                subject_type="admin",
+                secret_key="test-auth-secret",
+                ttl_seconds=3600,
+            )
+        }
+
+    def tearDown(self) -> None:
+        self.engine.dispose()
+        get_settings.cache_clear()
 
     def test_invalid_esim_tran_no_returns_json_4xx_envelope(self) -> None:
         response = self.client.post(
@@ -49,6 +97,7 @@ class ManagedTopUpErrorHandlingTest(unittest.TestCase):
                 "actorPhone": "+9647500000000",
                 "syncAfterTopup": False,
             },
+            headers=self.admin_headers,
         )
 
         self.assertGreaterEqual(response.status_code, 400)

@@ -1062,6 +1062,14 @@ def register_fib_payment_routes(
         assert isinstance(row, AdminUser)
         return None, row.id, row.phone
 
+    async def _require_admin_payment_actor(
+        claims: dict[str, Any] = Depends(get_token_claims),
+        db: Session = Depends(get_db),
+    ) -> AdminUser:
+        row = require_active_subject(db, claims=claims, subject_type="admin")
+        assert isinstance(row, AdminUser)
+        return row
+
     @app.post("/api/v1/payments/fib/checkout")
     @app.post("/api/v1/payments/fib/create")
     @app.post("/api/v1/payments/fib/intent")
@@ -1310,6 +1318,12 @@ def register_fib_payment_routes(
     ) -> JSONResponse:
         raw_body = await request.body()
         signature_valid: bool | None = None
+        if not provider.webhook_secret:
+            return _error_response(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                error_code="FIB_WEBHOOK_SECRET_NOT_CONFIGURED",
+                message="FIB webhook secret is not configured on this deployment.",
+            )
         if provider.webhook_secret:
             expected = hmac.new(provider.webhook_secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
             signature = _extract_webhook_signature({k.lower(): v for k, v in request.headers.items()})
@@ -1488,6 +1502,7 @@ def register_fib_payment_routes(
     async def create_payment_legacy(
         payload: CreatePaymentRequest,
         provider: FIBPaymentAPI = Depends(get_fib_provider),
+        _: AdminUser = Depends(_require_admin_payment_actor),
     ) -> dict[str, Any]:
         result = await provider.create_payment(payload)
         return {"provider": result.model_dump(by_alias=True, exclude_none=True)}
@@ -1496,6 +1511,7 @@ def register_fib_payment_routes(
     async def get_payment_status_legacy(
         payment_id: str,
         provider: FIBPaymentAPI = Depends(get_fib_provider),
+        _: AdminUser = Depends(_require_admin_payment_actor),
     ) -> dict[str, Any]:
         result = await provider.get_payment_status(payment_id)
         return {"provider": result.model_dump(by_alias=True, exclude_none=True)}
@@ -1504,6 +1520,7 @@ def register_fib_payment_routes(
     async def cancel_payment_legacy(
         payment_id: str,
         provider: FIBPaymentAPI = Depends(get_fib_provider),
+        _: AdminUser = Depends(_require_admin_payment_actor),
     ) -> Response:
         await provider.cancel_payment(payment_id)
         return Response(status_code=204)
@@ -1512,6 +1529,7 @@ def register_fib_payment_routes(
     async def refund_payment_legacy(
         payment_id: str,
         provider: FIBPaymentAPI = Depends(get_fib_provider),
+        _: AdminUser = Depends(_require_admin_payment_actor),
     ) -> Response:
         await provider.refund_payment(payment_id)
         return Response(status_code=202)

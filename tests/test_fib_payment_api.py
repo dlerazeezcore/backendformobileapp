@@ -108,6 +108,10 @@ class _FakeProvider:
         _ = payment_id
 
 
+class _FakeProviderWithoutWebhookSecret(_FakeProvider):
+    webhook_secret = None
+
+
 class FIBPaymentRoutesTest(unittest.TestCase):
     def setUp(self) -> None:
         os.environ["AUTH_SECRET_KEY"] = "test-auth-secret"
@@ -343,6 +347,51 @@ class FIBPaymentRoutesTest(unittest.TestCase):
         )
         self.assertEqual(accepted.status_code, 202)
         self.assertEqual(accepted.json().get("success"), True)
+
+    def test_webhook_rejects_when_secret_is_not_configured(self) -> None:
+        app = FastAPI()
+
+        def _get_provider() -> _FakeProviderWithoutWebhookSecret:
+            return _FakeProviderWithoutWebhookSecret()
+
+        def _get_db() -> Generator[Session, None, None]:
+            session = self.session_factory()
+            try:
+                yield session
+            finally:
+                session.close()
+
+        register_fib_payment_routes(app, _get_provider, _get_db)
+        client = TestClient(app)
+
+        response = client.post(
+            "/api/v1/payments/fib/webhook",
+            headers={"X-FIB-WEBHOOK-SECRET": "anything"},
+            json={"paymentId": "fib-pay-1", "status": "PAID"},
+        )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json().get("errorCode"), "FIB_WEBHOOK_SECRET_NOT_CONFIGURED")
+
+    def test_legacy_provider_routes_require_admin_token(self) -> None:
+        payload = {
+            "monetaryValue": {"amount": "1000", "currency": "IQD"},
+            "description": "Legacy provider call",
+        }
+
+        unauthenticated = self.client.post("/api/v1/fib-payments/payments", json=payload)
+        self.assertEqual(unauthenticated.status_code, 401)
+
+        user_cancel = self.client.post(
+            "/api/v1/fib-payments/payments/fib-pay-1/cancel",
+            headers=self.user_headers,
+        )
+        self.assertEqual(user_cancel.status_code, 403)
+
+        admin_refund = self.client.post(
+            "/api/v1/fib-payments/payments/fib-pay-1/refund",
+            headers=self.admin_headers,
+        )
+        self.assertEqual(admin_refund.status_code, 202)
 
     def test_webhook_is_idempotent_by_provider_event_id(self) -> None:
         payload = {
