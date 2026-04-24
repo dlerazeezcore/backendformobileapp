@@ -64,8 +64,6 @@ class Settings(BaseSettings):
     def validate_production_secrets(self) -> "Settings":
         if not self.auth_secret_key or self.auth_secret_key == DEFAULT_AUTH_SECRET_KEY:
             raise ValueError("AUTH_SECRET_KEY must be set to a strong deployment-specific value.")
-        if self.fib_payment_client_id and self.fib_payment_client_secret and not self.fib_payment_webhook_secret:
-            raise ValueError("FIB_PAYMENT_WEBHOOK_SECRET is required when FIB payment credentials are configured.")
         return self
 
 

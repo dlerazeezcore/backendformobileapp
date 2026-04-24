@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 import inspect
+import logging
 from typing import AsyncIterator
 
 from fastapi import FastAPI, HTTPException, Request
@@ -71,6 +72,7 @@ TWILIO_VERIFY_TIMEOUT_SECONDS = 20.0
 TWILIO_VERIFY_RATE_LIMIT_PER_SECOND = 5.0
 # Optional hardcoded fallback when env var is not set.
 FIB_PAYMENT_WEBHOOK_SECRET: str | None = None
+LOGGER = logging.getLogger("uvicorn.error")
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -86,9 +88,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             rate_limit_per_second=DEFAULT_ESIM_ACCESS_RATE_LIMIT_PER_SECOND,
         )
         app.state.fib_payment_api = None
-        if cfg.fib_payment_client_id and cfg.fib_payment_client_secret:
-            if not cfg.fib_payment_webhook_secret and not FIB_PAYMENT_WEBHOOK_SECRET:
-                raise RuntimeError("FIB_PAYMENT_WEBHOOK_SECRET is required when FIB payments are configured.")
+        fib_webhook_secret = cfg.fib_payment_webhook_secret or FIB_PAYMENT_WEBHOOK_SECRET
+        if cfg.fib_payment_client_id and cfg.fib_payment_client_secret and fib_webhook_secret:
             app.state.fib_payment_api = FIBPaymentAPI(
                 client_id=cfg.fib_payment_client_id,
                 client_secret=cfg.fib_payment_client_secret,
@@ -97,7 +98,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 rate_limit_per_second=FIB_PAYMENT_RATE_LIMIT_PER_SECOND,
                 default_status_callback_url=FIB_PAYMENT_STATUS_CALLBACK_URL,
                 default_redirect_uri=FIB_PAYMENT_REDIRECT_URI,
-                webhook_secret=cfg.fib_payment_webhook_secret or FIB_PAYMENT_WEBHOOK_SECRET,
+                webhook_secret=fib_webhook_secret,
+            )
+        elif cfg.fib_payment_client_id and cfg.fib_payment_client_secret:
+            LOGGER.warning(
+                "FIB payment credentials are set but FIB_PAYMENT_WEBHOOK_SECRET is missing; "
+                "FIB integration will remain disabled until a webhook secret is configured."
             )
         app.state.push_notification_service = PushNotificationService(
             service_account_file=cfg.firebase_service_account_file,

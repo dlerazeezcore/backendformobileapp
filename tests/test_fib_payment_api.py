@@ -114,6 +114,8 @@ class _FakeProviderWithoutWebhookSecret(_FakeProvider):
 
 class FIBPaymentRoutesTest(unittest.TestCase):
     def setUp(self) -> None:
+        os.environ["ESIM_ACCESS_ACCESS_CODE"] = "test-code"
+        os.environ["ESIM_ACCESS_SECRET_KEY"] = "test-secret"
         os.environ["AUTH_SECRET_KEY"] = "test-auth-secret"
         get_settings.cache_clear()
         temp_db = tempfile.NamedTemporaryFile(prefix="fib_test_", suffix=".db", delete=False)
