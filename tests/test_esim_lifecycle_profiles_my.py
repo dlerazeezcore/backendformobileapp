@@ -205,6 +205,40 @@ class EsimLifecycleProfilesMyTest(unittest.TestCase):
         self.assertEqual(profile["status"], "inactive")
         self.assertEqual(profile["supportTopUpType"], 3)
 
+    def test_activate_by_provider_order_no_works_for_recent_purchase_placeholder(self) -> None:
+        order_response = self.client.post(
+            "/api/v1/esim-access/orders/managed",
+            headers=self._user_headers(),
+            json={
+                "providerRequest": {
+                    "transactionId": "APP-LIFECYCLE-ORDER-2",
+                    "packageInfoList": [{"packageCode": "PKG-30D", "count": 1, "price": 1200, "periodNum": 30}],
+                },
+                "user": {
+                    "phone": self.user_phone,
+                    "name": "Lifecycle User",
+                    "email": "lifecycle@example.com",
+                },
+                "platformCode": "mobile_app",
+                "currencyCode": "IQD",
+                "providerCurrencyCode": "IQD",
+            },
+        )
+        self.assertEqual(order_response.status_code, 200)
+        provider_order_no = order_response.json().get("providerOrderNo")
+        self.assertEqual(provider_order_no, "ORD-LIFECYCLE-1")
+
+        activate_response = self.client.post(
+            "/api/v1/esim-access/profiles/activate/my",
+            headers=self._user_headers(),
+            json={"providerOrderNo": provider_order_no},
+        )
+        self.assertEqual(activate_response.status_code, 200)
+        activated_profile = activate_response.json()["data"]["profile"]
+        self.assertTrue(activated_profile["installed"])
+        self.assertEqual(activated_profile["status"], "active")
+        self.assertEqual(activated_profile["providerOrderNo"], provider_order_no)
+
     def test_bundle_expiry_moves_profile_to_expired(self) -> None:
         now = utcnow()
         with self.session_factory() as session:

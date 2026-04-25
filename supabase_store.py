@@ -585,6 +585,7 @@ class ProfileInventoryRow:
     esim_tran_no: str | None
     iccid: str | None
     activation_code: str | None
+    qr_code_url: str | None
     install_url: str | None
     provider_status: str | None
     app_status: str | None
@@ -911,6 +912,7 @@ class SupabaseStore:
             esim_tran_no=(custom_fields.get("esimTranNo") or custom_fields.get("esim_tran_no")),
             iccid=(custom_fields.get("iccid") or custom_fields.get("ICCID")),
             activation_code=(custom_fields.get("activationCode") or custom_fields.get("activation_code")),
+            qr_code_url=(custom_fields.get("qrCodeUrl") or custom_fields.get("qr_code_url")),
             install_url=(custom_fields.get("installUrl") or custom_fields.get("install_url")),
             provider_status=order_item.provider_status,
             app_status=status_value,
@@ -2271,9 +2273,20 @@ class SupabaseStore:
 
         provider_obj = (provider_response or {}).get("obj") or {}
         profile.activation_code = profile.activation_code or provider_obj.get("ac")
+        profile.qr_code_url = profile.qr_code_url or provider_obj.get("qrCodeUrl")
         profile.install_url = profile.install_url or provider_obj.get("shortUrl") or provider_obj.get("installUrl")
         profile.last_provider_sync_at = profile.last_provider_sync_at or utcnow()
-        profile.custom_fields = self._merge_json_dict(profile.custom_fields, order_item.custom_fields or {})
+        profile.custom_fields = self._merge_json_dict(
+            profile.custom_fields,
+            self._merge_json_dict(
+                order_item.custom_fields or {},
+                {
+                    "activationCode": profile.activation_code,
+                    "qrCodeUrl": profile.qr_code_url,
+                    "installUrl": profile.install_url,
+                },
+            ),
+        )
         self.session.flush()
         return profile
 
@@ -2395,6 +2408,9 @@ class SupabaseStore:
                     "supportTopUpType": support_topup_type,
                     "packageMetadata": self._build_order_item_package_metadata(order_item),
                     "checkoutSnapshot": (order_item.custom_fields or {}).get("checkoutSnapshot"),
+                    "activationCode": profile.activation_code,
+                    "qrCodeUrl": profile.qr_code_url,
+                    "installUrl": profile.install_url,
                 },
             )
             order_item.item_status = profile.app_status or order_item.item_status
@@ -2541,6 +2557,20 @@ class SupabaseStore:
     ) -> ESimProfile | None:
         if identifier_key == "iccid":
             profile = self.session.scalar(select(ESimProfile).where(ESimProfile.iccid == identifier_value))
+        elif identifier_key == "provider_order_no":
+            profile = self.session.scalar(
+                select(ESimProfile)
+                .join(OrderItem, ESimProfile.order_item_id == OrderItem.id)
+                .where(OrderItem.provider_order_no == identifier_value)
+                .order_by(ESimProfile.updated_at.desc(), ESimProfile.id.desc())
+                .limit(1)
+            )
+        elif identifier_key == "id":
+            profile_id = parse_provider_int(identifier_value)
+            if profile_id is None:
+                self.session.commit()
+                return None
+            profile = self.session.scalar(select(ESimProfile).where(ESimProfile.id == profile_id))
         else:
             profile = self.session.scalar(select(ESimProfile).where(ESimProfile.esim_tran_no == identifier_value))
         if profile is None:

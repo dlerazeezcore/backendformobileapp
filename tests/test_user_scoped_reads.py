@@ -125,6 +125,7 @@ class UserScopedReadsTest(unittest.TestCase):
                         activated_at=now,
                         expires_at=now,
                         activation_code="ACT-USER1",
+                        qr_code_url="https://qr.example/1",
                         install_url="https://install.example/1",
                         custom_fields={"source": "test", "usageUnit": "KB"},
                     ),
@@ -198,6 +199,7 @@ class UserScopedReadsTest(unittest.TestCase):
             self.assertEqual(profile["totalDataGb"], round(profile["totalDataMb"] / 1024, 6))
             self.assertEqual(profile["usedDataGb"], round(profile["usedDataMb"] / 1024, 6))
             self.assertEqual(profile["remainingDataGb"], round(profile["remainingDataMb"] / 1024, 6))
+            self.assertEqual(profile["qrCodeUrl"], "https://qr.example/1")
 
     def test_profiles_my_supports_filters(self) -> None:
         token = self._token(

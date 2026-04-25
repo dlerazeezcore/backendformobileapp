@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 
 from auth import get_token_claims, require_active_subject
 from config import get_settings
-from supabase_store import AdminUser, AppUser, ESimProfile, PaymentAttempt, ProfileInventoryRow, SupabaseStore, utcnow
+from supabase_store import AdminUser, AppUser, ESimProfile, OrderItem, PaymentAttempt, ProfileInventoryRow, SupabaseStore, utcnow
 from users import UserPayload
 
 
@@ -467,6 +467,8 @@ def _serialize_profile(row: ESimProfile | ProfileInventoryRow, *, now: datetime)
         "supportTopUpType": support_topup_type,
         "activationCode": row.activation_code,
         "activation_code": row.activation_code,
+        "qrCodeUrl": row.qr_code_url,
+        "qr_code_url": row.qr_code_url,
         "installUrl": row.install_url,
         "install_url": row.install_url,
         "customFields": custom_fields,
@@ -498,7 +500,32 @@ def _resolve_profile_identifier(payload: MyProfileActionPayload) -> tuple[str, s
         return "iccid", payload.iccid.strip()
     if payload.esim_tran_no and payload.esim_tran_no.strip():
         return "esim_tran_no", payload.esim_tran_no.strip()
-    raise HTTPException(status_code=422, detail="Either iccid or esimTranNo is required.")
+    if payload.provider_order_no and payload.provider_order_no.strip():
+        return "provider_order_no", payload.provider_order_no.strip()
+    if payload.profile_id is not None:
+        return "id", str(payload.profile_id)
+    raise HTTPException(status_code=422, detail="Either iccid, esimTranNo, providerOrderNo, or id is required.")
+
+
+def _lookup_profile_by_identifier(db: Session, *, identifier_key: str, identifier_value: str) -> ESimProfile | None:
+    if identifier_key == "iccid":
+        return db.scalar(select(ESimProfile).where(ESimProfile.iccid == identifier_value))
+    if identifier_key == "esim_tran_no":
+        return db.scalar(select(ESimProfile).where(ESimProfile.esim_tran_no == identifier_value))
+    if identifier_key == "provider_order_no":
+        return db.scalar(
+            select(ESimProfile)
+            .join(OrderItem, ESimProfile.order_item_id == OrderItem.id)
+            .where(OrderItem.provider_order_no == identifier_value)
+            .order_by(ESimProfile.updated_at.desc(), ESimProfile.id.desc())
+            .limit(1)
+        )
+    if identifier_key == "id":
+        parsed_id = _as_int(identifier_value)
+        if parsed_id is None:
+            return None
+        return db.scalar(select(ESimProfile).where(ESimProfile.id == parsed_id))
+    return None
 
 
 def build_topup_error_response(exc: Exception) -> JSONResponse:
@@ -948,6 +975,8 @@ class ActionContext(BaseModel):
 class MyProfileActionPayload(BaseModel):
     iccid: str | None = None
     esim_tran_no: str | None = Field(default=None, alias="esimTranNo")
+    provider_order_no: str | None = Field(default=None, alias="providerOrderNo")
+    profile_id: int | None = Field(default=None, alias="id")
     user_id: str | None = Field(default=None, alias="userId")
     platform_code: str | None = Field(default="mobile-app", alias="platformCode")
     note: str | None = None
@@ -1684,11 +1713,7 @@ def register_esim_access_routes(
         target_user_id = _resolve_target_user_id(actor=actor, claims=claims, requested_user_id=payload.user_id)
         identifier_key, identifier_value = _resolve_profile_identifier(payload)
         store = SupabaseStore(db)
-        profile = (
-            db.scalar(select(ESimProfile).where(ESimProfile.iccid == identifier_value))
-            if identifier_key == "iccid"
-            else db.scalar(select(ESimProfile).where(ESimProfile.esim_tran_no == identifier_value))
-        )
+        profile = _lookup_profile_by_identifier(db, identifier_key=identifier_key, identifier_value=identifier_value)
         if profile is None:
             raise HTTPException(status_code=404, detail="Profile not found.")
         if profile.user_id != target_user_id:
@@ -1723,11 +1748,7 @@ def register_esim_access_routes(
         target_user_id = _resolve_target_user_id(actor=actor, claims=claims, requested_user_id=payload.user_id)
         identifier_key, identifier_value = _resolve_profile_identifier(payload)
         store = SupabaseStore(db)
-        profile = (
-            db.scalar(select(ESimProfile).where(ESimProfile.iccid == identifier_value))
-            if identifier_key == "iccid"
-            else db.scalar(select(ESimProfile).where(ESimProfile.esim_tran_no == identifier_value))
-        )
+        profile = _lookup_profile_by_identifier(db, identifier_key=identifier_key, identifier_value=identifier_value)
         if profile is None:
             raise HTTPException(status_code=404, detail="Profile not found.")
         if profile.user_id != target_user_id:
