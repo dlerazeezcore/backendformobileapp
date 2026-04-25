@@ -538,29 +538,52 @@ def register_auth_routes(
         normalized_phone = _normalize_and_validate_signup_phone(payload.phone)
         _log_phone_lookup("auth.user.login", payload.phone, normalized_phone)
         if payload.otp_code:
-            user_row = _lookup_user_by_phone(db, normalized_phone)
-            if user_row is None:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="User account not found. Please sign up first.",
-                )
-            if not _is_row_active(user_row):
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="User account exists but is not active. Please contact support.",
-                )
-            required_provider = _require_twilio_provider(provider)
             requested_channel = _normalize_otp_channel(payload.otp_channel, field_name="otpChannel")
-            await _verify_twilio_user_otp(
-                provider=required_provider,
-                phone=normalized_phone,
-                code=payload.otp_code,
-                expected_channel=requested_channel,
-                verification_sid=payload.verification_sid,
+            user_row = _lookup_user_by_phone(db, normalized_phone)
+            if user_row is not None:
+                required_provider = _require_twilio_provider(provider)
+                if not _is_row_active(user_row):
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="User account exists but is not active. Please contact support.",
+                    )
+                await _verify_twilio_user_otp(
+                    provider=required_provider,
+                    phone=normalized_phone,
+                    code=payload.otp_code,
+                    expected_channel=requested_channel,
+                    verification_sid=payload.verification_sid,
+                )
+                user_row.last_login_at = utcnow()
+                db.commit()
+                return _issue_subject_session(user_row, subject_type="user")
+
+            # Keep parity with password login compatibility:
+            # if an admin account is using the shared /auth/user/login endpoint,
+            # allow OTP login and issue an admin session token.
+            admin_row = _lookup_admin_by_phone(db, normalized_phone)
+            if admin_row is not None:
+                required_provider = _require_twilio_provider(provider)
+                if not _is_row_active(admin_row):
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Admin account exists but is not active.",
+                    )
+                await _verify_twilio_user_otp(
+                    provider=required_provider,
+                    phone=normalized_phone,
+                    code=payload.otp_code,
+                    expected_channel=requested_channel,
+                    verification_sid=payload.verification_sid,
+                )
+                admin_row.last_login_at = utcnow()
+                db.commit()
+                return _issue_subject_session(admin_row, subject_type="admin")
+
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User account not found. Please sign up first.",
             )
-            user_row.last_login_at = utcnow()
-            db.commit()
-            return _issue_subject_session(user_row, subject_type="user")
 
         if payload.password is None:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="password or otpCode is required")

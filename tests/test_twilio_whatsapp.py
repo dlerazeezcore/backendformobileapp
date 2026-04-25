@@ -155,6 +155,19 @@ class TwilioWhatsAppAuthTest(unittest.TestCase):
             self.assertTrue(payload.get("accessToken"))
             self.assertEqual(payload.get("tokenType"), "bearer")
 
+    def test_user_login_otp_supports_admin_fallback_subject(self) -> None:
+        with self._client_with_fake_twilio() as client:
+            client.app.state.twilio_whatsapp_api = _FakeTwilioVerifyProvider()
+            response = client.post(
+                "/api/v1/auth/user/login",
+                json={"phone": "+9647700000001", "otpCode": "123456"},
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertEqual(payload.get("subjectType"), "admin")
+            self.assertEqual(payload.get("adminUserId"), "cccccccc-1111-2222-3333-dddddddddddd")
+            self.assertTrue(payload.get("isAdmin"))
+
     def test_user_login_otp_channel_match_allows_whatsapp(self) -> None:
         with self._client_with_fake_twilio() as client:
             fake_provider = _FakeTwilioVerifyProvider()
