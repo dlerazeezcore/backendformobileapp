@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import timedelta
 import os
 import tempfile
 import unittest
@@ -214,6 +215,33 @@ class UserScopedReadsTest(unittest.TestCase):
             self.assertEqual(payload["data"]["total"], 1)
             self.assertEqual(payload["data"]["profiles"][0]["status"], "active")
             self.assertTrue(payload["data"]["profiles"][0]["installed"])
+
+    def test_profiles_my_days_left_starts_after_activation(self) -> None:
+        with self.session_factory() as session:
+            profile = session.scalar(select(ESimProfile).where(ESimProfile.iccid == "ICCID-USER2"))
+            assert profile is not None
+            profile.app_status = "GOT_RESOURCE"
+            profile.activated_at = None
+            profile.expires_at = utcnow() + timedelta(days=7)
+            session.commit()
+
+        admin_token = self._token(
+            subject_id="11111111-1111-1111-1111-111111111111",
+            phone="+9647700000001",
+            subject_type="admin",
+        )
+
+        with TestClient(create_app()) as client:
+            response = client.get(
+                "/api/v1/esim-access/profiles/my?userId=33333333-3333-3333-3333-333333333333",
+                headers={"Authorization": f"Bearer {admin_token}"},
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            profile = payload["data"]["profiles"][0]
+            self.assertEqual(profile["status"], "got_resource")
+            self.assertIsNone(profile["activatedAt"])
+            self.assertIsNone(profile["daysLeft"])
 
     def test_profiles_my_user_token_forbids_other_user_filter(self) -> None:
         token = self._token(

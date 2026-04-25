@@ -333,7 +333,8 @@ def _serialize_profile(row: ESimProfile, *, now: datetime) -> dict[str, Any]:
 
     status_value = _normalize_status(row.app_status or row.provider_status)
     days_left: int | None = None
-    if row.expires_at is not None:
+    activation_started = row.activated_at is not None or status_value in {"active", "suspended"}
+    if activation_started and row.expires_at is not None:
         expires_at = row.expires_at if row.expires_at.tzinfo is not None else row.expires_at.replace(tzinfo=timezone.utc)
         now_at = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
         delta_seconds = (expires_at - now_at).total_seconds()
