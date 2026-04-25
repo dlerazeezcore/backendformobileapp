@@ -7,7 +7,7 @@ import json
 from math import ceil
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from time import time
 from typing import Any, Callable, Generic, TypeVar
 
@@ -333,12 +333,24 @@ def _serialize_profile(row: ESimProfile, *, now: datetime) -> dict[str, Any]:
 
     status_value = _normalize_status(row.app_status or row.provider_status)
     days_left: int | None = None
-    activation_started = row.activated_at is not None or status_value in {"active", "suspended"}
-    if activation_started and row.expires_at is not None:
-        expires_at = row.expires_at if row.expires_at.tzinfo is not None else row.expires_at.replace(tzinfo=timezone.utc)
-        now_at = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
-        delta_seconds = (expires_at - now_at).total_seconds()
+    now_at = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+    activated_at = (
+        row.activated_at if row.activated_at is None or row.activated_at.tzinfo is not None else row.activated_at.replace(tzinfo=timezone.utc)
+    )
+    # User-facing countdown follows bundle validity window:
+    # start only after activation and count validity_days from activated_at.
+    bundle_expires_at: datetime | None = None
+    if activated_at is not None and row.validity_days and row.validity_days > 0:
+        bundle_expires_at = activated_at + timedelta(days=row.validity_days)
+    effective_expires_at = bundle_expires_at
+    # Fallback for legacy rows that do not carry validity_days.
+    if effective_expires_at is None and activated_at is not None and row.expires_at is not None:
+        effective_expires_at = row.expires_at if row.expires_at.tzinfo is not None else row.expires_at.replace(tzinfo=timezone.utc)
+    if effective_expires_at is not None:
+        delta_seconds = (effective_expires_at - now_at).total_seconds()
         days_left = max(int(ceil(delta_seconds / 86400)), 0)
+        if row.validity_days and row.validity_days > 0:
+            days_left = min(days_left, int(row.validity_days))
     country_code = row.order_item.country_code if row.order_item is not None else None
     country_name = row.order_item.country_name if row.order_item is not None else None
     return {
@@ -350,7 +362,8 @@ def _serialize_profile(row: ESimProfile, *, now: datetime) -> dict[str, Any]:
         "status": status_value,
         "installed": bool(row.installed),
         "installedAt": _to_utc_z(row.installed_at),
-        "activatedAt": _to_utc_z(row.activated_at),
+        "activatedAt": _to_utc_z(activated_at),
+        "bundleExpiresAt": _to_utc_z(bundle_expires_at),
         "expiresAt": _to_utc_z(row.expires_at),
         "totalDataMb": total_data_mb,
         "packageDataMb": package_data_mb,

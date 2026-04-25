@@ -243,6 +243,38 @@ class UserScopedReadsTest(unittest.TestCase):
             self.assertIsNone(profile["activatedAt"])
             self.assertIsNone(profile["daysLeft"])
 
+    def test_profiles_my_days_left_prefers_bundle_validity_over_provider_expiry(self) -> None:
+        now = utcnow()
+        with self.session_factory() as session:
+            profile = session.scalar(select(ESimProfile).where(ESimProfile.iccid == "ICCID-USER2"))
+            assert profile is not None
+            profile.app_status = "ACTIVE"
+            profile.activated_at = now
+            profile.validity_days = 7
+            # Simulate long provider retention/expiry window.
+            profile.expires_at = now + timedelta(days=180)
+            session.commit()
+
+        admin_token = self._token(
+            subject_id="11111111-1111-1111-1111-111111111111",
+            phone="+9647700000001",
+            subject_type="admin",
+        )
+
+        with TestClient(create_app()) as client:
+            response = client.get(
+                "/api/v1/esim-access/profiles/my?userId=33333333-3333-3333-3333-333333333333",
+                headers={"Authorization": f"Bearer {admin_token}"},
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            profile = payload["data"]["profiles"][0]
+            self.assertEqual(profile["status"], "active")
+            self.assertIsNotNone(profile["activatedAt"])
+            self.assertEqual(profile["daysLeft"], 7)
+            self.assertIsNotNone(profile["bundleExpiresAt"])
+            self.assertIsNotNone(profile["expiresAt"])
+
     def test_profiles_my_user_token_forbids_other_user_filter(self) -> None:
         token = self._token(
             subject_id="22222222-2222-2222-2222-222222222222",
