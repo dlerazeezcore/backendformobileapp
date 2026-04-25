@@ -239,7 +239,7 @@ class UserScopedReadsTest(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             payload = response.json()
             profile = payload["data"]["profiles"][0]
-            self.assertEqual(profile["status"], "got_resource")
+            self.assertEqual(profile["status"], "inactive")
             self.assertIsNone(profile["activatedAt"])
             self.assertIsNone(profile["daysLeft"])
 
@@ -249,6 +249,8 @@ class UserScopedReadsTest(unittest.TestCase):
             profile = session.scalar(select(ESimProfile).where(ESimProfile.iccid == "ICCID-USER2"))
             assert profile is not None
             profile.app_status = "ACTIVE"
+            profile.installed = True
+            profile.installed_at = now
             profile.activated_at = now
             profile.validity_days = 7
             # Simulate long provider retention/expiry window.

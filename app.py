@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 import inspect
 import logging
+import uuid
 from typing import AsyncIterator
 
 from fastapi import FastAPI, HTTPException, Request
@@ -76,6 +77,34 @@ LOGGER = logging.getLogger("uvicorn.error")
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
+    def _error_envelope(
+        *,
+        status_code: int,
+        detail: object,
+        error_code: str | None = None,
+        request_id: str | None = None,
+        extra: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        trace_id = request_id or str(uuid.uuid4())
+        if isinstance(detail, dict):
+            message = str(detail.get("message") or detail.get("detail") or detail.get("error") or "Request failed.")
+            inferred_code = str(detail.get("code") or detail.get("errorCode") or f"HTTP_{status_code}")
+        else:
+            message = str(detail)
+            inferred_code = f"HTTP_{status_code}"
+        payload: dict[str, object] = {
+            "success": False,
+            "data": None,
+            "errorCode": error_code or inferred_code,
+            "message": message,
+            "detail": detail,
+            "requestId": trace_id,
+            "traceId": trace_id,
+        }
+        if extra:
+            payload.update(extra)
+        return payload
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         cfg = settings or get_settings()
@@ -155,19 +184,36 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.exception_handler(HTTPException)
     async def handle_http_exception(request: Request, exc: HTTPException) -> JSONResponse:
         _ = request
-        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=_error_envelope(status_code=exc.status_code, detail=exc.detail),
+        )
 
     @app.exception_handler(ESimAccessHTTPError)
     async def handle_http_error(request: Request, exc: ESimAccessHTTPError) -> JSONResponse:
         _ = request
-        return JSONResponse(status_code=502, content={"detail": str(exc)})
+        return JSONResponse(
+            status_code=502,
+            content=_error_envelope(
+                status_code=502,
+                detail=str(exc),
+                error_code="ESIM_PROVIDER_UNREACHABLE",
+                request_id=exc.request_id,
+            ),
+        )
 
     @app.exception_handler(ESimAccessAPIError)
     async def handle_api_error(request: Request, exc: ESimAccessAPIError) -> JSONResponse:
         _ = request
         return JSONResponse(
             status_code=502,
-            content={"detail": str(exc), "errorCode": exc.error_code, "errorMessage": exc.error_message},
+            content=_error_envelope(
+                status_code=502,
+                detail=str(exc),
+                error_code=exc.error_code or "ESIM_PROVIDER_ERROR",
+                request_id=exc.request_id,
+                extra={"errorMessage": exc.error_message},
+            ),
         )
 
     @app.exception_handler(FIBPaymentHTTPError)

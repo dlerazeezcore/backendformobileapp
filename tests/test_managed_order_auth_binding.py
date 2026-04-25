@@ -135,6 +135,8 @@ class ManagedOrderAuthBindingTest(unittest.TestCase):
             },
         )
         self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json().get("success"))
+        self.assertEqual(response.json().get("providerOrderNo"), "ORD-PROVIDER-1")
         order_id = response.json()["database"]["customerOrderId"]
         with self.session_factory() as session:
             order = session.scalar(select(CustomerOrder).where(CustomerOrder.id == order_id))

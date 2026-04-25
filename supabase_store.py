@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -576,6 +577,31 @@ class ESimProfile(TimeMixin, Base):
     payload_snapshots: Mapped[list["ProviderPayloadSnapshot"]] = relationship(back_populates="profile")
 
 
+@dataclass
+class ProfileInventoryRow:
+    id: int | str
+    order_item_id: int | None
+    user_id: str | None
+    esim_tran_no: str | None
+    iccid: str | None
+    activation_code: str | None
+    install_url: str | None
+    provider_status: str | None
+    app_status: str | None
+    installed: bool
+    total_data_mb: int | None
+    used_data_mb: int | None
+    remaining_data_mb: int | None
+    validity_days: int | None
+    installed_at: datetime | None
+    activated_at: datetime | None
+    expires_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+    custom_fields: dict[str, Any]
+    order_item: OrderItem | None = None
+
+
 class ESimLifecycleEvent(TimeMixin, Base):
     __tablename__ = "esim_lifecycle_events"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -748,6 +774,159 @@ class SupabaseStore:
         merged = dict(base or {})
         merged.update(incoming or {})
         return merged
+
+    @staticmethod
+    def _custom_int(custom_fields: dict[str, Any] | None, keys: tuple[str, ...]) -> int | None:
+        if not isinstance(custom_fields, dict):
+            return None
+        for key in keys:
+            parsed = parse_provider_int(custom_fields.get(key))
+            if parsed is not None:
+                return parsed
+        return None
+
+    def _resolve_validity_days(
+        self,
+        *,
+        profile_custom_fields: dict[str, Any] | None,
+        order_item_custom_fields: dict[str, Any] | None,
+        order_request: dict[str, Any] | None = None,
+    ) -> int | None:
+        validity_keys = (
+            "validityDays",
+            "validity_days",
+            "bundleValidityDays",
+            "bundle_validity_days",
+            "durationDays",
+            "duration_days",
+            "totalDuration",
+        )
+        validity_days = self._custom_int(profile_custom_fields, validity_keys)
+        if validity_days is None:
+            validity_days = self._custom_int(order_item_custom_fields, validity_keys)
+        if validity_days is None and isinstance(order_request, dict):
+            package_info = (order_request.get("packageInfoList") or [{}])[0]
+            validity_days = parse_provider_int(package_info.get("periodNum"))
+        if validity_days is not None and validity_days > 0:
+            return int(validity_days)
+        return None
+
+    def _resolve_support_topup_type(
+        self,
+        *,
+        profile_custom_fields: dict[str, Any] | None,
+        order_item_custom_fields: dict[str, Any] | None,
+    ) -> int:
+        keys = (
+            "supportTopUpType",
+            "support_top_up_type",
+            "topupSupportType",
+            "topUpType",
+        )
+        value = self._custom_int(profile_custom_fields, keys)
+        if value is None:
+            value = self._custom_int(order_item_custom_fields, keys)
+        if value is None:
+            return 0
+        return max(int(value), 0)
+
+    def _build_order_item_checkout_snapshot(
+        self,
+        *,
+        order_request: dict[str, Any],
+        provider_response: dict[str, Any],
+        order_item: OrderItem,
+    ) -> dict[str, Any]:
+        provider_obj = provider_response.get("obj") or {}
+        package_info = (order_request.get("packageInfoList") or [{}])[0]
+        return {
+            "transactionId": order_request.get("transactionId") or order_item.provider_transaction_id,
+            "providerOrderNo": provider_obj.get("orderNo") or order_item.provider_order_no,
+            "providerTransactionId": provider_obj.get("transactionId") or order_item.provider_transaction_id,
+            "packageInfo": package_info,
+            "orderRequest": order_request,
+            "providerResponse": provider_response,
+        }
+
+    def _build_order_item_package_metadata(self, order_item: OrderItem) -> dict[str, Any]:
+        return {
+            "packageCode": order_item.package_code,
+            "packageSlug": order_item.package_slug,
+            "packageName": order_item.package_name,
+            "countryCode": order_item.country_code,
+            "countryName": order_item.country_name,
+        }
+
+    @staticmethod
+    def _coerce_datetime(value: Any) -> datetime | None:
+        if isinstance(value, datetime):
+            return value if value.tzinfo is not None else value.replace(tzinfo=APP_TIMEZONE)
+        if isinstance(value, str):
+            return parse_provider_datetime(value)
+        return None
+
+    @staticmethod
+    def _coerce_bool(value: Any, *, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        lowered = str(value).strip().lower()
+        if lowered in {"true", "1", "yes", "y", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "n", "off"}:
+            return False
+        return default
+
+    def _build_fallback_profile_inventory_row(self, *, order_item: OrderItem) -> ProfileInventoryRow:
+        custom_fields = dict(order_item.custom_fields or {})
+        package_metadata = custom_fields.get("packageMetadata")
+        if not isinstance(package_metadata, dict):
+            package_metadata = self._build_order_item_package_metadata(order_item)
+        custom_fields["packageMetadata"] = package_metadata
+        if "checkoutSnapshot" not in custom_fields:
+            custom_fields["checkoutSnapshot"] = None
+
+        customer_order = order_item.customer_order
+        status_value = order_item.item_status or (customer_order.order_status if customer_order is not None else None) or "BOOKED"
+        installed_raw: Any = None
+        for candidate_key in ("installed", "isInstalled", "installedFlag"):
+            if candidate_key in custom_fields:
+                installed_raw = custom_fields.get(candidate_key)
+                break
+        installed = self._coerce_bool(installed_raw)
+        installed_at = self._coerce_datetime(custom_fields.get("installedAt") or custom_fields.get("installed_at"))
+        activated_at = self._coerce_datetime(custom_fields.get("activatedAt") or custom_fields.get("activated_at"))
+        expires_at = self._coerce_datetime(custom_fields.get("expiresAt") or custom_fields.get("expires_at"))
+        validity_days = self._resolve_validity_days(
+            profile_custom_fields=custom_fields,
+            order_item_custom_fields=custom_fields,
+        )
+        return ProfileInventoryRow(
+            id=f"fallback-{order_item.id}",
+            order_item_id=order_item.id,
+            user_id=customer_order.user_id if customer_order is not None else None,
+            esim_tran_no=(custom_fields.get("esimTranNo") or custom_fields.get("esim_tran_no")),
+            iccid=(custom_fields.get("iccid") or custom_fields.get("ICCID")),
+            activation_code=(custom_fields.get("activationCode") or custom_fields.get("activation_code")),
+            install_url=(custom_fields.get("installUrl") or custom_fields.get("install_url")),
+            provider_status=order_item.provider_status,
+            app_status=status_value,
+            installed=installed,
+            total_data_mb=self._custom_int(custom_fields, ("packageDataMb", "totalDataMb", "total_data_mb")),
+            used_data_mb=self._custom_int(custom_fields, ("usedDataMb", "used_data_mb")),
+            remaining_data_mb=self._custom_int(custom_fields, ("remainingDataMb", "remaining_data_mb")),
+            validity_days=validity_days,
+            installed_at=installed_at,
+            activated_at=activated_at,
+            expires_at=expires_at,
+            created_at=order_item.booked_at or order_item.created_at,
+            updated_at=order_item.updated_at,
+            custom_fields=custom_fields,
+            order_item=order_item,
+        )
 
     def ensure_user(
         self,
@@ -2009,8 +2188,25 @@ class SupabaseStore:
         item.applied_discount_rule_basis = discount_rule.applies_to if discount_rule else None
         item.booked_at = now
         item.last_provider_sync_at = now
-        item.custom_fields = custom_fields or {}
+        checkout_snapshot = self._build_order_item_checkout_snapshot(
+            order_request=order_request,
+            provider_response=provider_response,
+            order_item=item,
+        )
+        package_metadata = self._build_order_item_package_metadata(item)
+        item.custom_fields = self._merge_json_dict(
+            custom_fields or {},
+            {
+                "checkoutSnapshot": checkout_snapshot,
+                "packageMetadata": package_metadata,
+            },
+        )
         self.session.flush()
+        self.ensure_profile_placeholder_for_order_item(
+            order_item=item,
+            order_request=order_request,
+            provider_response=provider_response,
+        )
         self.add_event(
             customer_order=order,
             order_item=item,
@@ -2048,6 +2244,38 @@ class SupabaseStore:
         else:
             self.session.flush()
         return order, item
+
+    def ensure_profile_placeholder_for_order_item(
+        self,
+        *,
+        order_item: OrderItem,
+        order_request: dict[str, Any] | None = None,
+        provider_response: dict[str, Any] | None = None,
+    ) -> ESimProfile:
+        profile = self.session.scalar(select(ESimProfile).where(ESimProfile.order_item_id == order_item.id))
+        if profile is None:
+            profile = ESimProfile(order_item=order_item)
+            self.session.add(profile)
+        customer_order = order_item.customer_order
+        profile.user = customer_order.user if customer_order is not None else None
+        profile.user_id = customer_order.user_id if customer_order is not None else profile.user_id
+        profile.app_status = profile.app_status or order_item.item_status or "BOOKED"
+        profile.provider_status = profile.provider_status or order_item.provider_status
+        profile.installed = bool(profile.installed)
+        if profile.validity_days is None:
+            profile.validity_days = self._resolve_validity_days(
+                profile_custom_fields=profile.custom_fields,
+                order_item_custom_fields=order_item.custom_fields,
+                order_request=order_request,
+            )
+
+        provider_obj = (provider_response or {}).get("obj") or {}
+        profile.activation_code = profile.activation_code or provider_obj.get("ac")
+        profile.install_url = profile.install_url or provider_obj.get("shortUrl") or provider_obj.get("installUrl")
+        profile.last_provider_sync_at = profile.last_provider_sync_at or utcnow()
+        profile.custom_fields = self._merge_json_dict(profile.custom_fields, order_item.custom_fields or {})
+        self.session.flush()
+        return profile
 
     def sync_profiles(
         self,
@@ -2144,7 +2372,10 @@ class SupabaseStore:
             profile.total_data_mb = total_data_mb
             profile.used_data_mb = used_data_mb
             profile.remaining_data_mb = remaining_data_mb
-            profile.validity_days = validity_days
+            profile.validity_days = validity_days or self._resolve_validity_days(
+                profile_custom_fields=profile.custom_fields,
+                order_item_custom_fields=order_item.custom_fields,
+            )
             if used_data_mb not in (None, 0) and profile.activated_at is None:
                 profile.activated_at = utcnow()
             if expires_at is not None:
@@ -2152,11 +2383,18 @@ class SupabaseStore:
             elif profile.activated_at is not None and validity_days and profile.expires_at is None:
                 profile.expires_at = profile.activated_at + timedelta(days=validity_days)
             profile.last_provider_sync_at = utcnow()
+            support_topup_type = self._resolve_support_topup_type(
+                profile_custom_fields=profile.custom_fields,
+                order_item_custom_fields=order_item.custom_fields,
+            )
             profile.custom_fields = self._merge_json_dict(
                 profile.custom_fields,
                 {
                     "usageUnit": "MB",
                     "packageDataMb": total_data_mb,
+                    "supportTopUpType": support_topup_type,
+                    "packageMetadata": self._build_order_item_package_metadata(order_item),
+                    "checkoutSnapshot": (order_item.custom_fields or {}).get("checkoutSnapshot"),
                 },
             )
             order_item.item_status = profile.app_status or order_item.item_status
@@ -2691,31 +2929,131 @@ class SupabaseStore:
         self,
         *,
         user_id: str,
-        limit: int = 100,
-        offset: int = 0,
-        status: str | None = None,
-        installed: bool | None = None,
-    ) -> tuple[list[ESimProfile], int]:
-        effective_limit = max(1, min(limit, 500))
-        effective_offset = max(0, offset)
-
-        query = select(ESimProfile).where(ESimProfile.user_id == user_id)
-        if status is not None and status.strip():
-            normalized_status = status.strip().upper()
-            query = query.where(func.upper(func.coalesce(ESimProfile.app_status, "")) == normalized_status)
-        if installed is not None:
-            query = query.where(ESimProfile.installed.is_(installed))
-
-        count_query = select(func.count()).select_from(query.subquery())
-        total = int(self.session.scalar(count_query) or 0)
-
-        rows = self.session.scalars(
-            query
+    ) -> list[ESimProfile | ProfileInventoryRow]:
+        profile_rows = self.session.scalars(
+            select(ESimProfile)
+            .outerjoin(OrderItem, ESimProfile.order_item_id == OrderItem.id)
+            .outerjoin(CustomerOrder, OrderItem.customer_order_id == CustomerOrder.id)
+            .where(
+                or_(
+                    ESimProfile.user_id == user_id,
+                    CustomerOrder.user_id == user_id,
+                )
+            )
             .order_by(ESimProfile.updated_at.desc(), ESimProfile.id.desc())
-            .offset(effective_offset)
-            .limit(effective_limit)
         ).all()
-        return rows, total
+
+        deduped_profiles: dict[str, ESimProfile] = {}
+        for profile in profile_rows:
+            order_item = profile.order_item
+            custom_fields = profile.custom_fields if isinstance(profile.custom_fields, dict) else {}
+            provider_order_no = (
+                order_item.provider_order_no
+                if order_item is not None
+                else custom_fields.get("providerOrderNo") or custom_fields.get("provider_order_no")
+            )
+            key = (
+                (f"iccid:{profile.iccid.strip().upper()}" if profile.iccid and profile.iccid.strip() else None)
+                or (f"esim:{profile.esim_tran_no.strip().upper()}" if profile.esim_tran_no and profile.esim_tran_no.strip() else None)
+                or (f"order:{provider_order_no.strip().upper()}" if provider_order_no and provider_order_no.strip() else None)
+                or (f"order_item:{profile.order_item_id}" if profile.order_item_id is not None else None)
+                or f"profile:{profile.id}"
+            )
+            existing = deduped_profiles.get(key)
+            if existing is None:
+                deduped_profiles[key] = profile
+                continue
+            existing_ts = existing.updated_at or existing.created_at
+            candidate_ts = profile.updated_at or profile.created_at
+            if candidate_ts >= existing_ts:
+                deduped_profiles[key] = profile
+
+        merged_rows: list[ESimProfile | ProfileInventoryRow] = list(deduped_profiles.values())
+        profile_order_item_ids = {
+            int(profile.order_item_id)
+            for profile in merged_rows
+            if isinstance(profile, ESimProfile) and profile.order_item_id is not None
+        }
+        profile_provider_order_nos = {
+            str(
+                profile.order_item.provider_order_no
+                if profile.order_item is not None
+                else (
+                    profile.custom_fields.get("providerOrderNo")
+                    if isinstance(profile.custom_fields, dict)
+                    else None
+                )
+                or (
+                    profile.custom_fields.get("provider_order_no")
+                    if isinstance(profile.custom_fields, dict)
+                    else None
+                )
+            ).strip().upper()
+            for profile in merged_rows
+            if isinstance(profile, ESimProfile)
+            and (
+                (profile.order_item is not None and profile.order_item.provider_order_no)
+                or (isinstance(profile.custom_fields, dict) and (profile.custom_fields.get("providerOrderNo") or profile.custom_fields.get("provider_order_no")))
+            )
+            and str(
+                profile.order_item.provider_order_no
+                if profile.order_item is not None
+                else (
+                    profile.custom_fields.get("providerOrderNo")
+                    if isinstance(profile.custom_fields, dict)
+                    else None
+                )
+                or (
+                    profile.custom_fields.get("provider_order_no")
+                    if isinstance(profile.custom_fields, dict)
+                    else None
+                )
+            ).strip()
+        }
+
+        order_items = self.session.scalars(
+            select(OrderItem)
+            .join(CustomerOrder, OrderItem.customer_order_id == CustomerOrder.id)
+            .where(
+                CustomerOrder.user_id == user_id,
+                OrderItem.service_type == "esim",
+            )
+            .order_by(
+                func.coalesce(OrderItem.booked_at, OrderItem.created_at).desc(),
+                OrderItem.id.desc(),
+            )
+        ).all()
+
+        for order_item in order_items:
+            if order_item.id in profile_order_item_ids:
+                continue
+            provider_order_no = str(order_item.provider_order_no or "").strip().upper()
+            if provider_order_no and provider_order_no in profile_provider_order_nos:
+                continue
+            merged_rows.append(self._build_fallback_profile_inventory_row(order_item=order_item))
+
+        def _sort_timestamp(row: ESimProfile | ProfileInventoryRow) -> datetime:
+            if isinstance(row, ESimProfile):
+                order_item = row.order_item
+                customer_order = order_item.customer_order if order_item is not None else None
+                return (
+                    (order_item.booked_at if order_item is not None else None)
+                    or (customer_order.booked_at if customer_order is not None else None)
+                    or row.created_at
+                )
+            order_item = row.order_item
+            customer_order = order_item.customer_order if order_item is not None else None
+            return (
+                (order_item.booked_at if order_item is not None else None)
+                or (customer_order.booked_at if customer_order is not None else None)
+                or row.created_at
+            )
+
+        merged_rows.sort(
+            key=lambda row: (_sort_timestamp(row), row.updated_at, str(row.id)),
+            reverse=True,
+        )
+        return merged_rows
 
     def save_payload(
         self,

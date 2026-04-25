@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 
 from auth import get_token_claims, require_active_subject
 from config import get_settings
-from supabase_store import AdminUser, AppUser, ESimProfile, PaymentAttempt, SupabaseStore, utcnow
+from supabase_store import AdminUser, AppUser, ESimProfile, PaymentAttempt, ProfileInventoryRow, SupabaseStore, utcnow
 from users import UserPayload
 
 
@@ -95,13 +95,37 @@ def _to_utc_z(value: datetime | None) -> str | None:
     return normalized.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _normalize_status(value: str | None) -> str:
-    raw = str(value or "").strip().lower()
-    if not raw:
+def _canonical_lifecycle_status(
+    *,
+    raw_status: str | None,
+    installed: bool,
+    activated_at: datetime | None,
+    bundle_expires_at: datetime | None,
+    expires_at: datetime | None,
+    now: datetime,
+) -> str:
+    raw = str(raw_status or "").strip().lower()
+    now_at = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+    if bundle_expires_at is not None:
+        normalized_bundle_expires_at = (
+            bundle_expires_at
+            if bundle_expires_at.tzinfo is not None
+            else bundle_expires_at.replace(tzinfo=timezone.utc)
+        )
+        if normalized_bundle_expires_at <= now_at:
+            return "expired"
+    elif activated_at is not None and expires_at is not None:
+        normalized_expires_at = expires_at if expires_at.tzinfo is not None else expires_at.replace(tzinfo=timezone.utc)
+        if normalized_expires_at <= now_at:
+            return "expired"
+
+    if raw in {"expired", "cancelled", "canceled", "revoked", "refunded", "voided", "closed"}:
+        return "expired"
+    if raw in {"booked", "got_resource", "released", "pending_install", "pending", "inactive", "created"} or not raw:
         return "inactive"
-    if raw == "canceled":
-        return "cancelled"
-    return raw
+    if raw in {"active", "installed", "suspended"}:
+        return "active" if installed and activated_at is not None else "inactive"
+    return "inactive"
 
 
 def _format_number_as_string(value: float | int | str | None, fallback: str) -> str:
@@ -288,8 +312,37 @@ def _to_bool(value: Any, *, default: bool) -> bool:
     return default
 
 
-def _serialize_profile(row: ESimProfile, *, now: datetime) -> dict[str, Any]:
+def _resolve_support_topup_type(custom_fields: dict[str, Any]) -> int:
+    for key in ("supportTopUpType", "support_top_up_type", "topupSupportType", "topUpType"):
+        raw = custom_fields.get(key)
+        parsed = _as_int(raw)
+        if parsed is not None:
+            return max(int(parsed), 0)
+    return 0
+
+
+def _serialize_profile(row: ESimProfile | ProfileInventoryRow, *, now: datetime) -> dict[str, Any]:
     custom_fields = row.custom_fields or {}
+    if not isinstance(custom_fields, dict):
+        custom_fields = {}
+    custom_fields = dict(custom_fields)
+    order_item = getattr(row, "order_item", None)
+    if "checkoutSnapshot" not in custom_fields:
+        custom_fields["checkoutSnapshot"] = (order_item.custom_fields or {}).get("checkoutSnapshot") if order_item is not None else None
+    if "packageMetadata" not in custom_fields:
+        custom_fields["packageMetadata"] = (
+            (order_item.custom_fields or {}).get("packageMetadata")
+            if order_item is not None
+            else None
+        )
+    if custom_fields.get("packageMetadata") is None:
+        custom_fields["packageMetadata"] = {
+            "packageCode": order_item.package_code if order_item is not None else None,
+            "packageSlug": order_item.package_slug if order_item is not None else None,
+            "packageName": order_item.package_name if order_item is not None else None,
+            "countryCode": order_item.country_code if order_item is not None else None,
+            "countryName": order_item.country_name if order_item is not None else None,
+        }
     usage_unit_hint = str(
         custom_fields.get("dataUnit")
         or custom_fields.get("usageUnit")
@@ -331,7 +384,7 @@ def _serialize_profile(row: ESimProfile, *, now: datetime) -> dict[str, Any]:
             return None
         return round(float(value_mb) / 1024.0, 6)
 
-    status_value = _normalize_status(row.app_status or row.provider_status)
+    installed_flag = bool(getattr(row, "installed", False))
     days_left: int | None = None
     now_at = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
     activated_at = (
@@ -351,20 +404,56 @@ def _serialize_profile(row: ESimProfile, *, now: datetime) -> dict[str, Any]:
         days_left = max(int(ceil(delta_seconds / 86400)), 0)
         if row.validity_days and row.validity_days > 0:
             days_left = min(days_left, int(row.validity_days))
-    country_code = row.order_item.country_code if row.order_item is not None else None
-    country_name = row.order_item.country_name if row.order_item is not None else None
+    status_value = _canonical_lifecycle_status(
+        raw_status=row.app_status or row.provider_status,
+        installed=installed_flag,
+        activated_at=activated_at,
+        bundle_expires_at=bundle_expires_at,
+        expires_at=row.expires_at,
+        now=now_at,
+    )
+    if status_value == "expired" and days_left is None and activated_at is not None:
+        days_left = 0
+    package_metadata = custom_fields.get("packageMetadata") if isinstance(custom_fields.get("packageMetadata"), dict) else {}
+    country_code = (
+        row.order_item.country_code
+        if row.order_item is not None
+        else custom_fields.get("countryCode") or package_metadata.get("countryCode")
+    )
+    country_name = (
+        row.order_item.country_name
+        if row.order_item is not None
+        else custom_fields.get("countryName") or package_metadata.get("countryName")
+    )
+    provider_order_no = (
+        row.order_item.provider_order_no
+        if row.order_item is not None
+        else custom_fields.get("providerOrderNo") or custom_fields.get("provider_order_no")
+    )
+    support_topup_type = _resolve_support_topup_type(custom_fields)
     return {
         "id": row.id,
         "userId": row.user_id,
+        "user_id": row.user_id,
+        "providerOrderNo": provider_order_no,
+        "provider_order_no": provider_order_no,
+        "esimTranNo": row.esim_tran_no,
+        "esim_tran_no": row.esim_tran_no,
         "iccid": row.iccid,
         "countryCode": country_code,
+        "country_code": country_code,
         "countryName": country_name,
+        "country_name": country_name,
         "status": status_value,
-        "installed": bool(row.installed),
+        "installed": installed_flag,
         "installedAt": _to_utc_z(row.installed_at),
+        "installed_at": _to_utc_z(row.installed_at),
         "activatedAt": _to_utc_z(activated_at),
+        "activated_at": _to_utc_z(activated_at),
         "bundleExpiresAt": _to_utc_z(bundle_expires_at),
+        "bundle_expires_at": _to_utc_z(bundle_expires_at),
         "expiresAt": _to_utc_z(row.expires_at),
+        "expires_at": _to_utc_z(row.expires_at),
         "totalDataMb": total_data_mb,
         "packageDataMb": package_data_mb,
         "usedDataMb": used_data_mb,
@@ -375,10 +464,13 @@ def _serialize_profile(row: ESimProfile, *, now: datetime) -> dict[str, Any]:
         "dataUnit": "MB",
         "usageUnit": "MB",
         "daysLeft": days_left,
+        "supportTopUpType": support_topup_type,
         "activationCode": row.activation_code,
+        "activation_code": row.activation_code,
         "installUrl": row.install_url,
-        "esimTranNo": row.esim_tran_no,
+        "install_url": row.install_url,
         "customFields": custom_fields,
+        "custom_fields": custom_fields,
     }
 
 
@@ -1175,13 +1267,36 @@ def register_esim_access_routes(
         db.refresh(order_item)
         if payment_attempt is not None:
             db.refresh(payment_attempt)
-        return {
+        profiles_synced = 0
+        profile_sync_error: str | None = None
+        profile_sync_triggered = bool(order_item.provider_order_no)
+        if profile_sync_triggered and hasattr(provider, "query_profiles"):
+            try:
+                provider_sync_response = await provider.query_profiles(ProfileQueryRequest(order_no=order_item.provider_order_no))
+                synced = store.sync_profiles(
+                    provider_sync_response.model_dump(by_alias=True, exclude_none=True),
+                    platform_code=payload.platform_code,
+                    platform_name=payload.platform_name,
+                    actor_phone=auth_user.phone,
+                )
+                profiles_synced = len(synced)
+                db.refresh(order_item)
+            except Exception as exc:  # pragma: no cover - best-effort sync hardening
+                db.rollback()
+                profile_sync_error = str(exc)
+                db.refresh(customer_order)
+                db.refresh(order_item)
+                if payment_attempt is not None:
+                    db.refresh(payment_attempt)
+
+        response_payload = {
             "provider": provider_response_payload,
             "database": {
                 "customerOrderId": customer_order.id,
                 "orderNumber": customer_order.order_number,
                 "orderItemId": order_item.id,
                 "providerOrderNo": order_item.provider_order_no,
+                "orderNo": order_item.provider_order_no,
                 "pricing": {
                     "currencyCode": customer_order.currency_code,
                     "exchangeRate": customer_order.exchange_rate,
@@ -1202,7 +1317,19 @@ def register_esim_access_routes(
                     if payment_attempt is not None
                     else None
                 ),
+                "profileSync": {
+                    "triggered": profile_sync_triggered,
+                    "profilesSynced": profiles_synced,
+                    "error": profile_sync_error,
+                },
             },
+        }
+        return {
+            "success": True,
+            "data": response_payload,
+            "providerOrderNo": order_item.provider_order_no,
+            "orderNo": order_item.provider_order_no,
+            **response_payload,
         }
 
     @app.post("/api/v1/esim-access/profiles/query")
@@ -1516,18 +1643,24 @@ def register_esim_access_routes(
         actor = require_active_subject(db, claims=claims)
         target_user_id = _resolve_target_user_id(actor=actor, claims=claims, requested_user_id=user_id)
         store = SupabaseStore(db)
-        rows, total = store.list_profiles_for_user(
-            user_id=target_user_id,
-            limit=limit,
-            offset=offset,
-            status=status,
-            installed=installed,
-        )
+        rows = store.list_profiles_for_user(user_id=target_user_id)
         now = utcnow()
+        serialized = [_serialize_profile(row, now=now) for row in rows]
+        if status is not None and status.strip():
+            normalized_status = status.strip().lower()
+            if normalized_status in {"booked", "got_resource", "released", "pending_install", "pending"}:
+                normalized_status = "inactive"
+            if normalized_status in {"cancelled", "canceled", "revoked", "refunded", "voided", "closed"}:
+                normalized_status = "expired"
+            serialized = [row for row in serialized if str(row.get("status") or "").strip().lower() == normalized_status]
+        if installed is not None:
+            serialized = [row for row in serialized if bool(row.get("installed")) is installed]
+        total = len(serialized)
+        paged_profiles = serialized[offset : offset + limit]
         return {
             "success": True,
             "data": {
-                "profiles": [_serialize_profile(row, now=now) for row in rows],
+                "profiles": paged_profiles,
                 "limit": limit,
                 "offset": offset,
                 "total": total,
