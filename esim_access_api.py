@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 from math import ceil
 import re
 import uuid
@@ -22,6 +23,8 @@ from auth import get_token_claims, require_active_subject
 from config import get_settings
 from supabase_store import AdminUser, AppUser, ESimProfile, OrderItem, PaymentAttempt, ProfileInventoryRow, SupabaseStore, utcnow
 from users import UserPayload
+
+LOGGER = logging.getLogger("uvicorn.error")
 
 
 class ESimAccessError(Exception):
@@ -156,6 +159,38 @@ def _as_int(value: Any) -> int | None:
         return int(float(text))
     except ValueError:
         return None
+
+
+def _dedupe_esim_tran_nos(values: list[str | None]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = str(value or "").strip()
+        if not normalized:
+            continue
+        key = normalized.upper()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(normalized)
+    return deduped
+
+
+def _chunk_values(values: list[str], *, size: int) -> list[list[str]]:
+    if size <= 0:
+        return [values]
+    return [values[index : index + size] for index in range(0, len(values), size)]
+
+
+def _collect_esim_tran_nos(rows: list[ESimProfile | ProfileInventoryRow]) -> list[str]:
+    candidates: list[str | None] = []
+    for row in rows:
+        candidates.append(getattr(row, "esim_tran_no", None))
+        custom_fields = getattr(row, "custom_fields", None)
+        if isinstance(custom_fields, dict):
+            candidates.append(custom_fields.get("esimTranNo"))
+            candidates.append(custom_fields.get("esim_tran_no"))
+    return _dedupe_esim_tran_nos(candidates)
 
 
 def _bytes_to_mb(value: int | None) -> int | None:
@@ -1182,6 +1217,10 @@ def register_esim_access_routes(
     get_db: Callable[..., Any],
     get_provider: Callable[..., ESimAccessAPI],
 ) -> None:
+    usage_sync_interval_seconds = 3600
+    usage_sync_batch_size = 50
+    usage_sync_lock = asyncio.Lock()
+
     async def _require_admin_actor(
         claims: dict[str, Any] = Depends(get_token_claims),
         db: Session = Depends(get_db),
@@ -1210,6 +1249,141 @@ def register_esim_access_routes(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found.")
         if profile.user_id != actor.id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Profile ownership mismatch.")
+
+    def _serialize_profiles_for_user(
+        *,
+        store: SupabaseStore,
+        user_id: str,
+        limit: int,
+        offset: int,
+        status_filter: str | None,
+        installed_filter: bool | None,
+    ) -> dict[str, Any]:
+        rows = store.list_profiles_for_user(user_id=user_id)
+        now = utcnow()
+        serialized = [_serialize_profile(row, now=now) for row in rows]
+        if status_filter is not None and status_filter.strip():
+            normalized_status = status_filter.strip().lower()
+            if normalized_status in {"booked", "got_resource", "released", "pending_install", "pending"}:
+                normalized_status = "inactive"
+            if normalized_status in {"cancelled", "canceled", "revoked", "refunded", "voided", "closed"}:
+                normalized_status = "expired"
+            serialized = [row for row in serialized if str(row.get("status") or "").strip().lower() == normalized_status]
+        if installed_filter is not None:
+            serialized = [row for row in serialized if bool(row.get("installed")) is installed_filter]
+        total = len(serialized)
+        paged_profiles = serialized[offset : offset + limit]
+        return {
+            "profiles": paged_profiles,
+            "limit": limit,
+            "offset": offset,
+            "total": total,
+        }
+
+    async def _sync_usage_for_esim_tran_nos(
+        *,
+        db: Session,
+        provider: ESimAccessAPI,
+        esim_tran_nos: list[str],
+        actor_phone: str | None,
+    ) -> dict[str, int]:
+        unique_esim_tran_nos = _dedupe_esim_tran_nos(esim_tran_nos)
+        if not unique_esim_tran_nos:
+            return {
+                "esimTranNosRequested": 0,
+                "providerCalls": 0,
+                "usageRecordsReceived": 0,
+                "profilesSynced": 0,
+            }
+
+        provider_calls = 0
+        usage_records_received = 0
+        synced_profile_ids: set[int] = set()
+        for batch in _chunk_values(unique_esim_tran_nos, size=usage_sync_batch_size):
+            provider_calls += 1
+            provider_response = await provider.usage_check(UsageCheckRequest(esimTranNoList=batch))
+            provider_payload = provider_response.model_dump(by_alias=True, exclude_none=True)
+            usage_records = ((provider_payload.get("obj") or {}).get("esimUsageList") or [])
+            usage_records_received += len(usage_records)
+            synced_profiles = SupabaseStore(db).sync_usage_records(provider_payload, actor_phone=actor_phone)
+            for profile in synced_profiles:
+                if profile.id is not None:
+                    synced_profile_ids.add(int(profile.id))
+        return {
+            "esimTranNosRequested": len(unique_esim_tran_nos),
+            "providerCalls": provider_calls,
+            "usageRecordsReceived": usage_records_received,
+            "profilesSynced": len(synced_profile_ids),
+        }
+
+    def _list_all_esim_tran_nos(db: Session) -> list[str]:
+        values = db.scalars(
+            select(ESimProfile.esim_tran_no).where(ESimProfile.esim_tran_no.is_not(None))
+        ).all()
+        return _dedupe_esim_tran_nos(list(values))
+
+    async def _run_periodic_usage_sync_once() -> dict[str, Any]:
+        session_factory = getattr(app.state, "db_session_factory", None)
+        provider = getattr(app.state, "esim_access_api", None)
+        if session_factory is None or provider is None:
+            return {"enabled": False, "reason": "runtime state unavailable"}
+        if usage_sync_lock.locked():
+            return {"enabled": True, "skipped": True, "reason": "sync already in progress"}
+
+        db = session_factory()
+        try:
+            esim_tran_nos = _list_all_esim_tran_nos(db)
+            async with usage_sync_lock:
+                summary = await _sync_usage_for_esim_tran_nos(
+                    db=db,
+                    provider=provider,
+                    esim_tran_nos=esim_tran_nos,
+                    actor_phone="system:scheduled-usage-sync",
+                )
+            return {"enabled": True, **summary}
+        finally:
+            db.close()
+
+    async def _periodic_usage_sync_worker() -> None:
+        while True:
+            try:
+                summary = await _run_periodic_usage_sync_once()
+                LOGGER.info("Scheduled eSIM usage sync summary: %s", summary)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # pragma: no cover - background worker protection
+                LOGGER.exception("Scheduled eSIM usage sync failed: %s", exc)
+            await asyncio.sleep(usage_sync_interval_seconds)
+
+    @app.on_event("startup")
+    async def _start_periodic_usage_sync_worker() -> None:
+        session_factory = getattr(app.state, "db_session_factory", None)
+        provider = getattr(app.state, "esim_access_api", None)
+        if session_factory is None or provider is None:
+            LOGGER.info("Scheduled eSIM usage sync skipped: runtime state unavailable.")
+            return
+        existing_task = getattr(app.state, "esim_usage_sync_task", None)
+        if existing_task is not None and not existing_task.done():
+            return
+        app.state.esim_usage_sync_task = asyncio.create_task(_periodic_usage_sync_worker())
+        LOGGER.info(
+            "Scheduled eSIM usage sync started: interval=%ss batch_size=%s",
+            usage_sync_interval_seconds,
+            usage_sync_batch_size,
+        )
+
+    @app.on_event("shutdown")
+    async def _stop_periodic_usage_sync_worker() -> None:
+        task = getattr(app.state, "esim_usage_sync_task", None)
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            app.state.esim_usage_sync_task = None
 
     @app.post("/api/v1/esim-access/packages/query")
     async def query_packages(
@@ -1547,11 +1721,12 @@ def register_esim_access_routes(
                 profiles_synced = len(profiles)
             if payload.provider_request.esim_tran_no:
                 usage_request = UsageCheckRequest(esim_tran_no_list=[payload.provider_request.esim_tran_no])
-                usage_response = await provider.usage_check(usage_request)
-                usage_profiles = store.sync_usage_records(
-                    usage_response.model_dump(by_alias=True, exclude_none=True),
-                    actor_phone=payload.actor_phone,
-                )
+                async with usage_sync_lock:
+                    usage_response = await provider.usage_check(usage_request)
+                    usage_profiles = store.sync_usage_records(
+                        usage_response.model_dump(by_alias=True, exclude_none=True),
+                        actor_phone=payload.actor_phone,
+                    )
                 usage_records_synced = len(usage_profiles)
         return {
             "provider": provider_response.model_dump(by_alias=True, exclude_none=True),
@@ -1594,14 +1769,72 @@ def register_esim_access_routes(
         db: Session = Depends(get_db),
         _: AdminUser = Depends(_require_admin_actor),
     ) -> dict[str, Any]:
-        provider_response = await provider.usage_check(payload.provider_request)
-        profiles = SupabaseStore(db).sync_usage_records(
-            provider_response.model_dump(by_alias=True, exclude_none=True),
-            actor_phone=payload.actor_phone,
-        )
+        async with usage_sync_lock:
+            provider_response = await provider.usage_check(payload.provider_request)
+            profiles = SupabaseStore(db).sync_usage_records(
+                provider_response.model_dump(by_alias=True, exclude_none=True),
+                actor_phone=payload.actor_phone,
+            )
         return {
             "provider": provider_response.model_dump(by_alias=True, exclude_none=True),
             "database": {"profilesSynced": len(profiles)},
+        }
+
+    @app.post(
+        "/api/v1/esim-access/usage/sync/my",
+        summary="Refresh usage for caller-owned eSIM profiles",
+        responses={
+            401: {"description": "Missing or invalid bearer token."},
+            403: {"description": "Token subject cannot access the requested user scope."},
+        },
+    )
+    @app.post("/api/v1/esim-access/usage/refresh/my")
+    async def sync_my_usage(
+        provider: ESimAccessAPI = Depends(get_provider),
+        db: Session = Depends(get_db),
+        claims: dict[str, Any] = Depends(get_token_claims),
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+        status: str | None = Query(default=None),
+        installed: bool | None = Query(default=None),
+        user_id: str | None = Query(default=None, alias="userId"),
+    ) -> dict[str, Any]:
+        actor = require_active_subject(db, claims=claims)
+        target_user_id = _resolve_target_user_id(actor=actor, claims=claims, requested_user_id=user_id)
+        store = SupabaseStore(db)
+        existing_rows = store.list_profiles_for_user(user_id=target_user_id)
+        esim_tran_nos = _collect_esim_tran_nos(existing_rows)
+
+        if esim_tran_nos:
+            actor_phone = str(claims.get("phone") or "")
+            async with usage_sync_lock:
+                sync_summary = await _sync_usage_for_esim_tran_nos(
+                    db=db,
+                    provider=provider,
+                    esim_tran_nos=esim_tran_nos,
+                    actor_phone=actor_phone,
+                )
+        else:
+            sync_summary = {
+                "esimTranNosRequested": 0,
+                "providerCalls": 0,
+                "usageRecordsReceived": 0,
+                "profilesSynced": 0,
+            }
+        profile_data = _serialize_profiles_for_user(
+            store=store,
+            user_id=target_user_id,
+            limit=limit,
+            offset=offset,
+            status_filter=status,
+            installed_filter=installed,
+        )
+        return {
+            "success": True,
+            "data": {
+                **profile_data,
+                "sync": sync_summary,
+            },
         }
 
     @app.post("/api/v1/esim-access/locations/query")
@@ -1672,28 +1905,17 @@ def register_esim_access_routes(
         actor = require_active_subject(db, claims=claims)
         target_user_id = _resolve_target_user_id(actor=actor, claims=claims, requested_user_id=user_id)
         store = SupabaseStore(db)
-        rows = store.list_profiles_for_user(user_id=target_user_id)
-        now = utcnow()
-        serialized = [_serialize_profile(row, now=now) for row in rows]
-        if status is not None and status.strip():
-            normalized_status = status.strip().lower()
-            if normalized_status in {"booked", "got_resource", "released", "pending_install", "pending"}:
-                normalized_status = "inactive"
-            if normalized_status in {"cancelled", "canceled", "revoked", "refunded", "voided", "closed"}:
-                normalized_status = "expired"
-            serialized = [row for row in serialized if str(row.get("status") or "").strip().lower() == normalized_status]
-        if installed is not None:
-            serialized = [row for row in serialized if bool(row.get("installed")) is installed]
-        total = len(serialized)
-        paged_profiles = serialized[offset : offset + limit]
+        profile_data = _serialize_profiles_for_user(
+            store=store,
+            user_id=target_user_id,
+            limit=limit,
+            offset=offset,
+            status_filter=status,
+            installed_filter=installed,
+        )
         return {
             "success": True,
-            "data": {
-                "profiles": paged_profiles,
-                "limit": limit,
-                "offset": offset,
-                "total": total,
-            },
+            "data": profile_data,
         }
 
     @app.post(

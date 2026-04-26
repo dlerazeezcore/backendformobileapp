@@ -230,6 +230,62 @@ Queries provider usage and writes it into `esim_profiles`.
 }
 ```
 
+`POST /usage/sync/my`
+
+User-scoped usage refresh. Requires an active bearer token and refreshes only caller-owned profiles (or `userId` when an admin token is used).
+
+```text
+POST /api/v1/esim-access/usage/sync/my
+POST /api/v1/esim-access/usage/refresh/my
+```
+
+Example:
+
+```bash
+curl -X POST "$BASE_URL/api/v1/esim-access/usage/sync/my" \
+  -H "Authorization: Bearer $USER_TOKEN"
+```
+
+Response includes the regular profile list plus sync stats:
+
+```json
+{
+  "success": true,
+  "data": {
+    "profiles": [],
+    "limit": 100,
+    "offset": 0,
+    "total": 0,
+    "sync": {
+      "esimTranNosRequested": 0,
+      "providerCalls": 0,
+      "usageRecordsReceived": 0,
+      "profilesSynced": 0
+    }
+  }
+}
+```
+
+### Scheduled usage sync (Koyeb single instance)
+
+This backend now supports periodic server-side usage sync for long-term production operation on one instance.
+
+Current hardcoded settings in backend code:
+
+```text
+enabled: true
+interval: 3600 seconds (hourly)
+batch size: 50 eSIM transaction numbers per provider call
+```
+
+Behavior:
+
+- Runs on app startup when enabled and runtime state is available.
+- Reads all known `esim_tran_no` values from `esim_profiles`.
+- Calls provider usage query in batches.
+- Persists MB-normalized usage into `esim_profiles`.
+- Uses an internal async lock so scheduled sync, admin sync, top-up post-sync, and user sync do not overlap.
+
 ### Managed user purchase
 
 `POST /orders/managed`
@@ -1100,6 +1156,8 @@ Use `status`, not raw provider status.
 Use `installed`, `activatedAt`, `daysLeft`, and `bundleExpiresAt` for lifecycle UI.
 
 Use `remainingDataMb`, `usedDataMb`, and `totalDataMb` for usage bars.
+
+Call `POST /api/v1/esim-access/usage/sync/my` on app open or pull-to-refresh to force a fresh usage read for the signed-in user.
 
 Use `supportTopUpType > 0` to decide whether to show a top-up affordance. Then call `/packages/query` with `type="TOPUP"` and `iccid`.
 
