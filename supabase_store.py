@@ -705,6 +705,10 @@ def create_database(database_url: str) -> sessionmaker[Session]:
         engine_options: dict[str, Any] = {}
     else:
         connect_args = {"options": "-c timezone=Asia/Baghdad"}
+        if _is_supabase_pooler_url(database_url):
+            # Supabase pooler (PgBouncer) can fail with DuplicatePreparedStatement when
+            # server-side prepared statements are enabled across pooled connections.
+            connect_args["prepare_threshold"] = None
         use_null_pool = pool_class == "null" or (
             pool_class == "auto" and _is_supabase_pooler_url(database_url)
         )

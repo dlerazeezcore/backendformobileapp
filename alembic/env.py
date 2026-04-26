@@ -39,6 +39,11 @@ def _is_pool_saturation_error(error: OperationalError) -> bool:
     return "maxclientsinsessionmode" in lowered or "max clients reached" in lowered
 
 
+def _is_supabase_pooler_database_url(url: str) -> bool:
+    lowered = (url or "").lower()
+    return "pooler.supabase.com" in lowered
+
+
 def run_migrations_offline() -> None:
     url = config.get_main_option("sqlalchemy.url")
     context.configure(
@@ -63,6 +68,7 @@ def run_migrations_online() -> None:
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        connect_args={"prepare_threshold": None} if _is_supabase_pooler_database_url(database_url) else {},
     )
 
     for attempt in range(1, max_retries + 1):

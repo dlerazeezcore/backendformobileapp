@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy.exc import OperationalError as SQLAlchemyOperationalError
+from sqlalchemy.exc import ProgrammingError as SQLAlchemyProgrammingError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 from admin import register_admin_routes
@@ -215,6 +216,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             status_code=503,
             content=_error_envelope(
                 status_code=503,
+                detail=message,
+                error_code=error_code,
+            ),
+        )
+
+    @app.exception_handler(SQLAlchemyProgrammingError)
+    async def handle_db_programming_error(request: Request, exc: SQLAlchemyProgrammingError) -> JSONResponse:
+        raw_detail = str(exc)
+        lowered = raw_detail.lower()
+        if "duplicatepreparedstatement" in lowered or (
+            "prepared statement" in lowered and "already exists" in lowered
+        ):
+            error_code = "DB_PREPARED_STATEMENT_CONFLICT"
+            message = "Database pool session conflict detected. Please retry in a few seconds."
+            status_code = 503
+        else:
+            error_code = "DB_PROGRAMMING_ERROR"
+            message = "Database query failed."
+            status_code = 500
+        LOGGER.warning("database.programming_error path=%s code=%s detail=%s", request.url.path, error_code, raw_detail)
+        return JSONResponse(
+            status_code=status_code,
+            content=_error_envelope(
+                status_code=status_code,
                 detail=message,
                 error_code=error_code,
             ),

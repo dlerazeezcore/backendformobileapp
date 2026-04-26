@@ -389,6 +389,7 @@ Notes:
 - `DATABASE_POOL_CLASS=auto` uses `NullPool` automatically for any Supabase pooler host (`*.pooler.supabase.com`, including `:5432` session pooler and `:6543` transaction pooler) to avoid app-side queue bottlenecks
 - when `SUPABASE_FORCE_TRANSACTION_POOLER=true` (default), Supabase pooler URLs that use session mode (`:5432`) are rewritten to transaction mode (`:6543`) at runtime to reduce `MaxClientsInSessionMode` errors
 - set `SUPABASE_FORCE_TRANSACTION_POOLER=false` only if you intentionally need session mode behavior on Supabase pooler
+- for Supabase pooler connections, psycopg prepared statements are disabled (`prepare_threshold=None`) to avoid PgBouncer `DuplicatePreparedStatement` failures
 - for non-Supabase Postgres hosts, `DATABASE_POOL_CLASS=auto` uses queue pooling with the conservative defaults above
 - you can force queue pooling by setting `DATABASE_POOL_CLASS=queue`, or force `NullPool` on any host by setting `DATABASE_POOL_CLASS=null`
 - Alembic startup migration now retries DB connection; if retries exhaust due pool saturation (`MaxClientsInSessionMode`), it can skip migration for that startup so the app can still boot

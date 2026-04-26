@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from unittest.mock import patch
 
 from sqlalchemy.pool import NullPool
 from sqlalchemy.pool import QueuePool
@@ -78,6 +79,14 @@ class DatabasePoolingTest(unittest.TestCase):
             self.assertIsInstance(engine.pool, NullPool)
         finally:
             engine.dispose()
+
+    def test_supabase_pooler_connections_disable_prepared_statements(self) -> None:
+        with patch("supabase_store.create_engine") as mocked_create_engine:
+            mocked_create_engine.return_value = object()
+            create_database("postgresql://user:password@aws-1-ap-southeast-2.pooler.supabase.com:6543/postgres")
+            connect_args = mocked_create_engine.call_args.kwargs["connect_args"]
+            self.assertIn("prepare_threshold", connect_args)
+            self.assertIsNone(connect_args["prepare_threshold"])
 
     def test_postgres_pool_limits_can_be_overridden_by_environment(self) -> None:
         os.environ["DATABASE_POOL_SIZE"] = "2"
