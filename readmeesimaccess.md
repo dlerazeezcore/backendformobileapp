@@ -71,6 +71,7 @@ Use environment variables only. Do not hardcode provider credentials in code or 
 ESIM_ACCESS_ACCESS_CODE="<provider access code>"
 ESIM_ACCESS_SECRET_KEY="<provider secret key>"
 ESIM_ACCESS_WEBHOOK_SECRET="<your private webhook verification secret>"
+ESIM_USAGE_SYNC_ENABLED=false
 DATABASE_URL="postgresql+psycopg://..."
 DATABASE_POOL_SIZE=1
 DATABASE_MAX_OVERFLOW=0
@@ -1167,6 +1168,8 @@ alembic upgrade head
 The front end should only need `/profiles/my` plus the install/activate/top-up/package routes.
 
 `GET /api/v1/esim-access/exchange-rates/current` is public and cache-backed so the app can render pricing before login and during short DB pool saturation windows.
+
+Keep `ESIM_USAGE_SYNC_ENABLED=false` on small Koyeb/Supabase deployments unless you intentionally want a scheduled all-profile usage sync. The signed-in user flow can still call `POST /api/v1/esim-access/usage/sync/my` on demand.
 
 Use `status`, not raw provider status.
 

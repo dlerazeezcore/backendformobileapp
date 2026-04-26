@@ -362,6 +362,7 @@ ESIM_ACCESS_ACCESS_CODE=your_access_code
 ESIM_ACCESS_SECRET_KEY=your_secret_key
 ESIM_PACKAGES_CACHE_TTL_SECONDS=20
 ESIM_PACKAGES_CACHE_MAX_ENTRIES=128
+ESIM_USAGE_SYNC_ENABLED=false
 ESIM_USAGE_SYNC_INITIAL_DELAY_SECONDS=45
 FIB_PAYMENT_CLIENT_ID=your_fib_client_id
 FIB_PAYMENT_CLIENT_SECRET=your_fib_client_secret
@@ -405,7 +406,8 @@ Notes:
 - `CORS_ALLOWED_ORIGINS` and `CORS_ALLOW_ORIGIN_REGEX` can override the built-in mobile/dev/preview origin allowlist if the frontend moves to a new host
 - Alembic startup migration now retries DB connection; if retries exhaust due pool saturation (`MaxClientsInSessionMode`, pool checkout timeout, or similar saturation errors), it can skip migration for that startup so the app can still boot
 - recommended Koyeb default is `ALEMBIC_DB_CONNECT_RETRIES=1` so startup does not miss health-check windows when DB pool is saturated
-- `ESIM_USAGE_SYNC_INITIAL_DELAY_SECONDS` delays the first scheduled usage-sync run after startup (default `45`) to reduce DB pressure spikes during boot
+- `ESIM_USAGE_SYNC_ENABLED=false` keeps the scheduled all-profile usage sync disabled by default; user-triggered `/usage/sync/my` still works and is safer for small Supabase/Koyeb pools
+- if scheduled all-profile usage sync is enabled, `ESIM_USAGE_SYNC_INITIAL_DELAY_SECONDS` delays its first run after startup (default `45`) to reduce DB pressure spikes during boot
 - if `FIB_PAYMENT_CLIENT_ID` and `FIB_PAYMENT_CLIENT_SECRET` are missing, FIB routes return `503` (integration disabled)
 - `FIB_PAYMENT_WEBHOOK_SECRET` is optional; set it when you want signed webhook validation
 - push notifications require either `FIREBASE_SERVICE_ACCOUNT_FILE` or `FIREBASE_SERVICE_ACCOUNT_JSON`

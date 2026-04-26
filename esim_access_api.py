@@ -29,6 +29,18 @@ from users import UserPayload
 LOGGER = logging.getLogger("uvicorn.error")
 
 
+def _read_bool_env(name: str, default: bool) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 class ESimAccessError(Exception):
     pass
 
@@ -1278,6 +1290,7 @@ def register_esim_access_routes(
 ) -> None:
     usage_sync_interval_seconds = 3600
     usage_sync_batch_size = 50
+    usage_sync_enabled = _read_bool_env("ESIM_USAGE_SYNC_ENABLED", default=False)
     usage_sync_initial_delay_seconds = max(float(os.getenv("ESIM_USAGE_SYNC_INITIAL_DELAY_SECONDS", "45")), 0.0)
     usage_sync_lock = asyncio.Lock()
     exchange_rate_settings_cache: dict[str, Any] | None = None
@@ -1450,6 +1463,9 @@ def register_esim_access_routes(
 
     @app.on_event("startup")
     async def _start_periodic_usage_sync_worker() -> None:
+        if not usage_sync_enabled:
+            LOGGER.info("Scheduled eSIM usage sync skipped: disabled by ESIM_USAGE_SYNC_ENABLED.")
+            return
         session_factory = getattr(app.state, "db_session_factory", None)
         provider = getattr(app.state, "esim_access_api", None)
         if session_factory is None or provider is None:
