@@ -385,8 +385,9 @@ Notes:
 - for Supabase, prefer the pooler connection string when the direct host is not reachable
 - Postgres DB pooling defaults are intentionally conservative for Supabase session pooling: two app-side connections per process, one overflow slot, 15 second checkout timeout, and 300 second recycle
 - tune `DATABASE_POOL_SIZE` and `DATABASE_MAX_OVERFLOW` only if the Supabase pooler size and Koyeb process/worker count leave enough headroom
-- `DATABASE_POOL_CLASS=auto` uses queue pooling by default; it automatically switches to `NullPool` when using Supabase transaction pooler (`pooler.supabase.com:6543`)
-- you can force `NullPool` by setting `DATABASE_POOL_CLASS=null` (recommended when your pooler runs in transaction mode)
+- `DATABASE_POOL_CLASS=auto` uses `NullPool` automatically for any Supabase pooler host (`*.pooler.supabase.com`, including `:5432` session pooler and `:6543` transaction pooler) to avoid app-side queue bottlenecks
+- for non-Supabase Postgres hosts, `DATABASE_POOL_CLASS=auto` uses queue pooling with the conservative defaults above
+- you can force queue pooling by setting `DATABASE_POOL_CLASS=queue`, or force `NullPool` on any host by setting `DATABASE_POOL_CLASS=null`
 - Alembic startup migration now retries DB connection; if retries exhaust due pool saturation (`MaxClientsInSessionMode`), it can skip migration for that startup so the app can still boot
 - if `FIB_PAYMENT_CLIENT_ID` and `FIB_PAYMENT_CLIENT_SECRET` are missing, FIB routes return `503` (integration disabled)
 - `FIB_PAYMENT_WEBHOOK_SECRET` is optional; set it when you want signed webhook validation

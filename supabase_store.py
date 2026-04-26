@@ -176,12 +176,10 @@ def _read_pool_class_env(default: str = "auto") -> str:
     return default
 
 
-def _is_supabase_transaction_pooler_url(database_url: str) -> bool:
+def _is_supabase_pooler_url(database_url: str) -> bool:
     parsed = urlparse(database_url)
     hostname = (parsed.hostname or "").lower()
-    if "pooler.supabase.com" not in hostname:
-        return False
-    return parsed.port == 6543
+    return "pooler.supabase.com" in hostname
 
 
 class Base(DeclarativeBase):
@@ -683,7 +681,7 @@ def create_database(database_url: str) -> sessionmaker[Session]:
     else:
         connect_args = {"options": "-c timezone=Asia/Baghdad"}
         use_null_pool = pool_class == "null" or (
-            pool_class == "auto" and _is_supabase_transaction_pooler_url(database_url)
+            pool_class == "auto" and _is_supabase_pooler_url(database_url)
         )
         if use_null_pool:
             engine_options = {
