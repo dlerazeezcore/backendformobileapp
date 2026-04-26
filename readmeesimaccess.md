@@ -72,6 +72,7 @@ ESIM_ACCESS_ACCESS_CODE="<provider access code>"
 ESIM_ACCESS_SECRET_KEY="<provider secret key>"
 ESIM_ACCESS_WEBHOOK_SECRET="<your private webhook verification secret>"
 ESIM_USAGE_SYNC_ENABLED=false
+PUBLIC_DB_FAILURE_BACKOFF_SECONDS=15
 DATABASE_URL="postgresql+psycopg://..."
 DATABASE_POOL_SIZE=1
 DATABASE_MAX_OVERFLOW=0
@@ -1170,6 +1171,8 @@ The front end should only need `/profiles/my` plus the install/activate/top-up/p
 `GET /api/v1/esim-access/exchange-rates/current` is public and cache-backed so the app can render pricing before login and during short DB pool saturation windows.
 
 Keep `ESIM_USAGE_SYNC_ENABLED=false` on small Koyeb/Supabase deployments unless you intentionally want a scheduled all-profile usage sync. The signed-in user flow can still call `POST /api/v1/esim-access/usage/sync/my` on demand.
+
+Keep `PUBLIC_DB_FAILURE_BACKOFF_SECONDS` enabled so public app-open reads do not keep retrying DB checkouts while Supabase is saturated.
 
 Use `status`, not raw provider status.
 

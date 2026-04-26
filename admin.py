@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime
 import logging
+import os
+from time import monotonic
 from typing import Any, Callable
 
 from fastapi import Depends, FastAPI, Query
@@ -29,6 +31,8 @@ from esim_access_api import ActionContext
 
 LOGGER = logging.getLogger("uvicorn.error")
 _PUBLIC_FEATURED_LOCATIONS_CACHE: dict[str, list[dict[str, Any]]] = {}
+_PUBLIC_FEATURED_LOCATIONS_RETRY_AFTER: dict[str, float] = {}
+_PUBLIC_DB_FAILURE_BACKOFF_SECONDS = max(float(os.getenv("PUBLIC_DB_FAILURE_BACKOFF_SECONDS", "15")), 0.0)
 
 
 def _featured_locations_cache_key(service_type: str) -> str:
@@ -264,10 +268,19 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         service_type: str = Query(default="esim", alias="serviceType"),
     ) -> dict[str, Any]:
         cache_key = _featured_locations_cache_key(service_type)
+        cached_locations = _PUBLIC_FEATURED_LOCATIONS_CACHE.get(cache_key)
+        if monotonic() < _PUBLIC_FEATURED_LOCATIONS_RETRY_AFTER.get(cache_key, 0.0):
+            return {
+                "success": True,
+                "data": {
+                    "locations": _clone_featured_locations(cached_locations or []),
+                    "cacheStatus": "stale" if cached_locations is not None else "db_unavailable",
+                },
+            }
         try:
             locations = SupabaseStore(db).list_public_featured_locations(service_type=service_type)
         except SQLAlchemyError as exc:
-            cached_locations = _PUBLIC_FEATURED_LOCATIONS_CACHE.get(cache_key)
+            _PUBLIC_FEATURED_LOCATIONS_RETRY_AFTER[cache_key] = monotonic() + _PUBLIC_DB_FAILURE_BACKOFF_SECONDS
             if cached_locations is not None:
                 LOGGER.warning(
                     "featured_locations.public_db_unavailable cache=stale service_type=%s detail=%s",
@@ -289,6 +302,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
             return {"success": True, "data": {"locations": [], "cacheStatus": "db_unavailable"}}
 
         _PUBLIC_FEATURED_LOCATIONS_CACHE[cache_key] = _clone_featured_locations(locations)
+        _PUBLIC_FEATURED_LOCATIONS_RETRY_AFTER.pop(cache_key, None)
         return {"success": True, "data": {"locations": locations, "cacheStatus": "fresh"}}
 
     @app.post("/api/v1/admin/exchange-rates")

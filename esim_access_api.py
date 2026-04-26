@@ -1294,6 +1294,8 @@ def register_esim_access_routes(
     usage_sync_initial_delay_seconds = max(float(os.getenv("ESIM_USAGE_SYNC_INITIAL_DELAY_SECONDS", "45")), 0.0)
     usage_sync_lock = asyncio.Lock()
     exchange_rate_settings_cache: dict[str, Any] | None = None
+    exchange_rate_settings_retry_after = 0.0
+    public_db_failure_backoff_seconds = max(float(os.getenv("PUBLIC_DB_FAILURE_BACKOFF_SECONDS", "15")), 0.0)
 
     def _default_exchange_rate_settings() -> dict[str, Any]:
         return {
@@ -1958,16 +1960,27 @@ def register_esim_access_routes(
     def get_current_exchange_rate_settings(
         db: Session = Depends(get_db),
     ) -> dict[str, Any]:
-        nonlocal exchange_rate_settings_cache
+        nonlocal exchange_rate_settings_cache, exchange_rate_settings_retry_after
+        if monotonic() < exchange_rate_settings_retry_after:
+            fallback_settings = exchange_rate_settings_cache or _default_exchange_rate_settings()
+            return {
+                "success": True,
+                "data": {
+                    **fallback_settings,
+                    "cacheStatus": "stale" if exchange_rate_settings_cache is not None else "db_unavailable",
+                },
+            }
         try:
             store = SupabaseStore(db)
             exchange = store.get_current_exchange_rate_settings()
             exchange_rate_settings_cache = _serialize_exchange_rate_settings(exchange)
+            exchange_rate_settings_retry_after = 0.0
             return {
                 "success": True,
                 "data": {**exchange_rate_settings_cache, "cacheStatus": "fresh"},
             }
         except SQLAlchemyError as exc:
+            exchange_rate_settings_retry_after = monotonic() + public_db_failure_backoff_seconds
             if exchange_rate_settings_cache is not None:
                 LOGGER.warning("exchange_rates.current_db_unavailable cache=stale detail=%s", exc)
                 return {

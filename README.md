@@ -364,6 +364,7 @@ ESIM_PACKAGES_CACHE_TTL_SECONDS=20
 ESIM_PACKAGES_CACHE_MAX_ENTRIES=128
 ESIM_USAGE_SYNC_ENABLED=false
 ESIM_USAGE_SYNC_INITIAL_DELAY_SECONDS=45
+PUBLIC_DB_FAILURE_BACKOFF_SECONDS=15
 FIB_PAYMENT_CLIENT_ID=your_fib_client_id
 FIB_PAYMENT_CLIENT_SECRET=your_fib_client_secret
 FIB_PAYMENT_WEBHOOK_SECRET=optional_webhook_secret
@@ -408,6 +409,7 @@ Notes:
 - recommended Koyeb default is `ALEMBIC_DB_CONNECT_RETRIES=1` so startup does not miss health-check windows when DB pool is saturated
 - `ESIM_USAGE_SYNC_ENABLED=false` keeps the scheduled all-profile usage sync disabled by default; user-triggered `/usage/sync/my` still works and is safer for small Supabase/Koyeb pools
 - if scheduled all-profile usage sync is enabled, `ESIM_USAGE_SYNC_INITIAL_DELAY_SECONDS` delays its first run after startup (default `45`) to reduce DB pressure spikes during boot
+- `PUBLIC_DB_FAILURE_BACKOFF_SECONDS` temporarily stops public startup reads from retrying DB checkouts after a pool failure; this protects login and user routes from app-open retry bursts
 - if `FIB_PAYMENT_CLIENT_ID` and `FIB_PAYMENT_CLIENT_SECRET` are missing, FIB routes return `503` (integration disabled)
 - `FIB_PAYMENT_WEBHOOK_SECRET` is optional; set it when you want signed webhook validation
 - push notifications require either `FIREBASE_SERVICE_ACCOUNT_FILE` or `FIREBASE_SERVICE_ACCOUNT_JSON`
