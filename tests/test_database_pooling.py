@@ -42,7 +42,7 @@ class DatabasePoolingTest(unittest.TestCase):
         engine = session_factory.kw["bind"]
         try:
             self.assertIsInstance(engine.pool, QueuePool)
-            self.assertEqual(engine.pool.size(), 2)
+            self.assertEqual(engine.pool.size(), 1)
             self.assertEqual(engine.pool._max_overflow, 0)
         finally:
             engine.dispose()
@@ -54,7 +54,7 @@ class DatabasePoolingTest(unittest.TestCase):
         engine = session_factory.kw["bind"]
         try:
             self.assertIsInstance(engine.pool, QueuePool)
-            self.assertEqual(engine.pool.size(), 2)
+            self.assertEqual(engine.pool.size(), 1)
             self.assertEqual(engine.pool._max_overflow, 0)
             self.assertEqual(engine.url.port, 6543)
         finally:
@@ -67,7 +67,7 @@ class DatabasePoolingTest(unittest.TestCase):
         engine = session_factory.kw["bind"]
         try:
             self.assertIsInstance(engine.pool, QueuePool)
-            self.assertEqual(engine.pool.size(), 2)
+            self.assertEqual(engine.pool.size(), 1)
             self.assertEqual(engine.pool._max_overflow, 0)
             self.assertEqual(engine.url.port, 6543)
         finally:

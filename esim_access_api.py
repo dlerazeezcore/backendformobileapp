@@ -1277,6 +1277,7 @@ def register_esim_access_routes(
 ) -> None:
     usage_sync_interval_seconds = 3600
     usage_sync_batch_size = 50
+    usage_sync_initial_delay_seconds = max(float(os.getenv("ESIM_USAGE_SYNC_INITIAL_DELAY_SECONDS", "45")), 0.0)
     usage_sync_lock = asyncio.Lock()
 
     async def _require_admin_actor(
@@ -1403,6 +1404,8 @@ def register_esim_access_routes(
             db.close()
 
     async def _periodic_usage_sync_worker() -> None:
+        if usage_sync_initial_delay_seconds > 0:
+            await asyncio.sleep(usage_sync_initial_delay_seconds)
         while True:
             try:
                 summary = await _run_periodic_usage_sync_once()
@@ -1425,7 +1428,8 @@ def register_esim_access_routes(
             return
         app.state.esim_usage_sync_task = asyncio.create_task(_periodic_usage_sync_worker())
         LOGGER.info(
-            "Scheduled eSIM usage sync started: interval=%ss batch_size=%s",
+            "Scheduled eSIM usage sync started: initial_delay=%ss interval=%ss batch_size=%s",
+            usage_sync_initial_delay_seconds,
             usage_sync_interval_seconds,
             usage_sync_batch_size,
         )

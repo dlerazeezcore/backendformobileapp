@@ -738,7 +738,7 @@ def create_database(database_url: str) -> sessionmaker[Session]:
                 default_pool_size = 1
                 default_max_overflow = 0
             elif is_supabase_transaction_pooler:
-                default_pool_size = 2
+                default_pool_size = 1
                 default_max_overflow = 0
             else:
                 default_pool_size = 2

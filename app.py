@@ -81,6 +81,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             or "max clients reached" in lowered
             or "unable to check out connection from the pool due to timeout" in lowered
             or "check out connection from the pool due to timeout" in lowered
+            or "dbhandler exited" in lowered
         )
 
     def _error_envelope(
