@@ -728,16 +728,21 @@ def create_database(database_url: str) -> sessionmaker[Session]:
             # Supabase pooler (PgBouncer) can fail with DuplicatePreparedStatement when
             # server-side prepared statements are enabled across pooled connections.
             connect_args["prepare_threshold"] = None
-        use_null_pool = pool_class == "null" or (
-            pool_class == "auto" and is_supabase_transaction_pooler
-        )
+        use_null_pool = pool_class == "null"
         if use_null_pool:
             engine_options = {
                 "poolclass": NullPool,
             }
         else:
-            default_pool_size = 1 if is_supabase_session_pooler else 2
-            default_max_overflow = 0 if is_supabase_session_pooler else 1
+            if is_supabase_session_pooler:
+                default_pool_size = 1
+                default_max_overflow = 0
+            elif is_supabase_transaction_pooler:
+                default_pool_size = 2
+                default_max_overflow = 0
+            else:
+                default_pool_size = 2
+                default_max_overflow = 1
             engine_options = {
                 "pool_size": _read_int_env("DATABASE_POOL_SIZE", default_pool_size, minimum=1),
                 "max_overflow": _read_int_env("DATABASE_MAX_OVERFLOW", default_max_overflow),

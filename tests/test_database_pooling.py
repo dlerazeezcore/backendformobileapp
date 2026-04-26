@@ -35,23 +35,27 @@ class DatabasePoolingTest(unittest.TestCase):
         finally:
             engine.dispose()
 
-    def test_supabase_transaction_pooler_url_uses_null_pool_in_auto_mode(self) -> None:
+    def test_supabase_transaction_pooler_url_uses_small_queue_pool_in_auto_mode(self) -> None:
         session_factory = create_database(
             "postgresql://user:password@aws-1-ap-southeast-2.pooler.supabase.com:6543/postgres"
         )
         engine = session_factory.kw["bind"]
         try:
-            self.assertIsInstance(engine.pool, NullPool)
+            self.assertIsInstance(engine.pool, QueuePool)
+            self.assertEqual(engine.pool.size(), 2)
+            self.assertEqual(engine.pool._max_overflow, 0)
         finally:
             engine.dispose()
 
-    def test_supabase_session_pooler_url_uses_null_pool_in_auto_mode(self) -> None:
+    def test_supabase_session_pooler_url_is_normalized_and_uses_small_queue_pool_in_auto_mode(self) -> None:
         session_factory = create_database(
             "postgresql://user:password@aws-1-ap-southeast-2.pooler.supabase.com:5432/postgres"
         )
         engine = session_factory.kw["bind"]
         try:
-            self.assertIsInstance(engine.pool, NullPool)
+            self.assertIsInstance(engine.pool, QueuePool)
+            self.assertEqual(engine.pool.size(), 2)
+            self.assertEqual(engine.pool._max_overflow, 0)
             self.assertEqual(engine.url.port, 6543)
         finally:
             engine.dispose()
@@ -62,7 +66,9 @@ class DatabasePoolingTest(unittest.TestCase):
         )
         engine = session_factory.kw["bind"]
         try:
-            self.assertIsInstance(engine.pool, NullPool)
+            self.assertIsInstance(engine.pool, QueuePool)
+            self.assertEqual(engine.pool.size(), 2)
+            self.assertEqual(engine.pool._max_overflow, 0)
             self.assertEqual(engine.url.port, 6543)
         finally:
             engine.dispose()

@@ -9,6 +9,7 @@ from typing import AsyncIterator
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
+from sqlalchemy.exc import InternalError as SQLAlchemyInternalError
 from sqlalchemy.exc import OperationalError as SQLAlchemyOperationalError
 from sqlalchemy.exc import ProgrammingError as SQLAlchemyProgrammingError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
@@ -73,6 +74,15 @@ LOGGER = logging.getLogger("uvicorn.error")
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
+    def _is_pool_saturation_detail(raw_detail: str) -> bool:
+        lowered = raw_detail.lower()
+        return (
+            "maxclientsinsessionmode" in lowered
+            or "max clients reached" in lowered
+            or "unable to check out connection from the pool due to timeout" in lowered
+            or "check out connection from the pool due to timeout" in lowered
+        )
+
     def _error_envelope(
         *,
         status_code: int,
@@ -204,8 +214,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.exception_handler(SQLAlchemyOperationalError)
     async def handle_db_operational_error(request: Request, exc: SQLAlchemyOperationalError) -> JSONResponse:
         raw_detail = str(exc)
-        lowered = raw_detail.lower()
-        if "maxclientsinsessionmode" in lowered or "max clients reached" in lowered:
+        if _is_pool_saturation_detail(raw_detail):
             error_code = "DB_POOL_SATURATED"
             message = "Database connection limit reached. Please retry in a few seconds."
         else:
@@ -216,6 +225,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             status_code=503,
             content=_error_envelope(
                 status_code=503,
+                detail=message,
+                error_code=error_code,
+            ),
+        )
+
+    @app.exception_handler(SQLAlchemyInternalError)
+    async def handle_db_internal_error(request: Request, exc: SQLAlchemyInternalError) -> JSONResponse:
+        raw_detail = str(exc)
+        if _is_pool_saturation_detail(raw_detail):
+            error_code = "DB_POOL_SATURATED"
+            message = "Database connection limit reached. Please retry in a few seconds."
+            status_code = 503
+        else:
+            error_code = "DB_INTERNAL_ERROR"
+            message = "Database internal error."
+            status_code = 500
+        LOGGER.warning("database.internal_error path=%s code=%s detail=%s", request.url.path, error_code, raw_detail)
+        return JSONResponse(
+            status_code=status_code,
+            content=_error_envelope(
+                status_code=status_code,
                 detail=message,
                 error_code=error_code,
             ),
