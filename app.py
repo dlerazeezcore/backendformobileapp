@@ -160,6 +160,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 close_result = close_method()
                 if inspect.isawaitable(close_result):
                     await close_result
+        db_session_factory = getattr(app.state, "db_session_factory", None)
+        db_engine = getattr(db_session_factory, "kw", {}).get("bind") if db_session_factory is not None else None
+        if db_engine is not None:
+            db_engine.dispose()
 
     app = FastAPI(title="backendformobileapp", version="0.1.0", lifespan=lifespan)
     app.add_middleware(

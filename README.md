@@ -367,6 +367,10 @@ FIREBASE_SERVICE_ACCOUNT_FILE=/absolute/path/to/firebase-service-account.json
 FIREBASE_SERVICE_ACCOUNT_JSON={"type":"service_account","project_id":"..."}
 PUSH_NOTIFICATION_DEFAULT_CHANNEL_ID=general
 DATABASE_URL=postgresql://USER:PASSWORD@HOST:PORT/DATABASE
+DATABASE_POOL_SIZE=1
+DATABASE_MAX_OVERFLOW=0
+DATABASE_POOL_TIMEOUT_SECONDS=30
+DATABASE_POOL_RECYCLE_SECONDS=300
 AUTH_SECRET_KEY=replace_with_a_long_random_secret
 AUTH_TOKEN_TTL_SECONDS=86400
 ```
@@ -375,6 +379,8 @@ Notes:
 
 - `DATABASE_URL` may be plain `postgresql://...`; the backend normalizes it to SQLAlchemy `psycopg`
 - for Supabase, prefer the pooler connection string when the direct host is not reachable
+- Postgres DB pooling defaults are intentionally conservative for Supabase session pooling: one app-side connection per process, no overflow, 30 second checkout timeout, and 300 second recycle
+- tune `DATABASE_POOL_SIZE` and `DATABASE_MAX_OVERFLOW` only if the Supabase pooler size and Koyeb process/worker count leave enough headroom
 - if `FIB_PAYMENT_CLIENT_ID` and `FIB_PAYMENT_CLIENT_SECRET` are missing, FIB routes return `503` (integration disabled)
 - `FIB_PAYMENT_WEBHOOK_SECRET` is optional; set it when you want signed webhook validation
 - push notifications require either `FIREBASE_SERVICE_ACCOUNT_FILE` or `FIREBASE_SERVICE_ACCOUNT_JSON`

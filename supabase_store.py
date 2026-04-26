@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -150,6 +151,17 @@ def normalize_database_url(database_url: str) -> str:
     if database_url.startswith("postgres://"):
         return database_url.replace("postgres://", "postgresql+psycopg://", 1)
     return database_url
+
+
+def _read_int_env(name: str, default: int, *, minimum: int = 0) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None or raw_value.strip() == "":
+        return default
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        return default
+    return max(parsed, minimum)
 
 
 class Base(DeclarativeBase):
@@ -645,9 +657,17 @@ def create_database(database_url: str) -> sessionmaker[Session]:
     database_url = normalize_database_url(database_url)
     if database_url.startswith("sqlite"):
         connect_args = {"check_same_thread": False}
+        engine_options: dict[str, Any] = {}
     else:
         connect_args = {"options": "-c timezone=Asia/Baghdad"}
-    engine = create_engine(database_url, future=True, connect_args=connect_args)
+        engine_options = {
+            "pool_size": _read_int_env("DATABASE_POOL_SIZE", 1, minimum=1),
+            "max_overflow": _read_int_env("DATABASE_MAX_OVERFLOW", 0),
+            "pool_timeout": _read_int_env("DATABASE_POOL_TIMEOUT_SECONDS", 30, minimum=1),
+            "pool_recycle": _read_int_env("DATABASE_POOL_RECYCLE_SECONDS", 300, minimum=1),
+            "pool_pre_ping": True,
+        }
+    engine = create_engine(database_url, future=True, connect_args=connect_args, **engine_options)
     return sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 
