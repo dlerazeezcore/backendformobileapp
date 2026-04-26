@@ -85,6 +85,28 @@ class CorsPreflightTest(unittest.TestCase):
             self.assertEqual(install_preflight.headers.get("access-control-allow-origin"), "http://localhost:5173")
             self.assertEqual(activate_preflight.headers.get("access-control-allow-origin"), "http://localhost:5173")
 
+    def test_mobile_and_preview_origins_support_esim_preflight(self) -> None:
+        origins = [
+            "http://localhost:8100",
+            "http://192.168.1.25:8100",
+            "https://tulip-mobile.vercel.app",
+            "https://preview.pages.dev",
+            "capacitor://localhost",
+        ]
+        with TestClient(create_app()) as client:
+            for origin in origins:
+                with self.subTest(origin=origin):
+                    response = client.options(
+                        "/api/v1/esim-access/packages/query",
+                        headers={
+                            "Origin": origin,
+                            "Access-Control-Request-Method": "POST",
+                            "Access-Control-Request-Headers": "authorization,content-type,x-client-info",
+                        },
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.headers.get("access-control-allow-origin"), origin)
+
 
 if __name__ == "__main__":
     unittest.main()

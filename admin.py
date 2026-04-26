@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime
+import logging
 from typing import Any, Callable
 
 from fastapi import Depends, FastAPI, Query
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from auth import get_token_claims, require_active_subject
@@ -24,6 +26,17 @@ from supabase_store import (
     SupabaseStore,
 )
 from esim_access_api import ActionContext
+
+LOGGER = logging.getLogger("uvicorn.error")
+_PUBLIC_FEATURED_LOCATIONS_CACHE: dict[str, list[dict[str, Any]]] = {}
+
+
+def _featured_locations_cache_key(service_type: str) -> str:
+    return str(service_type or "esim").strip().lower() or "esim"
+
+
+def _clone_featured_locations(locations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [dict(location) for location in locations]
 
 
 class RefundPayload(BaseModel):
@@ -246,12 +259,37 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
 
     @app.get("/api/v1/featured-locations/public")
     @app.get("/api/v1/esim-access/featured-locations")
-    async def list_public_featured_locations(
+    def list_public_featured_locations(
         db: Session = Depends(get_db),
         service_type: str = Query(default="esim", alias="serviceType"),
     ) -> dict[str, Any]:
-        locations = SupabaseStore(db).list_public_featured_locations(service_type=service_type)
-        return {"success": True, "data": {"locations": locations}}
+        cache_key = _featured_locations_cache_key(service_type)
+        try:
+            locations = SupabaseStore(db).list_public_featured_locations(service_type=service_type)
+        except SQLAlchemyError as exc:
+            cached_locations = _PUBLIC_FEATURED_LOCATIONS_CACHE.get(cache_key)
+            if cached_locations is not None:
+                LOGGER.warning(
+                    "featured_locations.public_db_unavailable cache=stale service_type=%s detail=%s",
+                    cache_key,
+                    exc,
+                )
+                return {
+                    "success": True,
+                    "data": {
+                        "locations": _clone_featured_locations(cached_locations),
+                        "cacheStatus": "stale",
+                    },
+                }
+            LOGGER.warning(
+                "featured_locations.public_db_unavailable cache=empty service_type=%s detail=%s",
+                cache_key,
+                exc,
+            )
+            return {"success": True, "data": {"locations": [], "cacheStatus": "db_unavailable"}}
+
+        _PUBLIC_FEATURED_LOCATIONS_CACHE[cache_key] = _clone_featured_locations(locations)
+        return {"success": True, "data": {"locations": locations, "cacheStatus": "fresh"}}
 
     @app.post("/api/v1/admin/exchange-rates")
     async def save_exchange_rate(

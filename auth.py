@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from config import get_settings
 from phone_utils import normalize_phone, phone_lookup_candidates
@@ -519,7 +520,7 @@ def register_auth_routes(
         return _issue_subject_session(user_row, subject_type="user")
 
     @app.post("/api/v1/auth/admin/login")
-    async def admin_login(payload: LoginPayload, db: Session = Depends(get_db)) -> dict[str, Any]:
+    def admin_login(payload: LoginPayload, db: Session = Depends(get_db)) -> dict[str, Any]:
         row = _lookup_admin_by_phone(db, payload.phone)
         if payload.password is None:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="password is required")
@@ -539,7 +540,7 @@ def register_auth_routes(
         _log_phone_lookup("auth.user.login", payload.phone, normalized_phone)
         if payload.otp_code:
             requested_channel = _normalize_otp_channel(payload.otp_channel, field_name="otpChannel")
-            user_row = _lookup_user_by_phone(db, normalized_phone)
+            user_row = await run_in_threadpool(_lookup_user_by_phone, db, normalized_phone)
             if user_row is not None:
                 required_provider = _require_twilio_provider(provider)
                 if not _is_row_active(user_row):
@@ -555,13 +556,13 @@ def register_auth_routes(
                     verification_sid=payload.verification_sid,
                 )
                 user_row.last_login_at = utcnow()
-                db.commit()
+                await run_in_threadpool(db.commit)
                 return _issue_subject_session(user_row, subject_type="user")
 
             # Keep parity with password login compatibility:
             # if an admin account is using the shared /auth/user/login endpoint,
             # allow OTP login and issue an admin session token.
-            admin_row = _lookup_admin_by_phone(db, normalized_phone)
+            admin_row = await run_in_threadpool(_lookup_admin_by_phone, db, normalized_phone)
             if admin_row is not None:
                 required_provider = _require_twilio_provider(provider)
                 if not _is_row_active(admin_row):
@@ -577,7 +578,7 @@ def register_auth_routes(
                     verification_sid=payload.verification_sid,
                 )
                 admin_row.last_login_at = utcnow()
-                db.commit()
+                await run_in_threadpool(db.commit)
                 return _issue_subject_session(admin_row, subject_type="admin")
 
             raise HTTPException(
@@ -588,19 +589,19 @@ def register_auth_routes(
         if payload.password is None:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="password or otpCode is required")
 
-        user_row = _lookup_user_by_phone(db, normalized_phone)
+        user_row = await run_in_threadpool(_lookup_user_by_phone, db, normalized_phone)
         if user_row is None:
             # Compatibility path for frontends using a single login endpoint.
-            admin_row = _lookup_admin_by_phone(db, normalized_phone)
+            admin_row = await run_in_threadpool(_lookup_admin_by_phone, db, normalized_phone)
             if admin_row is not None:
                 if not _is_row_active(admin_row):
                     raise HTTPException(
                         status_code=status.HTTP_403_FORBIDDEN,
                         detail="Admin account exists but is not active.",
                     )
-                if verify_password(payload.password, admin_row.password_hash):
+                if await run_in_threadpool(verify_password, payload.password, admin_row.password_hash):
                     admin_row.last_login_at = utcnow()
-                    db.commit()
+                    await run_in_threadpool(db.commit)
                     return _issue_subject_session(admin_row, subject_type="admin")
                 raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid phone or password")
             raise HTTPException(
@@ -614,9 +615,9 @@ def register_auth_routes(
                 detail="User account exists but is not active. Please contact support.",
             )
 
-        if verify_password(payload.password, user_row.password_hash):
+        if await run_in_threadpool(verify_password, payload.password, user_row.password_hash):
             user_row.last_login_at = utcnow()
-            db.commit()
+            await run_in_threadpool(db.commit)
             return _issue_subject_session(user_row, subject_type="user")
 
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid phone or password")

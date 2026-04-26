@@ -411,13 +411,13 @@ class UserScopedReadsTest(unittest.TestCase):
             self.assertEqual(data["exchangeRate"], "1320")
             self.assertEqual(data["markupPercent"], "0")
 
-    def test_new_user_scoped_reads_require_token(self) -> None:
+    def test_user_profile_mutation_reads_require_token_but_exchange_rate_is_public(self) -> None:
         with TestClient(create_app()) as client:
             exchange_response = client.get("/api/v1/esim-access/exchange-rates/current")
             profiles_response = client.get("/api/v1/esim-access/profiles/my")
             install_response = client.post("/api/v1/esim-access/profiles/install/my", json={"iccid": "ICCID-USER1"})
             activate_response = client.post("/api/v1/esim-access/profiles/activate/my", json={"iccid": "ICCID-USER1"})
-            self.assertEqual(exchange_response.status_code, 401)
+            self.assertEqual(exchange_response.status_code, 200)
             self.assertEqual(profiles_response.status_code, 401)
             self.assertEqual(install_response.status_code, 401)
             self.assertEqual(activate_response.status_code, 401)

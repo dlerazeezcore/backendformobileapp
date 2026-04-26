@@ -19,6 +19,12 @@ def get_db(request: Request) -> Any:
     session = session_factory()
     try:
         yield session
+    except Exception:
+        try:
+            session.rollback()
+        except Exception:
+            pass
+        raise
     finally:
         session.close()
 

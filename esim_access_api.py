@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from auth import get_token_claims, require_active_subject
@@ -1279,6 +1280,37 @@ def register_esim_access_routes(
     usage_sync_batch_size = 50
     usage_sync_initial_delay_seconds = max(float(os.getenv("ESIM_USAGE_SYNC_INITIAL_DELAY_SECONDS", "45")), 0.0)
     usage_sync_lock = asyncio.Lock()
+    exchange_rate_settings_cache: dict[str, Any] | None = None
+
+    def _default_exchange_rate_settings() -> dict[str, Any]:
+        return {
+            "enableIQD": False,
+            "exchangeRate": "1320",
+            "markupPercent": "0",
+            "source": "tulip-admin",
+            "updatedAt": _to_utc_z(utcnow()),
+        }
+
+    def _serialize_exchange_rate_settings(exchange: Any | None) -> dict[str, Any]:
+        if exchange is None:
+            return _default_exchange_rate_settings()
+        custom = exchange.custom_fields or {}
+        enable_iqd = _to_bool(
+            custom.get("enableIQD", custom.get("enable_iqd")),
+            default=True,
+        )
+        markup_percent = _format_number_as_string(
+            custom.get("markupPercent", custom.get("markup_percent", 0)),
+            "0",
+        )
+        source = str(exchange.source or custom.get("source") or "tulip-admin").strip() or "tulip-admin"
+        return {
+            "enableIQD": enable_iqd,
+            "exchangeRate": _format_number_as_string(exchange.rate, "1320"),
+            "markupPercent": markup_percent,
+            "source": source,
+            "updatedAt": _to_utc_z(exchange.updated_at),
+        }
 
     async def _require_admin_actor(
         claims: dict[str, Any] = Depends(get_token_claims),
@@ -1907,45 +1939,30 @@ def register_esim_access_routes(
         return await provider.locations(payload)
 
     @app.get("/api/v1/esim-access/exchange-rates/current")
-    async def get_current_exchange_rate_settings(
+    def get_current_exchange_rate_settings(
         db: Session = Depends(get_db),
-        claims: dict[str, Any] = Depends(get_token_claims),
     ) -> dict[str, Any]:
-        _ = require_active_subject(db, claims=claims)
-        store = SupabaseStore(db)
-        exchange = store.get_current_exchange_rate_settings()
-        if exchange is None:
+        nonlocal exchange_rate_settings_cache
+        try:
+            store = SupabaseStore(db)
+            exchange = store.get_current_exchange_rate_settings()
+            exchange_rate_settings_cache = _serialize_exchange_rate_settings(exchange)
             return {
                 "success": True,
-                "data": {
-                    "enableIQD": False,
-                    "exchangeRate": "1320",
-                    "markupPercent": "0",
-                    "source": "tulip-admin",
-                    "updatedAt": _to_utc_z(utcnow()),
-                },
+                "data": {**exchange_rate_settings_cache, "cacheStatus": "fresh"},
             }
-
-        custom = exchange.custom_fields or {}
-        enable_iqd = _to_bool(
-            custom.get("enableIQD", custom.get("enable_iqd")),
-            default=True,
-        )
-        markup_percent = _format_number_as_string(
-            custom.get("markupPercent", custom.get("markup_percent", 0)),
-            "0",
-        )
-        source = str(exchange.source or custom.get("source") or "tulip-admin").strip() or "tulip-admin"
-        return {
-            "success": True,
-            "data": {
-                "enableIQD": enable_iqd,
-                "exchangeRate": _format_number_as_string(exchange.rate, "1320"),
-                "markupPercent": markup_percent,
-                "source": source,
-                "updatedAt": _to_utc_z(exchange.updated_at),
-            },
-        }
+        except SQLAlchemyError as exc:
+            if exchange_rate_settings_cache is not None:
+                LOGGER.warning("exchange_rates.current_db_unavailable cache=stale detail=%s", exc)
+                return {
+                    "success": True,
+                    "data": {**exchange_rate_settings_cache, "cacheStatus": "stale"},
+                }
+            LOGGER.warning("exchange_rates.current_db_unavailable cache=default detail=%s", exc)
+            return {
+                "success": True,
+                "data": {**_default_exchange_rate_settings(), "cacheStatus": "db_unavailable"},
+            }
 
     @app.get(
         "/api/v1/esim-access/profiles/my",

@@ -371,11 +371,15 @@ FIREBASE_SERVICE_ACCOUNT_JSON={"type":"service_account","project_id":"..."}
 PUSH_NOTIFICATION_DEFAULT_CHANNEL_ID=general
 DATABASE_URL=postgresql://USER:PASSWORD@HOST:PORT/DATABASE
 DATABASE_POOL_SIZE=1
-DATABASE_MAX_OVERFLOW=1
-DATABASE_POOL_TIMEOUT_SECONDS=15
+DATABASE_MAX_OVERFLOW=0
+DATABASE_POOL_TIMEOUT_SECONDS=3
+DATABASE_CONNECT_TIMEOUT_SECONDS=3
 DATABASE_POOL_RECYCLE_SECONDS=300
 DATABASE_POOL_CLASS=auto
 SUPABASE_FORCE_TRANSACTION_POOLER=true
+CORS_ALLOWED_ORIGINS=
+CORS_ALLOW_ORIGIN_REGEX=
+CORS_ALLOW_CREDENTIALS=true
 ALEMBIC_DB_CONNECT_RETRIES=1
 ALEMBIC_DB_CONNECT_RETRY_DELAY_SECONDS=0.5
 ALEMBIC_ALLOW_SKIP_ON_POOL_SATURATION=true
@@ -392,11 +396,13 @@ Notes:
 - Postgres DB pooling defaults are intentionally conservative: one app-side connection per process for Supabase pooler hosts, and small queue pooling defaults for non-Supabase hosts
 - tune `DATABASE_POOL_SIZE` and `DATABASE_MAX_OVERFLOW` only if the Supabase pooler size and Koyeb process/worker count leave enough headroom
 - `DATABASE_POOL_CLASS=auto` uses queue pooling for Supabase pooler with conservative caps (`:6543` and `:5432` both default to `pool_size=1`, `max_overflow=0`)
+- Supabase pooler connections default to fast failure (`DATABASE_POOL_TIMEOUT_SECONDS=3`, `DATABASE_CONNECT_TIMEOUT_SECONDS=3`) so login does not hang for a minute when the DB pool is saturated
 - when `SUPABASE_FORCE_TRANSACTION_POOLER=true` (default), Supabase pooler URLs in session mode are rewritten to transaction mode at runtime, including URLs where port is omitted
 - set `SUPABASE_FORCE_TRANSACTION_POOLER=false` only if you intentionally need session mode behavior on Supabase pooler
 - for Supabase pooler connections, psycopg prepared statements are disabled (`prepare_threshold=None`) to avoid PgBouncer `DuplicatePreparedStatement` failures
 - for non-Supabase Postgres hosts, `DATABASE_POOL_CLASS=auto` uses queue pooling with the conservative defaults above
 - you can force queue pooling by setting `DATABASE_POOL_CLASS=queue`, or force `NullPool` on any host by setting `DATABASE_POOL_CLASS=null` (not recommended for Supabase burst traffic)
+- `CORS_ALLOWED_ORIGINS` and `CORS_ALLOW_ORIGIN_REGEX` can override the built-in mobile/dev/preview origin allowlist if the frontend moves to a new host
 - Alembic startup migration now retries DB connection; if retries exhaust due pool saturation (`MaxClientsInSessionMode`, pool checkout timeout, or similar saturation errors), it can skip migration for that startup so the app can still boot
 - recommended Koyeb default is `ALEMBIC_DB_CONNECT_RETRIES=1` so startup does not miss health-check windows when DB pool is saturated
 - `ESIM_USAGE_SYNC_INITIAL_DELAY_SECONDS` delays the first scheduled usage-sync run after startup (default `45`) to reduce DB pressure spikes during boot
@@ -523,6 +529,7 @@ This keeps the backend simple now without blocking a more professional auth desi
 ### Health
 
 - `GET /health`
+- `GET /health/db` (checks DB connectivity plus current Alembic revision vs repository head)
 
 ### FIB payment routes
 
@@ -578,7 +585,7 @@ These are the routes frontend should mainly use.
 
 These routes are intended for mobile app read flows and do not require admin scope.
 
-- `GET /api/v1/esim-access/exchange-rates/current` (user/admin token)
+- `GET /api/v1/esim-access/exchange-rates/current` (public app pricing read)
 - `GET /api/v1/esim-access/profiles/my` (user/admin token, scoped to token subject only)
 - `POST /api/v1/esim-access/profiles/install/my` (user/admin token, ownership checks)
 - `POST /api/v1/esim-access/profiles/activate/my` (user/admin token, ownership checks)
@@ -1652,8 +1659,9 @@ For user-scoped read flows (mobile app):
 
 `GET /api/v1/esim-access/exchange-rates/current`
 
-- auth: user token or admin token
+- auth: public
 - returns current active USD -> IQD settings for app display
+- returns `cacheStatus` as `fresh`, `stale`, or `db_unavailable`; stale/default fallback keeps pricing screens responsive during short DB pool saturation windows
 - fallback when no configured active row:
   - `enableIQD=false`
   - `exchangeRate="1320"`

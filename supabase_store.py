@@ -724,6 +724,14 @@ def create_database(database_url: str) -> sessionmaker[Session]:
         is_supabase_pooler = _is_supabase_pooler_url(database_url)
         is_supabase_transaction_pooler = _is_supabase_transaction_pooler_url(database_url)
         is_supabase_session_pooler = _is_supabase_session_pooler_url(database_url)
+        is_supabase_database = is_supabase_pooler
+        default_connect_timeout = 3 if is_supabase_database else 10
+        connect_args["connect_timeout"] = _read_int_env(
+            "DATABASE_CONNECT_TIMEOUT_SECONDS",
+            default_connect_timeout,
+            minimum=1,
+        )
+        connect_args["application_name"] = os.getenv("DATABASE_APPLICATION_NAME", "tulip_mobile_backend")
         if is_supabase_pooler:
             # Supabase pooler (PgBouncer) can fail with DuplicatePreparedStatement when
             # server-side prepared statements are enabled across pooled connections.
@@ -743,15 +751,17 @@ def create_database(database_url: str) -> sessionmaker[Session]:
             else:
                 default_pool_size = 2
                 default_max_overflow = 1
+            default_pool_timeout = 3 if is_supabase_database else 15
             engine_options = {
                 "pool_size": _read_int_env("DATABASE_POOL_SIZE", default_pool_size, minimum=1),
                 "max_overflow": _read_int_env("DATABASE_MAX_OVERFLOW", default_max_overflow),
-                "pool_timeout": _read_int_env("DATABASE_POOL_TIMEOUT_SECONDS", 15, minimum=1),
+                "pool_timeout": _read_int_env("DATABASE_POOL_TIMEOUT_SECONDS", default_pool_timeout, minimum=1),
                 "pool_recycle": _read_int_env("DATABASE_POOL_RECYCLE_SECONDS", 300, minimum=1),
                 "pool_pre_ping": True,
+                "pool_use_lifo": True,
             }
     engine = create_engine(database_url, future=True, connect_args=connect_args, **engine_options)
-    return sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+    return sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
 
 
 def extract_selected_fields(payload: dict[str, Any], field_paths: list[str]) -> dict[str, Any]:

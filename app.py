@@ -3,12 +3,17 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 import inspect
 import logging
+import os
+from pathlib import Path
 import uuid
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
+from alembic.config import Config as AlembicConfig
+from alembic.script import ScriptDirectory
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
+from sqlalchemy import text
 from sqlalchemy.exc import InternalError as SQLAlchemyInternalError
 from sqlalchemy.exc import OperationalError as SQLAlchemyOperationalError
 from sqlalchemy.exc import ProgrammingError as SQLAlchemyProgrammingError
@@ -43,7 +48,7 @@ from twilio_whatsapp import TwilioVerifyAPIError, TwilioVerifyHTTPError, TwilioW
 from users import register_user_routes
 from wings_api import register_wings_routes
 
-CORS_ALLOWED_ORIGINS = [
+DEFAULT_CORS_ALLOWED_ORIGINS = [
     "capacitor://localhost",
     "ionic://localhost",
     "http://localhost",
@@ -58,7 +63,14 @@ CORS_ALLOWED_ORIGINS = [
 ]
 CORS_ALLOWED_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 CORS_ALLOWED_HEADERS = ["*"]
-CORS_ALLOW_ORIGIN_REGEX = r"^https://([a-zA-Z0-9-]+\.)?figma\.site$"
+DEFAULT_CORS_ALLOW_ORIGIN_REGEX = (
+    r"^(?:"
+    r"https://([a-zA-Z0-9-]+\.)?"
+    r"(figma\.site|koyeb\.app|vercel\.app|netlify\.app|pages\.dev|web\.app|firebaseapp\.com)"
+    r"|https?://(?:localhost|127\.0\.0\.1|10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[0-1])(?:\.\d{1,3}){2})(?::\d+)?"
+    r"|capacitor://localhost|ionic://localhost"
+    r")$"
+)
 FIB_PAYMENT_BASE_URL = "https://fib.prod.fib.iq"
 FIB_PAYMENT_TIMEOUT_SECONDS = 30.0
 FIB_PAYMENT_RATE_LIMIT_PER_SECOND = 8.0
@@ -71,6 +83,51 @@ TWILIO_VERIFY_RATE_LIMIT_PER_SECOND = 5.0
 # Optional hardcoded fallback when env var is not set.
 FIB_PAYMENT_WEBHOOK_SECRET: str | None = None
 LOGGER = logging.getLogger("uvicorn.error")
+
+
+def _split_env_csv(value: str | None) -> list[str]:
+    if value is None:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _read_bool_env(name: str, default: bool) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _get_cors_allowed_origins() -> list[str]:
+    configured = _split_env_csv(os.getenv("CORS_ALLOWED_ORIGINS"))
+    if configured:
+        return configured
+    return DEFAULT_CORS_ALLOWED_ORIGINS
+
+
+def _get_cors_allow_origin_regex() -> str | None:
+    configured = os.getenv("CORS_ALLOW_ORIGIN_REGEX")
+    if configured is not None:
+        stripped = configured.strip()
+        return stripped or None
+    return DEFAULT_CORS_ALLOW_ORIGIN_REGEX
+
+
+def _get_expected_alembic_heads() -> list[str]:
+    try:
+        alembic_ini = Path(__file__).with_name("alembic.ini")
+        config = AlembicConfig(str(alembic_ini))
+        config.set_main_option("script_location", str(Path(__file__).with_name("alembic")))
+        script = ScriptDirectory.from_config(config)
+        return sorted(script.get_heads())
+    except Exception as exc:  # pragma: no cover - diagnostic endpoint should not break app startup
+        LOGGER.warning("alembic.head_lookup_failed detail=%s", exc)
+        return []
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -175,11 +232,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="backendformobileapp", version="0.1.0", lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=CORS_ALLOWED_ORIGINS,
-        allow_origin_regex=CORS_ALLOW_ORIGIN_REGEX,
-        allow_credentials=True,
+        allow_origins=_get_cors_allowed_origins(),
+        allow_origin_regex=_get_cors_allow_origin_regex(),
+        allow_credentials=_read_bool_env("CORS_ALLOW_CREDENTIALS", default=True),
         allow_methods=CORS_ALLOWED_METHODS,
         allow_headers=CORS_ALLOWED_HEADERS,
+        max_age=86400,
     )
 
     @app.middleware("http")
@@ -358,6 +416,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/health/db")
+    def health_db() -> dict[str, Any]:
+        session_factory = app.state.db_session_factory
+        db = session_factory()
+        try:
+            db.scalar(text("select 1"))
+            current_revisions = list(
+                db.execute(text("select version_num from alembic_version order by version_num")).scalars().all()
+            )
+        finally:
+            db.close()
+        expected_heads = _get_expected_alembic_heads()
+        return {
+            "status": "ok",
+            "database": "ok",
+            "alembic": {
+                "currentRevisions": current_revisions,
+                "expectedHeads": expected_heads,
+                "isCurrent": bool(current_revisions) and set(current_revisions) == set(expected_heads),
+            },
+        }
 
     @app.options("/api/v1/{path:path}", include_in_schema=False)
     async def options_fallback(path: str) -> Response:

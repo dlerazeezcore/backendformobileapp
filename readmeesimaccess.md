@@ -72,8 +72,15 @@ ESIM_ACCESS_ACCESS_CODE="<provider access code>"
 ESIM_ACCESS_SECRET_KEY="<provider secret key>"
 ESIM_ACCESS_WEBHOOK_SECRET="<your private webhook verification secret>"
 DATABASE_URL="postgresql+psycopg://..."
+DATABASE_POOL_SIZE=1
+DATABASE_MAX_OVERFLOW=0
+DATABASE_POOL_TIMEOUT_SECONDS=3
+DATABASE_CONNECT_TIMEOUT_SECONDS=3
+SUPABASE_FORCE_TRANSACTION_POOLER=true
 AUTH_SECRET_KEY="<strong auth secret>"
 ```
+
+For mobile/web frontends, the backend has a built-in CORS allowlist for Capacitor/Ionic, localhost dev ports, private LAN dev URLs, and common preview hosts. If the frontend moves to a custom host, set `CORS_ALLOWED_ORIGINS` or `CORS_ALLOW_ORIGIN_REGEX` in the deployment environment.
 
 Optional local SQLite database:
 
@@ -925,6 +932,14 @@ select version_num
 from alembic_version;
 ```
 
+Runtime health check:
+
+```bash
+curl "$BASE_URL/health/db"
+```
+
+The response includes `alembic.currentRevisions`, `alembic.expectedHeads`, and `alembic.isCurrent`. Production is at the same migration level as the repo when `isCurrent` is `true`.
+
 List eSIM columns:
 
 ```sql
@@ -1150,6 +1165,8 @@ alembic upgrade head
 ## Front-End Rules
 
 The front end should only need `/profiles/my` plus the install/activate/top-up/package routes.
+
+`GET /api/v1/esim-access/exchange-rates/current` is public and cache-backed so the app can render pricing before login and during short DB pool saturation windows.
 
 Use `status`, not raw provider status.
 
