@@ -360,6 +360,8 @@ Create a local `.env` file with:
 ```env
 ESIM_ACCESS_ACCESS_CODE=your_access_code
 ESIM_ACCESS_SECRET_KEY=your_secret_key
+ESIM_PACKAGES_CACHE_TTL_SECONDS=20
+ESIM_PACKAGES_CACHE_MAX_ENTRIES=128
 FIB_PAYMENT_CLIENT_ID=your_fib_client_id
 FIB_PAYMENT_CLIENT_SECRET=your_fib_client_secret
 FIB_PAYMENT_WEBHOOK_SECRET=optional_webhook_secret
@@ -383,11 +385,13 @@ AUTH_TOKEN_TTL_SECONDS=86400
 Notes:
 
 - `DATABASE_URL` may be plain `postgresql://...`; the backend normalizes it to SQLAlchemy `psycopg`
+- repeated `/api/v1/esim-access/packages/query` payloads are cached in-memory for `ESIM_PACKAGES_CACHE_TTL_SECONDS` (default `20`) to reduce provider round-trips during app startup bursts
+- set `ESIM_PACKAGES_CACHE_TTL_SECONDS=0` to disable this cache
 - for Supabase, prefer the pooler connection string when the direct host is not reachable
 - Postgres DB pooling defaults are intentionally conservative for Supabase session pooling: two app-side connections per process, one overflow slot, 15 second checkout timeout, and 300 second recycle
 - tune `DATABASE_POOL_SIZE` and `DATABASE_MAX_OVERFLOW` only if the Supabase pooler size and Koyeb process/worker count leave enough headroom
-- `DATABASE_POOL_CLASS=auto` uses `NullPool` automatically for any Supabase pooler host (`*.pooler.supabase.com`, including `:5432` session pooler and `:6543` transaction pooler) to avoid app-side queue bottlenecks
-- when `SUPABASE_FORCE_TRANSACTION_POOLER=true` (default), Supabase pooler URLs that use session mode (`:5432`) are rewritten to transaction mode (`:6543`) at runtime to reduce `MaxClientsInSessionMode` errors
+- `DATABASE_POOL_CLASS=auto` uses `NullPool` for Supabase transaction pooler (`:6543`) and queue pooling for session pooler (`:5432`)
+- when `SUPABASE_FORCE_TRANSACTION_POOLER=true` (default), Supabase pooler URLs in session mode are rewritten to transaction mode at runtime, including URLs where port is omitted
 - set `SUPABASE_FORCE_TRANSACTION_POOLER=false` only if you intentionally need session mode behavior on Supabase pooler
 - for Supabase pooler connections, psycopg prepared statements are disabled (`prepare_threshold=None`) to avoid PgBouncer `DuplicatePreparedStatement` failures
 - for non-Supabase Postgres hosts, `DATABASE_POOL_CLASS=auto` uses queue pooling with the conservative defaults above

@@ -5,11 +5,12 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 from math import ceil
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
-from time import time
+from time import monotonic, time
 from typing import Any, Callable, Generic, TypeVar
 
 import httpx
@@ -875,15 +876,72 @@ class ESimAccessAPI:
             transport=transport,
             headers={"Accept": "application/json"},
         )
+        self.packages_cache_ttl_seconds = self._read_float_env("ESIM_PACKAGES_CACHE_TTL_SECONDS", 20.0, minimum=0.0)
+        self.packages_cache_max_entries = self._read_int_env("ESIM_PACKAGES_CACHE_MAX_ENTRIES", 128, minimum=1)
+        self._packages_cache: dict[str, tuple[float, ESimAccessResponse[PackageListResult]]] = {}
+        self._packages_cache_lock = asyncio.Lock()
 
     async def close(self) -> None:
         await self.client.aclose()
+
+    @staticmethod
+    def _read_float_env(name: str, default: float, *, minimum: float = 0.0) -> float:
+        raw_value = os.getenv(name)
+        if raw_value is None or raw_value.strip() == "":
+            return default
+        try:
+            parsed = float(raw_value)
+        except ValueError:
+            return default
+        return max(parsed, minimum)
+
+    @staticmethod
+    def _read_int_env(name: str, default: int, *, minimum: int = 0) -> int:
+        raw_value = os.getenv(name)
+        if raw_value is None or raw_value.strip() == "":
+            return default
+        try:
+            parsed = int(raw_value)
+        except ValueError:
+            return default
+        return max(parsed, minimum)
+
+    @staticmethod
+    def _package_cache_key(request: PackageQueryRequest) -> str:
+        payload = request.model_dump(by_alias=True, exclude_none=True)
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
     async def get_packages(
         self,
         request: PackageQueryRequest,
     ) -> ESimAccessResponse[PackageListResult]:
-        return await self._post("/api/v1/open/package/list", request, ESimAccessResponse[PackageListResult])
+        if self.packages_cache_ttl_seconds <= 0:
+            return await self._post("/api/v1/open/package/list", request, ESimAccessResponse[PackageListResult])
+
+        cache_key = self._package_cache_key(request)
+        now = monotonic()
+        async with self._packages_cache_lock:
+            cached = self._packages_cache.get(cache_key)
+            if cached is not None:
+                expires_at, cached_response = cached
+                if expires_at > now:
+                    return cached_response
+                self._packages_cache.pop(cache_key, None)
+
+        response = await self._post("/api/v1/open/package/list", request, ESimAccessResponse[PackageListResult])
+
+        now = monotonic()
+        async with self._packages_cache_lock:
+            self._packages_cache[cache_key] = (now + self.packages_cache_ttl_seconds, response)
+            if len(self._packages_cache) > self.packages_cache_max_entries:
+                expired_keys = [key for key, (expires_at, _) in self._packages_cache.items() if expires_at <= now]
+                for key in expired_keys:
+                    self._packages_cache.pop(key, None)
+            while len(self._packages_cache) > self.packages_cache_max_entries:
+                oldest_key = min(self._packages_cache.items(), key=lambda item: item[1][0])[0]
+                self._packages_cache.pop(oldest_key, None)
+
+        return response
 
     async def order_profiles(
         self,

@@ -161,11 +161,13 @@ def normalize_database_url(database_url: str) -> str:
     hostname = (parsed.hostname or "").lower()
     if "pooler.supabase.com" not in hostname:
         return normalized_url
-    if parsed.port != 5432:
+    if parsed.port not in (None, 5432):
         return normalized_url
-    if parsed.netloc.endswith(":5432"):
+    if parsed.port == 5432 and parsed.netloc.endswith(":5432"):
         return parsed._replace(netloc=parsed.netloc[:-5] + ":6543").geturl()
-    return normalized_url
+    # Some Supabase URLs omit the explicit port (psycopg defaults to 5432).
+    # Add :6543 explicitly so runtime reliably uses transaction mode.
+    return parsed._replace(netloc=f"{parsed.netloc}:6543").geturl()
 
 
 def _read_int_env(name: str, default: int, *, minimum: int = 0) -> int:
@@ -205,6 +207,20 @@ def _is_supabase_pooler_url(database_url: str) -> bool:
     parsed = urlparse(database_url)
     hostname = (parsed.hostname or "").lower()
     return "pooler.supabase.com" in hostname
+
+
+def _is_supabase_transaction_pooler_url(database_url: str) -> bool:
+    if not _is_supabase_pooler_url(database_url):
+        return False
+    parsed = urlparse(database_url)
+    return parsed.port == 6543
+
+
+def _is_supabase_session_pooler_url(database_url: str) -> bool:
+    if not _is_supabase_pooler_url(database_url):
+        return False
+    parsed = urlparse(database_url)
+    return parsed.port in (None, 5432)
 
 
 class Base(DeclarativeBase):
@@ -705,21 +721,26 @@ def create_database(database_url: str) -> sessionmaker[Session]:
         engine_options: dict[str, Any] = {}
     else:
         connect_args = {"options": "-c timezone=Asia/Baghdad"}
-        if _is_supabase_pooler_url(database_url):
+        is_supabase_pooler = _is_supabase_pooler_url(database_url)
+        is_supabase_transaction_pooler = _is_supabase_transaction_pooler_url(database_url)
+        is_supabase_session_pooler = _is_supabase_session_pooler_url(database_url)
+        if is_supabase_pooler:
             # Supabase pooler (PgBouncer) can fail with DuplicatePreparedStatement when
             # server-side prepared statements are enabled across pooled connections.
             connect_args["prepare_threshold"] = None
         use_null_pool = pool_class == "null" or (
-            pool_class == "auto" and _is_supabase_pooler_url(database_url)
+            pool_class == "auto" and is_supabase_transaction_pooler
         )
         if use_null_pool:
             engine_options = {
                 "poolclass": NullPool,
             }
         else:
+            default_pool_size = 1 if is_supabase_session_pooler else 2
+            default_max_overflow = 0 if is_supabase_session_pooler else 1
             engine_options = {
-                "pool_size": _read_int_env("DATABASE_POOL_SIZE", 2, minimum=1),
-                "max_overflow": _read_int_env("DATABASE_MAX_OVERFLOW", 1),
+                "pool_size": _read_int_env("DATABASE_POOL_SIZE", default_pool_size, minimum=1),
+                "max_overflow": _read_int_env("DATABASE_MAX_OVERFLOW", default_max_overflow),
                 "pool_timeout": _read_int_env("DATABASE_POOL_TIMEOUT_SECONDS", 15, minimum=1),
                 "pool_recycle": _read_int_env("DATABASE_POOL_RECYCLE_SECONDS", 300, minimum=1),
                 "pool_pre_ping": True,

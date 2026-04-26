@@ -56,9 +56,27 @@ class DatabasePoolingTest(unittest.TestCase):
         finally:
             engine.dispose()
 
+    def test_supabase_pooler_url_without_explicit_port_is_normalized_to_transaction_mode(self) -> None:
+        session_factory = create_database(
+            "postgresql://user:password@aws-1-ap-southeast-2.pooler.supabase.com/postgres"
+        )
+        engine = session_factory.kw["bind"]
+        try:
+            self.assertIsInstance(engine.pool, NullPool)
+            self.assertEqual(engine.url.port, 6543)
+        finally:
+            engine.dispose()
+
     def test_normalize_database_url_moves_supabase_pooler_to_transaction_port(self) -> None:
         normalized = normalize_database_url(
             "postgresql://user:password@aws-1-ap-southeast-2.pooler.supabase.com:5432/postgres"
+        )
+        self.assertTrue(normalized.startswith("postgresql+psycopg://"))
+        self.assertIn(":6543/", normalized)
+
+    def test_normalize_database_url_moves_supabase_pooler_without_port_to_transaction_port(self) -> None:
+        normalized = normalize_database_url(
+            "postgresql://user:password@aws-1-ap-southeast-2.pooler.supabase.com/postgres"
         )
         self.assertTrue(normalized.startswith("postgresql+psycopg://"))
         self.assertIn(":6543/", normalized)
@@ -70,6 +88,19 @@ class DatabasePoolingTest(unittest.TestCase):
         )
         self.assertTrue(normalized.startswith("postgresql+psycopg://"))
         self.assertIn(":5432/", normalized)
+
+    def test_supabase_session_pooler_uses_small_queue_pool_when_transaction_override_disabled(self) -> None:
+        os.environ["SUPABASE_FORCE_TRANSACTION_POOLER"] = "false"
+        session_factory = create_database(
+            "postgresql://user:password@aws-1-ap-southeast-2.pooler.supabase.com:5432/postgres"
+        )
+        engine = session_factory.kw["bind"]
+        try:
+            self.assertIsInstance(engine.pool, QueuePool)
+            self.assertEqual(engine.pool.size(), 1)
+            self.assertEqual(engine.pool._max_overflow, 0)
+        finally:
+            engine.dispose()
 
     def test_pool_class_can_force_null_pool(self) -> None:
         os.environ["DATABASE_POOL_CLASS"] = "null"
