@@ -371,6 +371,9 @@ DATABASE_POOL_SIZE=1
 DATABASE_MAX_OVERFLOW=0
 DATABASE_POOL_TIMEOUT_SECONDS=30
 DATABASE_POOL_RECYCLE_SECONDS=300
+ALEMBIC_DB_CONNECT_RETRIES=20
+ALEMBIC_DB_CONNECT_RETRY_DELAY_SECONDS=3
+ALEMBIC_ALLOW_SKIP_ON_POOL_SATURATION=true
 AUTH_SECRET_KEY=replace_with_a_long_random_secret
 AUTH_TOKEN_TTL_SECONDS=86400
 ```
@@ -381,6 +384,7 @@ Notes:
 - for Supabase, prefer the pooler connection string when the direct host is not reachable
 - Postgres DB pooling defaults are intentionally conservative for Supabase session pooling: one app-side connection per process, no overflow, 30 second checkout timeout, and 300 second recycle
 - tune `DATABASE_POOL_SIZE` and `DATABASE_MAX_OVERFLOW` only if the Supabase pooler size and Koyeb process/worker count leave enough headroom
+- Alembic startup migration now retries DB connection; if retries exhaust due pool saturation (`MaxClientsInSessionMode`), it can skip migration for that startup so the app can still boot
 - if `FIB_PAYMENT_CLIENT_ID` and `FIB_PAYMENT_CLIENT_SECRET` are missing, FIB routes return `503` (integration disabled)
 - `FIB_PAYMENT_WEBHOOK_SECRET` is optional; set it when you want signed webhook validation
 - push notifications require either `FIREBASE_SERVICE_ACCOUNT_FILE` or `FIREBASE_SERVICE_ACCOUNT_JSON`
