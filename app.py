@@ -19,7 +19,6 @@ from sqlalchemy.exc import InternalError as SQLAlchemyInternalError
 from sqlalchemy.exc import OperationalError as SQLAlchemyOperationalError
 from sqlalchemy.exc import ProgrammingError as SQLAlchemyProgrammingError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
-from starlette.concurrency import run_in_threadpool
 
 from admin import register_admin_routes
 from auth import register_auth_routes
@@ -448,7 +447,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def health_db() -> Any:
         timeout_seconds = _read_float_env("DATABASE_HEALTH_TIMEOUT_SECONDS", 4.0, minimum=0.5)
         try:
-            return await asyncio.wait_for(run_in_threadpool(_run_health_db_check), timeout=timeout_seconds)
+            return await asyncio.wait_for(asyncio.to_thread(_run_health_db_check), timeout=timeout_seconds)
         except asyncio.TimeoutError:
             LOGGER.warning("database.health_timeout path=/health/db timeout_seconds=%.1f", timeout_seconds)
             return JSONResponse(
