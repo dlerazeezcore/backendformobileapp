@@ -78,11 +78,14 @@ DATABASE_POOL_SIZE=2
 DATABASE_MAX_OVERFLOW=0
 DATABASE_POOL_TIMEOUT_SECONDS=3
 DATABASE_CONNECT_TIMEOUT_SECONDS=3
+DATABASE_STATEMENT_TIMEOUT_MS=5000
+DATABASE_LOCK_TIMEOUT_MS=3000
+DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS=10000
 SUPABASE_FORCE_TRANSACTION_POOLER=true
 AUTH_SECRET_KEY="<strong auth secret>"
 ```
 
-For mobile/web frontends, the backend reflects CORS origins by default so browser preflight cannot block login or package queries. If the frontend moves to a locked production host, set `CORS_ALLOWED_ORIGINS` or `CORS_ALLOW_ORIGIN_REGEX` in the deployment environment to narrow it.
+For mobile/web frontends, the backend reflects CORS origins by default so browser preflight cannot block login or package queries. If the frontend moves to a locked production host, set `CORS_ALLOWED_ORIGINS` or `CORS_ALLOW_ORIGIN_REGEX` in the deployment environment to narrow it. Supabase pooler queries use short statement/lock/idle transaction timeouts so DB saturation fails fast instead of holding the login pool.
 
 Optional local SQLite database:
 

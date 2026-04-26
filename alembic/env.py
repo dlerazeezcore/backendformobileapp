@@ -12,7 +12,7 @@ from sqlalchemy.exc import InternalError as SQLAlchemyInternalError
 from sqlalchemy.exc import OperationalError as SQLAlchemyOperationalError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
-from supabase_store import Base, normalize_database_url
+from supabase_store import Base, build_database_connect_args, normalize_database_url
 
 load_dotenv()
 
@@ -78,7 +78,7 @@ def run_migrations_online() -> None:
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
-        connect_args={"prepare_threshold": None} if _is_supabase_pooler_database_url(database_url) else {},
+        connect_args=build_database_connect_args(database_url, for_migrations=True),
     )
 
     try:

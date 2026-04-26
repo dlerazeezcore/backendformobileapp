@@ -18,6 +18,10 @@ class DatabasePoolingTest(unittest.TestCase):
             "DATABASE_POOL_TIMEOUT_SECONDS",
             "DATABASE_POOL_RECYCLE_SECONDS",
             "DATABASE_CONNECT_TIMEOUT_SECONDS",
+            "DATABASE_STATEMENT_TIMEOUT_MS",
+            "DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS",
+            "DATABASE_LOCK_TIMEOUT_MS",
+            "DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS",
             "DATABASE_APPLICATION_NAME",
             "DATABASE_POOL_CLASS",
             "SUPABASE_FORCE_TRANSACTION_POOLER",
@@ -131,6 +135,10 @@ class DatabasePoolingTest(unittest.TestCase):
             self.assertIsNone(connect_args["prepare_threshold"])
             self.assertEqual(connect_args["connect_timeout"], 3)
             self.assertEqual(connect_args["application_name"], "tulip_mobile_backend")
+            self.assertIn("timezone=Asia/Baghdad", connect_args["options"])
+            self.assertIn("statement_timeout=5000", connect_args["options"])
+            self.assertIn("lock_timeout=3000", connect_args["options"])
+            self.assertIn("idle_in_transaction_session_timeout=10000", connect_args["options"])
 
     def test_database_connect_timeout_can_be_overridden_by_environment(self) -> None:
         os.environ["DATABASE_CONNECT_TIMEOUT_SECONDS"] = "7"
@@ -142,6 +150,19 @@ class DatabasePoolingTest(unittest.TestCase):
             connect_args = mocked_create_engine.call_args.kwargs["connect_args"]
             self.assertEqual(connect_args["connect_timeout"], 7)
             self.assertEqual(connect_args["application_name"], "tulip_test_app")
+
+    def test_database_statement_timeouts_can_be_overridden_by_environment(self) -> None:
+        os.environ["DATABASE_STATEMENT_TIMEOUT_MS"] = "2500"
+        os.environ["DATABASE_LOCK_TIMEOUT_MS"] = "1200"
+        os.environ["DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS"] = "4500"
+
+        with patch("supabase_store.create_engine") as mocked_create_engine:
+            mocked_create_engine.return_value = object()
+            create_database("postgresql://user:password@aws-1-ap-southeast-2.pooler.supabase.com:6543/postgres")
+            connect_args = mocked_create_engine.call_args.kwargs["connect_args"]
+            self.assertIn("statement_timeout=2500", connect_args["options"])
+            self.assertIn("lock_timeout=1200", connect_args["options"])
+            self.assertIn("idle_in_transaction_session_timeout=4500", connect_args["options"])
 
     def test_postgres_pool_limits_can_be_overridden_by_environment(self) -> None:
         os.environ["DATABASE_POOL_SIZE"] = "2"

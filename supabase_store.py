@@ -181,6 +181,39 @@ def _read_int_env(name: str, default: int, *, minimum: int = 0) -> int:
     return max(parsed, minimum)
 
 
+def _build_postgres_options(*, is_supabase_database: bool, for_migrations: bool = False) -> str:
+    options = ["-c timezone=Asia/Baghdad"]
+    if for_migrations:
+        statement_timeout = _read_int_env(
+            "DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS",
+            15000 if is_supabase_database else 60000,
+            minimum=0,
+        )
+    else:
+        statement_timeout = _read_int_env(
+            "DATABASE_STATEMENT_TIMEOUT_MS",
+            5000 if is_supabase_database else 30000,
+            minimum=0,
+        )
+    lock_timeout = _read_int_env(
+        "DATABASE_LOCK_TIMEOUT_MS",
+        3000 if is_supabase_database else 10000,
+        minimum=0,
+    )
+    idle_transaction_timeout = _read_int_env(
+        "DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS",
+        10000 if is_supabase_database else 30000,
+        minimum=0,
+    )
+    if statement_timeout > 0:
+        options.append(f"-c statement_timeout={statement_timeout}")
+    if lock_timeout > 0:
+        options.append(f"-c lock_timeout={lock_timeout}")
+    if idle_transaction_timeout > 0:
+        options.append(f"-c idle_in_transaction_session_timeout={idle_transaction_timeout}")
+    return " ".join(options)
+
+
 def _read_bool_env(name: str, default: bool) -> bool:
     raw_value = os.getenv(name)
     if raw_value is None:
@@ -221,6 +254,29 @@ def _is_supabase_session_pooler_url(database_url: str) -> bool:
         return False
     parsed = urlparse(database_url)
     return parsed.port in (None, 5432)
+
+
+def build_database_connect_args(database_url: str, *, for_migrations: bool = False) -> dict[str, Any]:
+    normalized_url = normalize_database_url(database_url)
+    is_supabase_pooler = _is_supabase_pooler_url(normalized_url)
+    default_connect_timeout = 3 if is_supabase_pooler else 10
+    connect_args: dict[str, Any] = {
+        "options": _build_postgres_options(
+            is_supabase_database=is_supabase_pooler,
+            for_migrations=for_migrations,
+        ),
+        "connect_timeout": _read_int_env(
+            "DATABASE_CONNECT_TIMEOUT_SECONDS",
+            default_connect_timeout,
+            minimum=1,
+        ),
+        "application_name": os.getenv("DATABASE_APPLICATION_NAME", "tulip_mobile_backend"),
+    }
+    if is_supabase_pooler:
+        # Supabase pooler (PgBouncer) can fail with DuplicatePreparedStatement when
+        # server-side prepared statements are enabled across pooled connections.
+        connect_args["prepare_threshold"] = None
+    return connect_args
 
 
 class Base(DeclarativeBase):
@@ -720,22 +776,11 @@ def create_database(database_url: str) -> sessionmaker[Session]:
         connect_args = {"check_same_thread": False}
         engine_options: dict[str, Any] = {}
     else:
-        connect_args = {"options": "-c timezone=Asia/Baghdad"}
+        connect_args = build_database_connect_args(database_url)
         is_supabase_pooler = _is_supabase_pooler_url(database_url)
         is_supabase_transaction_pooler = _is_supabase_transaction_pooler_url(database_url)
         is_supabase_session_pooler = _is_supabase_session_pooler_url(database_url)
         is_supabase_database = is_supabase_pooler
-        default_connect_timeout = 3 if is_supabase_database else 10
-        connect_args["connect_timeout"] = _read_int_env(
-            "DATABASE_CONNECT_TIMEOUT_SECONDS",
-            default_connect_timeout,
-            minimum=1,
-        )
-        connect_args["application_name"] = os.getenv("DATABASE_APPLICATION_NAME", "tulip_mobile_backend")
-        if is_supabase_pooler:
-            # Supabase pooler (PgBouncer) can fail with DuplicatePreparedStatement when
-            # server-side prepared statements are enabled across pooled connections.
-            connect_args["prepare_threshold"] = None
         use_null_pool = pool_class == "null"
         if use_null_pool:
             engine_options = {

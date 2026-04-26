@@ -376,6 +376,9 @@ DATABASE_POOL_SIZE=2
 DATABASE_MAX_OVERFLOW=0
 DATABASE_POOL_TIMEOUT_SECONDS=3
 DATABASE_CONNECT_TIMEOUT_SECONDS=3
+DATABASE_STATEMENT_TIMEOUT_MS=5000
+DATABASE_LOCK_TIMEOUT_MS=3000
+DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS=10000
 DATABASE_POOL_RECYCLE_SECONDS=300
 DATABASE_POOL_CLASS=auto
 SUPABASE_FORCE_TRANSACTION_POOLER=true
@@ -399,6 +402,7 @@ Notes:
 - tune `DATABASE_POOL_SIZE` and `DATABASE_MAX_OVERFLOW` only if the Supabase pooler size and Koyeb process/worker count leave enough headroom
 - `DATABASE_POOL_CLASS=auto` uses queue pooling for Supabase pooler with conservative caps (`:6543` defaults to `pool_size=2`, `max_overflow=0`; `:5432` stays `pool_size=1`, `max_overflow=0` if transaction override is disabled)
 - Supabase pooler connections default to fast failure (`DATABASE_POOL_TIMEOUT_SECONDS=3`, `DATABASE_CONNECT_TIMEOUT_SECONDS=3`) so login does not hang for a minute when the DB pool is saturated
+- Supabase pooler queries also set Postgres-side fast-fail limits (`DATABASE_STATEMENT_TIMEOUT_MS=5000`, `DATABASE_LOCK_TIMEOUT_MS=3000`, `DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS=10000`) so stuck PgBouncer/server waits release app pool slots instead of wedging login
 - when `SUPABASE_FORCE_TRANSACTION_POOLER=true` (default), Supabase pooler URLs in session mode are rewritten to transaction mode at runtime, including URLs where port is omitted
 - set `SUPABASE_FORCE_TRANSACTION_POOLER=false` only if you intentionally need session mode behavior on Supabase pooler
 - for Supabase pooler connections, psycopg prepared statements are disabled (`prepare_threshold=None`) to avoid PgBouncer `DuplicatePreparedStatement` failures
