@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 import inspect
 import logging
@@ -18,6 +19,7 @@ from sqlalchemy.exc import InternalError as SQLAlchemyInternalError
 from sqlalchemy.exc import OperationalError as SQLAlchemyOperationalError
 from sqlalchemy.exc import ProgrammingError as SQLAlchemyProgrammingError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
+from starlette.concurrency import run_in_threadpool
 
 from admin import register_admin_routes
 from auth import register_auth_routes
@@ -94,6 +96,17 @@ def _read_bool_env(name: str, default: bool) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     return default
+
+
+def _read_float_env(name: str, default: float, *, minimum: float = 0.0) -> float:
+    raw_value = os.getenv(name)
+    if raw_value is None or raw_value.strip() == "":
+        return default
+    try:
+        parsed = float(raw_value)
+    except ValueError:
+        return default
+    return max(parsed, minimum)
 
 
 def _get_cors_allowed_origins() -> list[str]:
@@ -410,8 +423,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.get("/health/db")
-    def health_db() -> dict[str, Any]:
+    def _run_health_db_check() -> dict[str, Any]:
         session_factory = app.state.db_session_factory
         db = session_factory()
         try:
@@ -431,6 +443,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "isCurrent": bool(current_revisions) and set(current_revisions) == set(expected_heads),
             },
         }
+
+    @app.get("/health/db")
+    async def health_db() -> Any:
+        timeout_seconds = _read_float_env("DATABASE_HEALTH_TIMEOUT_SECONDS", 4.0, minimum=0.5)
+        try:
+            return await asyncio.wait_for(run_in_threadpool(_run_health_db_check), timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            LOGGER.warning("database.health_timeout path=/health/db timeout_seconds=%.1f", timeout_seconds)
+            return JSONResponse(
+                status_code=503,
+                content=_error_envelope(
+                    status_code=503,
+                    detail="Database health check timed out. Please retry shortly.",
+                    error_code="DB_HEALTH_TIMEOUT",
+                ),
+            )
 
     @app.options("/api/v1/{path:path}", include_in_schema=False)
     async def options_fallback(path: str) -> Response:
