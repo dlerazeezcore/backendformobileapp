@@ -55,8 +55,8 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    max_retries = max(int(os.getenv("ALEMBIC_DB_CONNECT_RETRIES", "20")), 1)
-    retry_delay_seconds = max(float(os.getenv("ALEMBIC_DB_CONNECT_RETRY_DELAY_SECONDS", "3")), 0.1)
+    max_retries = max(int(os.getenv("ALEMBIC_DB_CONNECT_RETRIES", "8")), 1)
+    retry_delay_seconds = max(float(os.getenv("ALEMBIC_DB_CONNECT_RETRY_DELAY_SECONDS", "1.5")), 0.1)
     allow_skip_on_pool_saturation = _as_bool(os.getenv("ALEMBIC_ALLOW_SKIP_ON_POOL_SATURATION"), default=True)
 
     connectable = engine_from_config(

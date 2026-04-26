@@ -9,6 +9,8 @@ from typing import AsyncIterator
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
+from sqlalchemy.exc import OperationalError as SQLAlchemyOperationalError
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 from admin import register_admin_routes
 from auth import register_auth_routes
@@ -191,6 +193,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return JSONResponse(
             status_code=exc.status_code,
             content=_error_envelope(status_code=exc.status_code, detail=exc.detail),
+        )
+
+    @app.exception_handler(SQLAlchemyTimeoutError)
+    async def handle_db_pool_timeout(request: Request, exc: SQLAlchemyTimeoutError) -> JSONResponse:
+        LOGGER.warning("database.pool_timeout path=%s detail=%s", request.url.path, str(exc))
+        return JSONResponse(
+            status_code=503,
+            content=_error_envelope(
+                status_code=503,
+                detail="Database is busy. Please retry in a few seconds.",
+                error_code="DB_POOL_TIMEOUT",
+            ),
+        )
+
+    @app.exception_handler(SQLAlchemyOperationalError)
+    async def handle_db_operational_error(request: Request, exc: SQLAlchemyOperationalError) -> JSONResponse:
+        raw_detail = str(exc)
+        lowered = raw_detail.lower()
+        if "maxclientsinsessionmode" in lowered or "max clients reached" in lowered:
+            error_code = "DB_POOL_SATURATED"
+            message = "Database connection limit reached. Please retry in a few seconds."
+        else:
+            error_code = "DB_OPERATIONAL_ERROR"
+            message = "Database is temporarily unavailable. Please retry shortly."
+        LOGGER.warning("database.operational_error path=%s code=%s detail=%s", request.url.path, error_code, raw_detail)
+        return JSONResponse(
+            status_code=503,
+            content=_error_envelope(
+                status_code=503,
+                detail=message,
+                error_code=error_code,
+            ),
         )
 
     @app.exception_handler(ESimAccessHTTPError)

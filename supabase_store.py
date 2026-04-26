@@ -5,6 +5,7 @@ import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 from sqlalchemy import (
     BigInteger,
@@ -28,6 +29,7 @@ from sqlalchemy import (
     select,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
+from sqlalchemy.pool import NullPool
 
 from phone_utils import normalize_phone, phone_lookup_candidates
 
@@ -162,6 +164,24 @@ def _read_int_env(name: str, default: int, *, minimum: int = 0) -> int:
     except ValueError:
         return default
     return max(parsed, minimum)
+
+
+def _read_pool_class_env(default: str = "auto") -> str:
+    raw_value = os.getenv("DATABASE_POOL_CLASS")
+    if raw_value is None:
+        return default
+    normalized = raw_value.strip().lower()
+    if normalized in {"auto", "queue", "null"}:
+        return normalized
+    return default
+
+
+def _is_supabase_transaction_pooler_url(database_url: str) -> bool:
+    parsed = urlparse(database_url)
+    hostname = (parsed.hostname or "").lower()
+    if "pooler.supabase.com" not in hostname:
+        return False
+    return parsed.port == 6543
 
 
 class Base(DeclarativeBase):
@@ -655,18 +675,28 @@ class ProviderPayloadSnapshot(TimeMixin, Base):
 
 def create_database(database_url: str) -> sessionmaker[Session]:
     database_url = normalize_database_url(database_url)
+    pool_class = _read_pool_class_env(default="auto")
+
     if database_url.startswith("sqlite"):
         connect_args = {"check_same_thread": False}
         engine_options: dict[str, Any] = {}
     else:
         connect_args = {"options": "-c timezone=Asia/Baghdad"}
-        engine_options = {
-            "pool_size": _read_int_env("DATABASE_POOL_SIZE", 1, minimum=1),
-            "max_overflow": _read_int_env("DATABASE_MAX_OVERFLOW", 0),
-            "pool_timeout": _read_int_env("DATABASE_POOL_TIMEOUT_SECONDS", 30, minimum=1),
-            "pool_recycle": _read_int_env("DATABASE_POOL_RECYCLE_SECONDS", 300, minimum=1),
-            "pool_pre_ping": True,
-        }
+        use_null_pool = pool_class == "null" or (
+            pool_class == "auto" and _is_supabase_transaction_pooler_url(database_url)
+        )
+        if use_null_pool:
+            engine_options = {
+                "poolclass": NullPool,
+            }
+        else:
+            engine_options = {
+                "pool_size": _read_int_env("DATABASE_POOL_SIZE", 2, minimum=1),
+                "max_overflow": _read_int_env("DATABASE_MAX_OVERFLOW", 1),
+                "pool_timeout": _read_int_env("DATABASE_POOL_TIMEOUT_SECONDS", 15, minimum=1),
+                "pool_recycle": _read_int_env("DATABASE_POOL_RECYCLE_SECONDS", 300, minimum=1),
+                "pool_pre_ping": True,
+            }
     engine = create_engine(database_url, future=True, connect_args=connect_args, **engine_options)
     return sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 

@@ -367,12 +367,13 @@ FIREBASE_SERVICE_ACCOUNT_FILE=/absolute/path/to/firebase-service-account.json
 FIREBASE_SERVICE_ACCOUNT_JSON={"type":"service_account","project_id":"..."}
 PUSH_NOTIFICATION_DEFAULT_CHANNEL_ID=general
 DATABASE_URL=postgresql://USER:PASSWORD@HOST:PORT/DATABASE
-DATABASE_POOL_SIZE=1
-DATABASE_MAX_OVERFLOW=0
-DATABASE_POOL_TIMEOUT_SECONDS=30
+DATABASE_POOL_SIZE=2
+DATABASE_MAX_OVERFLOW=1
+DATABASE_POOL_TIMEOUT_SECONDS=15
 DATABASE_POOL_RECYCLE_SECONDS=300
-ALEMBIC_DB_CONNECT_RETRIES=20
-ALEMBIC_DB_CONNECT_RETRY_DELAY_SECONDS=3
+DATABASE_POOL_CLASS=auto
+ALEMBIC_DB_CONNECT_RETRIES=8
+ALEMBIC_DB_CONNECT_RETRY_DELAY_SECONDS=1.5
 ALEMBIC_ALLOW_SKIP_ON_POOL_SATURATION=true
 AUTH_SECRET_KEY=replace_with_a_long_random_secret
 AUTH_TOKEN_TTL_SECONDS=86400
@@ -382,8 +383,10 @@ Notes:
 
 - `DATABASE_URL` may be plain `postgresql://...`; the backend normalizes it to SQLAlchemy `psycopg`
 - for Supabase, prefer the pooler connection string when the direct host is not reachable
-- Postgres DB pooling defaults are intentionally conservative for Supabase session pooling: one app-side connection per process, no overflow, 30 second checkout timeout, and 300 second recycle
+- Postgres DB pooling defaults are intentionally conservative for Supabase session pooling: two app-side connections per process, one overflow slot, 15 second checkout timeout, and 300 second recycle
 - tune `DATABASE_POOL_SIZE` and `DATABASE_MAX_OVERFLOW` only if the Supabase pooler size and Koyeb process/worker count leave enough headroom
+- `DATABASE_POOL_CLASS=auto` uses queue pooling by default; it automatically switches to `NullPool` when using Supabase transaction pooler (`pooler.supabase.com:6543`)
+- you can force `NullPool` by setting `DATABASE_POOL_CLASS=null` (recommended when your pooler runs in transaction mode)
 - Alembic startup migration now retries DB connection; if retries exhaust due pool saturation (`MaxClientsInSessionMode`), it can skip migration for that startup so the app can still boot
 - if `FIB_PAYMENT_CLIENT_ID` and `FIB_PAYMENT_CLIENT_SECRET` are missing, FIB routes return `503` (integration disabled)
 - `FIB_PAYMENT_WEBHOOK_SECRET` is optional; set it when you want signed webhook validation
@@ -397,10 +400,14 @@ Notes:
   - callback URL and redirect URI defaults
 - never put real secrets in this README
 
-Example Supabase pooler shape:
+Example Supabase pooler shapes:
 
 ```env
+# Session pooler
 DATABASE_URL=postgresql://postgres.PROJECT_REF:ENCODED_PASSWORD@aws-REGION.pooler.supabase.com:5432/postgres
+
+# Transaction pooler (recommended with DATABASE_POOL_CLASS=auto or null)
+DATABASE_URL=postgresql://postgres.PROJECT_REF:ENCODED_PASSWORD@aws-REGION.pooler.supabase.com:6543/postgres
 ```
 
 If the password contains special characters like `@` or `!`, it must be URL-encoded.
