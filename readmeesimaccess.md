@@ -74,7 +74,7 @@ ESIM_ACCESS_WEBHOOK_SECRET="<your private webhook verification secret>"
 ESIM_USAGE_SYNC_ENABLED=false
 PUBLIC_DB_FAILURE_BACKOFF_SECONDS=15
 DATABASE_URL="postgresql+psycopg://..."
-DATABASE_POOL_SIZE=1
+DATABASE_POOL_SIZE=2
 DATABASE_MAX_OVERFLOW=0
 DATABASE_POOL_TIMEOUT_SECONDS=3
 DATABASE_CONNECT_TIMEOUT_SECONDS=3
@@ -82,7 +82,7 @@ SUPABASE_FORCE_TRANSACTION_POOLER=true
 AUTH_SECRET_KEY="<strong auth secret>"
 ```
 
-For mobile/web frontends, the backend has a built-in CORS allowlist for Capacitor/Ionic, localhost dev ports, private LAN dev URLs, and common preview hosts. If the frontend moves to a custom host, set `CORS_ALLOWED_ORIGINS` or `CORS_ALLOW_ORIGIN_REGEX` in the deployment environment.
+For mobile/web frontends, the backend reflects CORS origins by default so browser preflight cannot block login or package queries. If the frontend moves to a locked production host, set `CORS_ALLOWED_ORIGINS` or `CORS_ALLOW_ORIGIN_REGEX` in the deployment environment to narrow it.
 
 Optional local SQLite database:
 

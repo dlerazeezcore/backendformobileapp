@@ -63,14 +63,7 @@ DEFAULT_CORS_ALLOWED_ORIGINS = [
 ]
 CORS_ALLOWED_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 CORS_ALLOWED_HEADERS = ["*"]
-DEFAULT_CORS_ALLOW_ORIGIN_REGEX = (
-    r"^(?:"
-    r"https://([a-zA-Z0-9-]+\.)?"
-    r"(figma\.site|koyeb\.app|vercel\.app|netlify\.app|pages\.dev|web\.app|firebaseapp\.com)"
-    r"|https?://(?:localhost|127\.0\.0\.1|10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[0-1])(?:\.\d{1,3}){2})(?::\d+)?"
-    r"|capacitor://localhost|ionic://localhost"
-    r")$"
-)
+DEFAULT_CORS_ALLOW_ORIGIN_REGEX = r".*"
 FIB_PAYMENT_BASE_URL = "https://fib.prod.fib.iq"
 FIB_PAYMENT_TIMEOUT_SECONDS = 30.0
 FIB_PAYMENT_RATE_LIMIT_PER_SECOND = 8.0

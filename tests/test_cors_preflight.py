@@ -91,6 +91,7 @@ class CorsPreflightTest(unittest.TestCase):
             "http://192.168.1.25:8100",
             "https://tulip-mobile.vercel.app",
             "https://preview.pages.dev",
+            "https://customer-mobile.example.com",
             "capacitor://localhost",
         ]
         with TestClient(create_app()) as client:

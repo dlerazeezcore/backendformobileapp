@@ -372,7 +372,7 @@ FIREBASE_SERVICE_ACCOUNT_FILE=/absolute/path/to/firebase-service-account.json
 FIREBASE_SERVICE_ACCOUNT_JSON={"type":"service_account","project_id":"..."}
 PUSH_NOTIFICATION_DEFAULT_CHANNEL_ID=general
 DATABASE_URL=postgresql://USER:PASSWORD@HOST:PORT/DATABASE
-DATABASE_POOL_SIZE=1
+DATABASE_POOL_SIZE=2
 DATABASE_MAX_OVERFLOW=0
 DATABASE_POOL_TIMEOUT_SECONDS=3
 DATABASE_CONNECT_TIMEOUT_SECONDS=3
@@ -395,16 +395,16 @@ Notes:
 - repeated `/api/v1/esim-access/packages/query` payloads are cached in-memory for `ESIM_PACKAGES_CACHE_TTL_SECONDS` (default `20`) to reduce provider round-trips during app startup bursts
 - set `ESIM_PACKAGES_CACHE_TTL_SECONDS=0` to disable this cache
 - for Supabase, prefer the pooler connection string when the direct host is not reachable
-- Postgres DB pooling defaults are intentionally conservative: one app-side connection per process for Supabase pooler hosts, and small queue pooling defaults for non-Supabase hosts
+- Postgres DB pooling defaults are intentionally conservative: two app-side connections per process for Supabase transaction-pooler hosts, one for Supabase session-pooler hosts, and small queue pooling defaults for non-Supabase hosts
 - tune `DATABASE_POOL_SIZE` and `DATABASE_MAX_OVERFLOW` only if the Supabase pooler size and Koyeb process/worker count leave enough headroom
-- `DATABASE_POOL_CLASS=auto` uses queue pooling for Supabase pooler with conservative caps (`:6543` and `:5432` both default to `pool_size=1`, `max_overflow=0`)
+- `DATABASE_POOL_CLASS=auto` uses queue pooling for Supabase pooler with conservative caps (`:6543` defaults to `pool_size=2`, `max_overflow=0`; `:5432` stays `pool_size=1`, `max_overflow=0` if transaction override is disabled)
 - Supabase pooler connections default to fast failure (`DATABASE_POOL_TIMEOUT_SECONDS=3`, `DATABASE_CONNECT_TIMEOUT_SECONDS=3`) so login does not hang for a minute when the DB pool is saturated
 - when `SUPABASE_FORCE_TRANSACTION_POOLER=true` (default), Supabase pooler URLs in session mode are rewritten to transaction mode at runtime, including URLs where port is omitted
 - set `SUPABASE_FORCE_TRANSACTION_POOLER=false` only if you intentionally need session mode behavior on Supabase pooler
 - for Supabase pooler connections, psycopg prepared statements are disabled (`prepare_threshold=None`) to avoid PgBouncer `DuplicatePreparedStatement` failures
 - for non-Supabase Postgres hosts, `DATABASE_POOL_CLASS=auto` uses queue pooling with the conservative defaults above
 - you can force queue pooling by setting `DATABASE_POOL_CLASS=queue`, or force `NullPool` on any host by setting `DATABASE_POOL_CLASS=null` (not recommended for Supabase burst traffic)
-- `CORS_ALLOWED_ORIGINS` and `CORS_ALLOW_ORIGIN_REGEX` can override the built-in mobile/dev/preview origin allowlist if the frontend moves to a new host
+- default CORS reflects mobile/web origins so browser preflight cannot block the app; set `CORS_ALLOW_ORIGIN_REGEX` to a narrower regex if you need a strict production allowlist
 - Alembic startup migration now retries DB connection; if retries exhaust due pool saturation (`MaxClientsInSessionMode`, pool checkout timeout, or similar saturation errors), it can skip migration for that startup so the app can still boot
 - recommended Koyeb default is `ALEMBIC_DB_CONNECT_RETRIES=1` so startup does not miss health-check windows when DB pool is saturated
 - `ESIM_USAGE_SYNC_ENABLED=false` keeps the scheduled all-profile usage sync disabled by default; user-triggered `/usage/sync/my` still works and is safer for small Supabase/Koyeb pools
