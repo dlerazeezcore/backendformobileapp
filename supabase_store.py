@@ -148,11 +148,24 @@ def normalize_usage_pair_to_mb(
 
 
 def normalize_database_url(database_url: str) -> str:
+    normalized_url = database_url
     if database_url.startswith("postgresql://"):
-        return database_url.replace("postgresql://", "postgresql+psycopg://", 1)
-    if database_url.startswith("postgres://"):
-        return database_url.replace("postgres://", "postgresql+psycopg://", 1)
-    return database_url
+        normalized_url = database_url.replace("postgresql://", "postgresql+psycopg://", 1)
+    elif database_url.startswith("postgres://"):
+        normalized_url = database_url.replace("postgres://", "postgresql+psycopg://", 1)
+
+    if not _read_bool_env("SUPABASE_FORCE_TRANSACTION_POOLER", default=True):
+        return normalized_url
+
+    parsed = urlparse(normalized_url)
+    hostname = (parsed.hostname or "").lower()
+    if "pooler.supabase.com" not in hostname:
+        return normalized_url
+    if parsed.port != 5432:
+        return normalized_url
+    if parsed.netloc.endswith(":5432"):
+        return parsed._replace(netloc=parsed.netloc[:-5] + ":6543").geturl()
+    return normalized_url
 
 
 def _read_int_env(name: str, default: int, *, minimum: int = 0) -> int:
@@ -164,6 +177,18 @@ def _read_int_env(name: str, default: int, *, minimum: int = 0) -> int:
     except ValueError:
         return default
     return max(parsed, minimum)
+
+
+def _read_bool_env(name: str, default: bool) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def _read_pool_class_env(default: str = "auto") -> str:

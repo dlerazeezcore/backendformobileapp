@@ -55,14 +55,7 @@ CORS_ALLOWED_ORIGINS = [
     "http://127.0.0.1:5173",
 ]
 CORS_ALLOWED_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
-CORS_ALLOWED_HEADERS = [
-    "Authorization",
-    "Content-Type",
-    "Baggage",
-    "Sentry-Trace",
-    "X-Client-Info",
-    "Apikey",
-]
+CORS_ALLOWED_HEADERS = ["*"]
 CORS_ALLOW_ORIGIN_REGEX = r"^https://([a-zA-Z0-9-]+\.)?figma\.site$"
 FIB_PAYMENT_BASE_URL = "https://fib.prod.fib.iq"
 FIB_PAYMENT_TIMEOUT_SECONDS = 30.0

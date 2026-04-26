@@ -6,7 +6,7 @@ import unittest
 from sqlalchemy.pool import NullPool
 from sqlalchemy.pool import QueuePool
 
-from supabase_store import create_database
+from supabase_store import create_database, normalize_database_url
 
 
 class DatabasePoolingTest(unittest.TestCase):
@@ -17,6 +17,7 @@ class DatabasePoolingTest(unittest.TestCase):
             "DATABASE_POOL_TIMEOUT_SECONDS",
             "DATABASE_POOL_RECYCLE_SECONDS",
             "DATABASE_POOL_CLASS",
+            "SUPABASE_FORCE_TRANSACTION_POOLER",
         ):
             os.environ.pop(name, None)
 
@@ -50,8 +51,24 @@ class DatabasePoolingTest(unittest.TestCase):
         engine = session_factory.kw["bind"]
         try:
             self.assertIsInstance(engine.pool, NullPool)
+            self.assertEqual(engine.url.port, 6543)
         finally:
             engine.dispose()
+
+    def test_normalize_database_url_moves_supabase_pooler_to_transaction_port(self) -> None:
+        normalized = normalize_database_url(
+            "postgresql://user:password@aws-1-ap-southeast-2.pooler.supabase.com:5432/postgres"
+        )
+        self.assertTrue(normalized.startswith("postgresql+psycopg://"))
+        self.assertIn(":6543/", normalized)
+
+    def test_normalize_database_url_can_keep_session_pooler_when_override_disabled(self) -> None:
+        os.environ["SUPABASE_FORCE_TRANSACTION_POOLER"] = "false"
+        normalized = normalize_database_url(
+            "postgresql://user:password@aws-1-ap-southeast-2.pooler.supabase.com:5432/postgres"
+        )
+        self.assertTrue(normalized.startswith("postgresql+psycopg://"))
+        self.assertIn(":5432/", normalized)
 
     def test_pool_class_can_force_null_pool(self) -> None:
         os.environ["DATABASE_POOL_CLASS"] = "null"
