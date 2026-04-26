@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -15,7 +16,6 @@ from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-from starlette.concurrency import run_in_threadpool
 
 from config import get_settings
 from phone_utils import normalize_phone, phone_lookup_candidates
@@ -101,6 +101,29 @@ def _api_error(status_code: int, code: str, message: str) -> HTTPException:
             "message": message,
         },
     )
+
+
+def _read_float_env(name: str, default: float, *, minimum: float = 0.0) -> float:
+    raw_value = os.getenv(name)
+    if raw_value is None or raw_value.strip() == "":
+        return default
+    try:
+        parsed = float(raw_value)
+    except ValueError:
+        return default
+    return max(parsed, minimum)
+
+
+async def _run_login_db_worker(worker: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    timeout_seconds = _read_float_env("AUTH_DB_TIMEOUT_SECONDS", 4.0, minimum=0.5)
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(worker, *args, **kwargs), timeout=timeout_seconds)
+    except asyncio.TimeoutError as exc:
+        raise _api_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "AUTH_DB_TIMEOUT",
+            "Login database check timed out. Please retry in a few seconds.",
+        ) from exc
 
 
 def _urlsafe_b64encode(raw: bytes) -> str:
@@ -388,6 +411,103 @@ def _issue_subject_session(row: AppUser | AdminUser, *, subject_type: str) -> di
     }
 
 
+def _lookup_login_subject_id(session_factory: Callable[[], Session], phone: str) -> tuple[str, str]:
+    db = session_factory()
+    try:
+        user_row = _lookup_user_by_phone(db, phone)
+        if user_row is not None:
+            if not _is_row_active(user_row):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="User account exists but is not active. Please contact support.",
+                )
+            return ("user", user_row.id)
+
+        admin_row = _lookup_admin_by_phone(db, phone)
+        if admin_row is not None:
+            if not _is_row_active(admin_row):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Admin account exists but is not active.",
+                )
+            return ("admin", admin_row.id)
+
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User account not found. Please sign up first.",
+        )
+    finally:
+        db.close()
+
+
+def _issue_login_for_subject_id(
+    session_factory: Callable[[], Session],
+    *,
+    subject_type: str,
+    subject_id: str,
+) -> dict[str, Any]:
+    db = session_factory()
+    try:
+        if subject_type == "admin":
+            row = db.scalar(select(AdminUser).where(AdminUser.id == subject_id))
+        else:
+            row = db.scalar(select(AppUser).where(AppUser.id == subject_id))
+        if row is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Auth subject not found")
+        if not _is_row_active(row):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is not active.")
+        row.last_login_at = utcnow()
+        db.commit()
+        db.refresh(row)
+        return _issue_subject_session(row, subject_type=subject_type)
+    finally:
+        db.close()
+
+
+def _login_subject_with_password(
+    session_factory: Callable[[], Session],
+    *,
+    phone: str,
+    password: str,
+) -> dict[str, Any]:
+    db = session_factory()
+    try:
+        user_row = _lookup_user_by_phone(db, phone)
+        if user_row is not None:
+            if not _is_row_active(user_row):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="User account exists but is not active. Please contact support.",
+                )
+            if verify_password(password, user_row.password_hash):
+                user_row.last_login_at = utcnow()
+                db.commit()
+                db.refresh(user_row)
+                return _issue_subject_session(user_row, subject_type="user")
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid phone or password")
+
+        admin_row = _lookup_admin_by_phone(db, phone)
+        if admin_row is not None:
+            if not _is_row_active(admin_row):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Admin account exists but is not active.",
+                )
+            if verify_password(password, admin_row.password_hash):
+                admin_row.last_login_at = utcnow()
+                db.commit()
+                db.refresh(admin_row)
+                return _issue_subject_session(admin_row, subject_type="admin")
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid phone or password")
+
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User account not found. Please sign up first.",
+        )
+    finally:
+        db.close()
+
+
 def register_auth_routes(
     app: FastAPI,
     get_db: Callable[..., Any],
@@ -533,94 +653,43 @@ def register_auth_routes(
     @app.post("/api/v1/auth/user/login")
     async def user_login(
         payload: LoginPayload,
-        db: Session = Depends(get_db),
+        request: Request,
         provider: TwilioWhatsAppVerifyAPI | None = Depends(_get_optional_twilio_provider),
     ) -> dict[str, Any]:
         normalized_phone = _normalize_and_validate_signup_phone(payload.phone)
         _log_phone_lookup("auth.user.login", payload.phone, normalized_phone)
+        session_factory = request.app.state.db_session_factory
         if payload.otp_code:
             requested_channel = _normalize_otp_channel(payload.otp_channel, field_name="otpChannel")
-            user_row = await run_in_threadpool(_lookup_user_by_phone, db, normalized_phone)
-            if user_row is not None:
-                required_provider = _require_twilio_provider(provider)
-                if not _is_row_active(user_row):
-                    raise HTTPException(
-                        status_code=status.HTTP_403_FORBIDDEN,
-                        detail="User account exists but is not active. Please contact support.",
-                    )
-                await _verify_twilio_user_otp(
-                    provider=required_provider,
-                    phone=normalized_phone,
-                    code=payload.otp_code,
-                    expected_channel=requested_channel,
-                    verification_sid=payload.verification_sid,
-                )
-                user_row.last_login_at = utcnow()
-                await run_in_threadpool(db.commit)
-                return _issue_subject_session(user_row, subject_type="user")
-
-            # Keep parity with password login compatibility:
-            # if an admin account is using the shared /auth/user/login endpoint,
-            # allow OTP login and issue an admin session token.
-            admin_row = await run_in_threadpool(_lookup_admin_by_phone, db, normalized_phone)
-            if admin_row is not None:
-                required_provider = _require_twilio_provider(provider)
-                if not _is_row_active(admin_row):
-                    raise HTTPException(
-                        status_code=status.HTTP_403_FORBIDDEN,
-                        detail="Admin account exists but is not active.",
-                    )
-                await _verify_twilio_user_otp(
-                    provider=required_provider,
-                    phone=normalized_phone,
-                    code=payload.otp_code,
-                    expected_channel=requested_channel,
-                    verification_sid=payload.verification_sid,
-                )
-                admin_row.last_login_at = utcnow()
-                await run_in_threadpool(db.commit)
-                return _issue_subject_session(admin_row, subject_type="admin")
-
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User account not found. Please sign up first.",
+            subject_type, subject_id = await _run_login_db_worker(
+                _lookup_login_subject_id,
+                session_factory,
+                normalized_phone,
+            )
+            required_provider = _require_twilio_provider(provider)
+            await _verify_twilio_user_otp(
+                provider=required_provider,
+                phone=normalized_phone,
+                code=payload.otp_code,
+                expected_channel=requested_channel,
+                verification_sid=payload.verification_sid,
+            )
+            return await _run_login_db_worker(
+                _issue_login_for_subject_id,
+                session_factory,
+                subject_type=subject_type,
+                subject_id=subject_id,
             )
 
         if payload.password is None:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="password or otpCode is required")
 
-        user_row = await run_in_threadpool(_lookup_user_by_phone, db, normalized_phone)
-        if user_row is None:
-            # Compatibility path for frontends using a single login endpoint.
-            admin_row = await run_in_threadpool(_lookup_admin_by_phone, db, normalized_phone)
-            if admin_row is not None:
-                if not _is_row_active(admin_row):
-                    raise HTTPException(
-                        status_code=status.HTTP_403_FORBIDDEN,
-                        detail="Admin account exists but is not active.",
-                    )
-                if await run_in_threadpool(verify_password, payload.password, admin_row.password_hash):
-                    admin_row.last_login_at = utcnow()
-                    await run_in_threadpool(db.commit)
-                    return _issue_subject_session(admin_row, subject_type="admin")
-                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid phone or password")
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User account not found. Please sign up first.",
-            )
-
-        if not _is_row_active(user_row):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="User account exists but is not active. Please contact support.",
-            )
-
-        if await run_in_threadpool(verify_password, payload.password, user_row.password_hash):
-            user_row.last_login_at = utcnow()
-            await run_in_threadpool(db.commit)
-            return _issue_subject_session(user_row, subject_type="user")
-
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid phone or password")
+        return await _run_login_db_worker(
+            _login_subject_with_password,
+            session_factory,
+            phone=normalized_phone,
+            password=payload.password,
+        )
 
     @app.post("/api/v1/auth/user/register")
     @app.post("/api/v1/auth/user/signup")
