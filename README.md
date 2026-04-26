@@ -396,7 +396,7 @@ Notes:
 - for Supabase pooler connections, psycopg prepared statements are disabled (`prepare_threshold=None`) to avoid PgBouncer `DuplicatePreparedStatement` failures
 - for non-Supabase Postgres hosts, `DATABASE_POOL_CLASS=auto` uses queue pooling with the conservative defaults above
 - you can force queue pooling by setting `DATABASE_POOL_CLASS=queue`, or force `NullPool` on any host by setting `DATABASE_POOL_CLASS=null` (not recommended for Supabase burst traffic)
-- Alembic startup migration now retries DB connection; if retries exhaust due pool saturation (`MaxClientsInSessionMode`), it can skip migration for that startup so the app can still boot
+- Alembic startup migration now retries DB connection; if retries exhaust due pool saturation (`MaxClientsInSessionMode`, pool checkout timeout, or similar saturation errors), it can skip migration for that startup so the app can still boot
 - if `FIB_PAYMENT_CLIENT_ID` and `FIB_PAYMENT_CLIENT_SECRET` are missing, FIB routes return `503` (integration disabled)
 - `FIB_PAYMENT_WEBHOOK_SECRET` is optional; set it when you want signed webhook validation
 - push notifications require either `FIREBASE_SERVICE_ACCOUNT_FILE` or `FIREBASE_SERVICE_ACCOUNT_JSON`

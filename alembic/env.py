@@ -8,7 +8,9 @@ import logging
 from alembic import context
 from dotenv import load_dotenv
 from sqlalchemy import engine_from_config, pool
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import InternalError as SQLAlchemyInternalError
+from sqlalchemy.exc import OperationalError as SQLAlchemyOperationalError
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 from supabase_store import Base, normalize_database_url
 
@@ -34,9 +36,15 @@ def _as_bool(value: str | None, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _is_pool_saturation_error(error: OperationalError) -> bool:
+def _is_pool_saturation_error(error: BaseException) -> bool:
     lowered = str(error).lower()
-    return "maxclientsinsessionmode" in lowered or "max clients reached" in lowered
+    return (
+        "maxclientsinsessionmode" in lowered
+        or "max clients reached" in lowered
+        or "unable to check out connection from the pool due to timeout" in lowered
+        or "check out connection from the pool due to timeout" in lowered
+        or "dbhandler exited" in lowered
+    )
 
 
 def _is_supabase_pooler_database_url(url: str) -> bool:
@@ -71,37 +79,40 @@ def run_migrations_online() -> None:
         connect_args={"prepare_threshold": None} if _is_supabase_pooler_database_url(database_url) else {},
     )
 
-    for attempt in range(1, max_retries + 1):
-        try:
-            with connectable.connect() as connection:
-                context.configure(
-                    connection=connection,
-                    target_metadata=target_metadata,
-                    compare_type=True,
-                    compare_server_default=True,
-                )
+    try:
+        for attempt in range(1, max_retries + 1):
+            try:
+                with connectable.connect() as connection:
+                    context.configure(
+                        connection=connection,
+                        target_metadata=target_metadata,
+                        compare_type=True,
+                        compare_server_default=True,
+                    )
 
-                with context.begin_transaction():
-                    context.run_migrations()
-            return
-        except OperationalError as error:
-            if attempt < max_retries:
-                LOGGER.warning(
-                    "Alembic DB connect failed (attempt %s/%s). Retrying in %.1fs.",
-                    attempt,
-                    max_retries,
-                    retry_delay_seconds,
-                )
-                time.sleep(retry_delay_seconds)
-                continue
-            if allow_skip_on_pool_saturation and _is_pool_saturation_error(error):
-                LOGGER.warning(
-                    "Skipping alembic migration for this startup after %s failed connection attempts "
-                    "due to DB pool saturation.",
-                    max_retries,
-                )
+                    with context.begin_transaction():
+                        context.run_migrations()
                 return
-            raise
+            except (SQLAlchemyOperationalError, SQLAlchemyInternalError, SQLAlchemyTimeoutError) as error:
+                if attempt < max_retries:
+                    LOGGER.warning(
+                        "Alembic DB connect failed (attempt %s/%s). Retrying in %.1fs.",
+                        attempt,
+                        max_retries,
+                        retry_delay_seconds,
+                    )
+                    time.sleep(retry_delay_seconds)
+                    continue
+                if allow_skip_on_pool_saturation and _is_pool_saturation_error(error):
+                    LOGGER.warning(
+                        "Skipping alembic migration for this startup after %s failed connection attempts "
+                        "due to DB pool saturation.",
+                        max_retries,
+                    )
+                    return
+                raise
+    finally:
+        connectable.dispose()
 
 
 if context.is_offline_mode():
