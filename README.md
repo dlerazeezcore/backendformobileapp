@@ -372,8 +372,8 @@ FIREBASE_SERVICE_ACCOUNT_FILE=/absolute/path/to/firebase-service-account.json
 FIREBASE_SERVICE_ACCOUNT_JSON={"type":"service_account","project_id":"..."}
 PUSH_NOTIFICATION_DEFAULT_CHANNEL_ID=general
 DATABASE_URL=postgresql://USER:PASSWORD@HOST:PORT/DATABASE
-DATABASE_POOL_SIZE=2
-DATABASE_MAX_OVERFLOW=0
+DATABASE_POOL_SIZE=4
+DATABASE_MAX_OVERFLOW=1
 DATABASE_POOL_TIMEOUT_SECONDS=3
 DATABASE_CONNECT_TIMEOUT_SECONDS=3
 DATABASE_STATEMENT_TIMEOUT_MS=5000
@@ -398,9 +398,9 @@ Notes:
 - repeated `/api/v1/esim-access/packages/query` payloads are cached in-memory for `ESIM_PACKAGES_CACHE_TTL_SECONDS` (default `20`) to reduce provider round-trips during app startup bursts
 - set `ESIM_PACKAGES_CACHE_TTL_SECONDS=0` to disable this cache
 - for Supabase, prefer the pooler connection string when the direct host is not reachable
-- Postgres DB pooling defaults are intentionally conservative: two app-side connections per process for Supabase transaction-pooler hosts, one for Supabase session-pooler hosts, and small queue pooling defaults for non-Supabase hosts
+- Postgres DB pooling defaults are intentionally conservative: four app-side connections per process for Supabase transaction-pooler hosts, one for Supabase session-pooler hosts, and small queue pooling defaults for non-Supabase hosts
 - tune `DATABASE_POOL_SIZE` and `DATABASE_MAX_OVERFLOW` only if the Supabase pooler size and Koyeb process/worker count leave enough headroom
-- `DATABASE_POOL_CLASS=auto` uses queue pooling for Supabase pooler with conservative caps (`:6543` defaults to `pool_size=2`, `max_overflow=0`; `:5432` stays `pool_size=1`, `max_overflow=0` if transaction override is disabled)
+- `DATABASE_POOL_CLASS=auto` uses queue pooling for Supabase pooler with conservative caps (`:6543` defaults to `pool_size=4`, `max_overflow=1`; `:5432` stays `pool_size=1`, `max_overflow=0` if transaction override is disabled)
 - Supabase pooler connections default to fast failure (`DATABASE_POOL_TIMEOUT_SECONDS=3`, `DATABASE_CONNECT_TIMEOUT_SECONDS=3`) so login does not hang for a minute when the DB pool is saturated
 - Supabase pooler queries also set Postgres-side fast-fail limits (`DATABASE_STATEMENT_TIMEOUT_MS=5000`, `DATABASE_LOCK_TIMEOUT_MS=3000`, `DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS=10000`) so stuck PgBouncer/server waits release app pool slots instead of wedging login
 - when `SUPABASE_FORCE_TRANSACTION_POOLER=true` (default), Supabase pooler URLs in session mode are rewritten to transaction mode at runtime, including URLs where port is omitted
