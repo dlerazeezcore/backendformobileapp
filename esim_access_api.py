@@ -15,7 +15,7 @@ from typing import Any, Callable, Generic, TypeVar
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
@@ -1291,6 +1291,7 @@ def register_esim_access_routes(
     usage_sync_interval_seconds = 3600
     usage_sync_batch_size = 50
     usage_sync_enabled = _read_bool_env("ESIM_USAGE_SYNC_ENABLED", default=False)
+    usage_sync_skip_if_busy = _read_bool_env("ESIM_USAGE_SYNC_SKIP_IF_BUSY", default=True)
     usage_sync_initial_delay_seconds = max(float(os.getenv("ESIM_USAGE_SYNC_INITIAL_DELAY_SECONDS", "45")), 0.0)
     usage_sync_lock = asyncio.Lock()
     exchange_rate_settings_cache: dict[str, Any] | None = None
@@ -1386,6 +1387,14 @@ def register_esim_access_routes(
             "total": total,
         }
 
+    def _empty_usage_sync_summary() -> dict[str, int]:
+        return {
+            "esimTranNosRequested": 0,
+            "providerCalls": 0,
+            "usageRecordsReceived": 0,
+            "profilesSynced": 0,
+        }
+
     async def _sync_usage_for_esim_tran_nos(
         *,
         db: Session,
@@ -1395,17 +1404,14 @@ def register_esim_access_routes(
     ) -> dict[str, int]:
         unique_esim_tran_nos = _dedupe_esim_tran_nos(esim_tran_nos)
         if not unique_esim_tran_nos:
-            return {
-                "esimTranNosRequested": 0,
-                "providerCalls": 0,
-                "usageRecordsReceived": 0,
-                "profilesSynced": 0,
-            }
+            return _empty_usage_sync_summary()
 
         provider_calls = 0
         usage_records_received = 0
         synced_profile_ids: set[int] = set()
         for batch in _chunk_values(unique_esim_tran_nos, size=usage_sync_batch_size):
+            # Avoid holding a checked-out DB connection while waiting on provider IO.
+            db.close()
             provider_calls += 1
             provider_response = await provider.usage_check(UsageCheckRequest(esimTranNoList=batch))
             provider_payload = provider_response.model_dump(by_alias=True, exclude_none=True)
@@ -1439,6 +1445,7 @@ def register_esim_access_routes(
         db = session_factory()
         try:
             esim_tran_nos = _list_all_esim_tran_nos(db)
+            db.close()
             async with usage_sync_lock:
                 summary = await _sync_usage_for_esim_tran_nos(
                     db=db,
@@ -1881,6 +1888,8 @@ def register_esim_access_routes(
         db: Session = Depends(get_db),
         _: AdminUser = Depends(_require_admin_actor),
     ) -> dict[str, Any]:
+        # Free the pool slot while waiting on upstream provider network latency.
+        db.close()
         async with usage_sync_lock:
             provider_response = await provider.usage_check(payload.provider_request)
             profiles = SupabaseStore(db).sync_usage_records(
@@ -1902,6 +1911,7 @@ def register_esim_access_routes(
     )
     @app.post("/api/v1/esim-access/usage/refresh/my")
     async def sync_my_usage(
+        request: Request,
         provider: ESimAccessAPI = Depends(get_provider),
         db: Session = Depends(get_db),
         claims: dict[str, Any] = Depends(get_token_claims),
@@ -1916,23 +1926,29 @@ def register_esim_access_routes(
         store = SupabaseStore(db)
         existing_rows = store.list_profiles_for_user(user_id=target_user_id)
         esim_tran_nos = _collect_esim_tran_nos(existing_rows)
+        db.close()
 
         if esim_tran_nos:
             actor_phone = str(claims.get("phone") or "")
-            async with usage_sync_lock:
-                sync_summary = await _sync_usage_for_esim_tran_nos(
-                    db=db,
-                    provider=provider,
-                    esim_tran_nos=esim_tran_nos,
-                    actor_phone=actor_phone,
+            if usage_sync_skip_if_busy and usage_sync_lock.locked():
+                LOGGER.info(
+                    "usage.sync.my skipped busy lock user_id=%s path=%s",
+                    target_user_id,
+                    request.url.path,
                 )
+                sync_summary = _empty_usage_sync_summary()
+            else:
+                async with usage_sync_lock:
+                    sync_summary = await _sync_usage_for_esim_tran_nos(
+                        db=db,
+                        provider=provider,
+                        esim_tran_nos=esim_tran_nos,
+                        actor_phone=actor_phone,
+                    )
         else:
-            sync_summary = {
-                "esimTranNosRequested": 0,
-                "providerCalls": 0,
-                "usageRecordsReceived": 0,
-                "profilesSynced": 0,
-            }
+            sync_summary = _empty_usage_sync_summary()
+        db.close()
+        store = SupabaseStore(db)
         profile_data = _serialize_profiles_for_user(
             store=store,
             user_id=target_user_id,

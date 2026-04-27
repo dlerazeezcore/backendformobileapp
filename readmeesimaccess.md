@@ -72,6 +72,7 @@ ESIM_ACCESS_ACCESS_CODE="<provider access code>"
 ESIM_ACCESS_SECRET_KEY="<provider secret key>"
 ESIM_ACCESS_WEBHOOK_SECRET="<your private webhook verification secret>"
 ESIM_USAGE_SYNC_ENABLED=false
+ESIM_USAGE_SYNC_SKIP_IF_BUSY=true
 PUBLIC_DB_FAILURE_BACKOFF_SECONDS=15
 DATABASE_URL="postgresql+psycopg://..."
 DATABASE_POOL_SIZE=4
@@ -245,6 +246,7 @@ Queries provider usage and writes it into `esim_profiles`.
 `POST /usage/sync/my`
 
 User-scoped usage refresh. Requires an active bearer token and refreshes only caller-owned profiles (or `userId` when an admin token is used).
+When `ESIM_USAGE_SYNC_SKIP_IF_BUSY=true` and another usage sync is already running, the endpoint returns the latest DB-backed profile list immediately with zeroed sync counters instead of queueing behind the lock.
 
 ```text
 POST /api/v1/esim-access/usage/sync/my
