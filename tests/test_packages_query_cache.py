@@ -12,6 +12,7 @@ class PackagesQueryCacheTest(unittest.IsolatedAsyncioTestCase):
         for name in (
             "ESIM_PACKAGES_CACHE_TTL_SECONDS",
             "ESIM_PACKAGES_CACHE_MAX_ENTRIES",
+            "ESIM_LOCATIONS_CACHE_TTL_SECONDS",
         ):
             os.environ.pop(name, None)
 
@@ -24,6 +25,19 @@ class PackagesQueryCacheTest(unittest.IsolatedAsyncioTestCase):
             payload = PackageQueryRequest(location_code="IQ", type="COUNTRY")
             response_one = await provider.get_packages(payload)
             response_two = await provider.get_packages(payload)
+            self.assertEqual(provider._post.await_count, 1)
+            self.assertEqual(response_one, response_two)
+        finally:
+            await provider.close()
+
+    async def test_locations_reuses_cached_response_for_catalog_payload(self) -> None:
+        os.environ["ESIM_LOCATIONS_CACHE_TTL_SECONDS"] = "20"
+        provider = ESimAccessAPI(access_code="code", secret_key="secret")
+        provider._post = AsyncMock(side_effect=[{"obj": {"locationList": [1]}}, {"obj": {"locationList": [2]}}])  # type: ignore[method-assign]
+
+        try:
+            response_one = await provider.locations()
+            response_two = await provider.locations()
             self.assertEqual(provider._post.await_count, 1)
             self.assertEqual(response_one, response_two)
         finally:
@@ -60,4 +74,3 @@ class PackagesQueryCacheTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

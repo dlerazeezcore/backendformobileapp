@@ -218,6 +218,22 @@ class UserScopedReadsTest(unittest.TestCase):
             self.assertEqual(payload["data"]["profiles"][0]["status"], "active")
             self.assertTrue(payload["data"]["profiles"][0]["installed"])
 
+    def test_profiles_my_status_all_does_not_filter_out_profiles(self) -> None:
+        token = self._token(
+            subject_id="22222222-2222-2222-2222-222222222222",
+            phone="+9647700000002",
+            subject_type="user",
+        )
+        with TestClient(create_app()) as client:
+            response = client.get(
+                "/api/v1/esim-access/profiles/my?status=all&includeInactive=true&includeUninstalled=true",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertEqual(payload["data"]["total"], 1)
+            self.assertEqual(payload["data"]["profiles"][0]["iccid"], "ICCID-USER1")
+
     def test_profiles_my_days_left_starts_after_activation(self) -> None:
         with self.session_factory() as session:
             profile = session.scalar(select(ESimProfile).where(ESimProfile.iccid == "ICCID-USER2"))

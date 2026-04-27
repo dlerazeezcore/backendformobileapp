@@ -889,10 +889,13 @@ class ESimAccessAPI:
             transport=transport,
             headers={"Accept": "application/json"},
         )
-        self.packages_cache_ttl_seconds = self._read_float_env("ESIM_PACKAGES_CACHE_TTL_SECONDS", 20.0, minimum=0.0)
+        self.packages_cache_ttl_seconds = self._read_float_env("ESIM_PACKAGES_CACHE_TTL_SECONDS", 7200.0, minimum=0.0)
         self.packages_cache_max_entries = self._read_int_env("ESIM_PACKAGES_CACHE_MAX_ENTRIES", 128, minimum=1)
         self._packages_cache: dict[str, tuple[float, ESimAccessResponse[PackageListResult]]] = {}
         self._packages_cache_lock = asyncio.Lock()
+        self.locations_cache_ttl_seconds = self._read_float_env("ESIM_LOCATIONS_CACHE_TTL_SECONDS", 7200.0, minimum=0.0)
+        self._locations_cache: tuple[float, ESimAccessResponse[LocationListResult]] | None = None
+        self._locations_cache_lock = asyncio.Lock()
 
     async def close(self) -> None:
         await self.client.aclose()
@@ -1023,7 +1026,24 @@ class ESimAccessAPI:
         self,
         request: EmptyRequest | None = None,
     ) -> ESimAccessResponse[LocationListResult]:
-        return await self._post("/api/v1/open/location/list", request or EmptyRequest(), ESimAccessResponse[LocationListResult])
+        payload = request or EmptyRequest()
+        if self.locations_cache_ttl_seconds <= 0:
+            return await self._post("/api/v1/open/location/list", payload, ESimAccessResponse[LocationListResult])
+
+        now = monotonic()
+        async with self._locations_cache_lock:
+            if self._locations_cache is not None:
+                expires_at, cached_response = self._locations_cache
+                if expires_at > now:
+                    return cached_response
+                self._locations_cache = None
+
+        response = await self._post("/api/v1/open/location/list", payload, ESimAccessResponse[LocationListResult])
+
+        async with self._locations_cache_lock:
+            self._locations_cache = (monotonic() + self.locations_cache_ttl_seconds, response)
+
+        return response
 
     async def _post(
         self,
@@ -1288,11 +1308,19 @@ def register_esim_access_routes(
     get_db: Callable[..., Any],
     get_provider: Callable[..., ESimAccessAPI],
 ) -> None:
-    usage_sync_interval_seconds = 3600
-    usage_sync_batch_size = 50
+    usage_sync_interval_seconds = ESimAccessAPI._read_float_env(
+        "ESIM_USAGE_SYNC_INTERVAL_SECONDS",
+        7200.0,
+        minimum=300.0,
+    )
+    usage_sync_batch_size = ESimAccessAPI._read_int_env("ESIM_USAGE_SYNC_BATCH_SIZE", 50, minimum=1)
     usage_sync_enabled = _read_bool_env("ESIM_USAGE_SYNC_ENABLED", default=False)
     usage_sync_skip_if_busy = _read_bool_env("ESIM_USAGE_SYNC_SKIP_IF_BUSY", default=True)
-    usage_sync_initial_delay_seconds = max(float(os.getenv("ESIM_USAGE_SYNC_INITIAL_DELAY_SECONDS", "45")), 0.0)
+    usage_sync_initial_delay_seconds = ESimAccessAPI._read_float_env(
+        "ESIM_USAGE_SYNC_INITIAL_DELAY_SECONDS",
+        45.0,
+        minimum=0.0,
+    )
     usage_sync_lock = asyncio.Lock()
     exchange_rate_settings_cache: dict[str, Any] | None = None
     exchange_rate_settings_retry_after = 0.0
@@ -1371,11 +1399,14 @@ def register_esim_access_routes(
         serialized = [_serialize_profile(row, now=now) for row in rows]
         if status_filter is not None and status_filter.strip():
             normalized_status = status_filter.strip().lower()
+            if normalized_status in {"all", "any", "*"}:
+                normalized_status = ""
             if normalized_status in {"booked", "got_resource", "released", "pending_install", "pending"}:
                 normalized_status = "inactive"
             if normalized_status in {"cancelled", "canceled", "revoked", "refunded", "voided", "closed"}:
                 normalized_status = "expired"
-            serialized = [row for row in serialized if str(row.get("status") or "").strip().lower() == normalized_status]
+            if normalized_status:
+                serialized = [row for row in serialized if str(row.get("status") or "").strip().lower() == normalized_status]
         if installed_filter is not None:
             serialized = [row for row in serialized if bool(row.get("installed")) is installed_filter]
         total = len(serialized)

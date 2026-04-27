@@ -28,7 +28,7 @@ from sqlalchemy import (
     or_,
     select,
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, joinedload, mapped_column, relationship, sessionmaker
 from sqlalchemy.pool import NullPool
 
 from phone_utils import normalize_phone, phone_lookup_candidates
@@ -498,6 +498,10 @@ class DiscountRule(TimeMixin, Base):
 
 class FeaturedLocation(TimeMixin, Base):
     __tablename__ = "featured_locations"
+    __table_args__ = (
+        Index("ix_featured_locations_public_lookup", "service_type", "enabled", "is_popular", "sort_order", "updated_at"),
+    )
+
     id: Mapped[int] = mapped_column(primary_key=True)
     code: Mapped[str] = mapped_column(String(16), index=True)
     name: Mapped[str] = mapped_column(String(255))
@@ -791,12 +795,12 @@ def create_database(database_url: str) -> sessionmaker[Session]:
                 default_pool_size = 1
                 default_max_overflow = 0
             elif is_supabase_transaction_pooler:
-                default_pool_size = 4
-                default_max_overflow = 1
+                default_pool_size = 2
+                default_max_overflow = 0
             else:
                 default_pool_size = 2
                 default_max_overflow = 1
-            default_pool_timeout = 3 if is_supabase_database else 15
+            default_pool_timeout = 10 if is_supabase_database else 15
             engine_options = {
                 "pool_size": _read_int_env("DATABASE_POOL_SIZE", default_pool_size, minimum=1),
                 "max_overflow": _read_int_env("DATABASE_MAX_OVERFLOW", default_max_overflow),
@@ -3105,6 +3109,7 @@ class SupabaseStore:
                     "isPopular": bool(row.is_popular),
                     "enabled": bool(row.enabled),
                     "sortOrder": int(row.sort_order or 0),
+                    "customFields": dict(row.custom_fields or {}),
                     "updatedAt": self._to_app_timezone(row.updated_at),
                 }
             )
@@ -3120,6 +3125,7 @@ class SupabaseStore:
     ) -> list[ESimProfile | ProfileInventoryRow]:
         profile_rows = self.session.scalars(
             select(ESimProfile)
+            .options(joinedload(ESimProfile.order_item).joinedload(OrderItem.customer_order))
             .outerjoin(OrderItem, ESimProfile.order_item_id == OrderItem.id)
             .outerjoin(CustomerOrder, OrderItem.customer_order_id == CustomerOrder.id)
             .where(
@@ -3201,6 +3207,7 @@ class SupabaseStore:
 
         order_items = self.session.scalars(
             select(OrderItem)
+            .options(joinedload(OrderItem.customer_order))
             .join(CustomerOrder, OrderItem.customer_order_id == CustomerOrder.id)
             .where(
                 CustomerOrder.user_id == user_id,

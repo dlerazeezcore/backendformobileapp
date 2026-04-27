@@ -249,6 +249,9 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         _: AdminUser = Depends(_require_admin_actor),
     ) -> dict[str, Any]:
         row = SupabaseStore(db).save_featured_location(payload.model_dump(by_alias=False))
+        cache_key = _featured_locations_cache_key(payload.service_type)
+        _PUBLIC_FEATURED_LOCATIONS_CACHE.pop(cache_key, None)
+        _PUBLIC_FEATURED_LOCATIONS_RETRY_AFTER.pop(cache_key, None)
         return {"location": {"id": row.id}}
 
     @app.get("/api/v1/admin/featured-locations")

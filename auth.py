@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import time
+from datetime import datetime
 from typing import Any, Callable
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
@@ -272,36 +273,56 @@ def require_active_subject(
     return row
 
 
+def _digits_only(value: str) -> str:
+    return "".join(ch for ch in str(value or "") if ch.isdigit())
+
+
+def _compact_phone_expression(column: Any) -> Any:
+    compact = column
+    for token in ("+", " ", "-", "(", ")", "\t", "\r", "\n"):
+        compact = func.replace(compact, token, "")
+    return compact
+
+
+def _lookup_row_by_compact_phone(db: Session, model: type[AppUser] | type[AdminUser], candidates: list[str]) -> Any | None:
+    compact_candidates = sorted({_digits_only(candidate) for candidate in candidates if _digits_only(candidate)})
+    if not compact_candidates:
+        return None
+    return db.scalar(
+        select(model)
+        .where(_compact_phone_expression(model.phone).in_(compact_candidates))
+        .limit(1)
+    )
+
+
 def _lookup_admin_by_phone(db: Session, phone: str) -> AdminUser | None:
     candidates = phone_lookup_candidates(phone)
     if candidates:
-        row = db.scalar(select(AdminUser).where(AdminUser.phone.in_(candidates)))
+        row = db.scalar(select(AdminUser).where(AdminUser.phone.in_(candidates)).limit(1))
         if row is not None:
             return row
     canonical = normalize_phone(phone)
     if not canonical:
         return None
-    for row in db.scalars(select(AdminUser)):
-        if normalize_phone(row.phone or "") == canonical:
-            LOGGER.info("auth.lookup.admin fallback-normalized-match canonical=%s stored=%s", canonical, row.phone)
-            return row
-    return None
+    row = _lookup_row_by_compact_phone(db, AdminUser, candidates)
+    if row is not None:
+        LOGGER.info("auth.lookup.admin fallback-compact-match canonical=%s stored=%s", canonical, row.phone)
+    return row
 
 
 def _lookup_user_by_phone(db: Session, phone: str) -> AppUser | None:
     candidates = phone_lookup_candidates(phone)
     if candidates:
-        row = db.scalar(select(AppUser).where(AppUser.phone.in_(candidates)))
+        row = db.scalar(select(AppUser).where(AppUser.phone.in_(candidates)).limit(1))
         if row is not None:
             return row
     canonical = normalize_phone(phone)
     if not canonical:
         return None
-    for row in db.scalars(select(AppUser)):
-        if normalize_phone(row.phone or "") == canonical:
-            LOGGER.info("auth.lookup.user fallback-normalized-match canonical=%s stored=%s", canonical, row.phone)
-            return row
-    return None
+    row = _lookup_row_by_compact_phone(db, AppUser, candidates)
+    if row is not None:
+        LOGGER.info("auth.lookup.user fallback-compact-match canonical=%s stored=%s", canonical, row.phone)
+    return row
 
 
 def _issue_token(row: AppUser | AdminUser, *, subject_type: str) -> dict[str, Any]:
@@ -411,6 +432,26 @@ def _issue_subject_session(row: AppUser | AdminUser, *, subject_type: str) -> di
     }
 
 
+def _last_login_touch_due(previous: datetime | None, now: datetime) -> bool:
+    interval_seconds = _read_float_env("AUTH_LAST_LOGIN_TOUCH_INTERVAL_SECONDS", 3600.0, minimum=0.0)
+    if previous is None:
+        return True
+    if previous.tzinfo is None and now.tzinfo is not None:
+        previous = previous.replace(tzinfo=now.tzinfo)
+    try:
+        return (now - previous).total_seconds() >= interval_seconds
+    except TypeError:
+        return True
+
+
+def _touch_last_login_if_due(db: Session, row: AppUser | AdminUser) -> None:
+    now = utcnow()
+    if not _last_login_touch_due(row.last_login_at, now):
+        return
+    row.last_login_at = now
+    db.commit()
+
+
 def _lookup_login_subject_id(session_factory: Callable[[], Session], phone: str) -> tuple[str, str]:
     db = session_factory()
     try:
@@ -456,9 +497,7 @@ def _issue_login_for_subject_id(
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Auth subject not found")
         if not _is_row_active(row):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is not active.")
-        row.last_login_at = utcnow()
-        db.commit()
-        db.refresh(row)
+        _touch_last_login_if_due(db, row)
         return _issue_subject_session(row, subject_type=subject_type)
     finally:
         db.close()
@@ -480,9 +519,7 @@ def _login_subject_with_password(
                     detail="User account exists but is not active. Please contact support.",
                 )
             if verify_password(password, user_row.password_hash):
-                user_row.last_login_at = utcnow()
-                db.commit()
-                db.refresh(user_row)
+                _touch_last_login_if_due(db, user_row)
                 return _issue_subject_session(user_row, subject_type="user")
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid phone or password")
 
@@ -494,9 +531,7 @@ def _login_subject_with_password(
                     detail="Admin account exists but is not active.",
                 )
             if verify_password(password, admin_row.password_hash):
-                admin_row.last_login_at = utcnow()
-                db.commit()
-                db.refresh(admin_row)
+                _touch_last_login_if_due(db, admin_row)
                 return _issue_subject_session(admin_row, subject_type="admin")
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid phone or password")
 
