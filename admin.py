@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from auth import get_token_claims, require_active_subject
 from supabase_store import (
     AdminUser,
+    AppSetting,
     CustomerOrder,
     DiscountRule,
     ESimLifecycleEvent,
@@ -26,6 +27,8 @@ from supabase_store import (
     PaymentProviderEvent,
     SupabaseStore,
 )
+
+WHITELIST_SETTINGS_KEY = "country_whitelist"
 from esim_access_api import ActionContext
 
 LOGGER = logging.getLogger("uvicorn.error")
@@ -111,6 +114,43 @@ class FeaturedLocationPayload(BaseModel):
     starts_at: datetime | None = Field(default=None, alias="startsAt")
     ends_at: datetime | None = Field(default=None, alias="endsAt")
     custom_fields: dict[str, Any] = Field(default_factory=dict, alias="customFields")
+
+
+class WhitelistSettingsPayload(BaseModel):
+    enabled: bool | None = None
+    is_enabled: bool | None = Field(default=None, alias="isEnabled")
+    codes: list[str] | None = None
+    country_codes: list[str] | None = Field(default=None, alias="countryCodes")
+    whitelist_codes: list[str] | None = Field(default=None, alias="whitelistCodes")
+    custom_fields: dict[str, Any] | None = Field(default=None, alias="customFields")
+
+    model_config = {"populate_by_name": True}
+
+
+def _normalize_country_codes(values: list[str] | None) -> list[str]:
+    if not values:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in values:
+        code = str(raw or "").strip().upper()
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        out.append(code)
+    return out
+
+
+def _whitelist_response(stored: dict[str, Any]) -> dict[str, Any]:
+    enabled = bool(stored.get("enabled"))
+    codes = _normalize_country_codes(stored.get("codes") if isinstance(stored.get("codes"), list) else [])
+    return {
+        "enabled": enabled,
+        "isEnabled": enabled,
+        "codes": codes,
+        "countryCodes": codes,
+        "whitelistCodes": codes,
+    }
 
 
 def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
@@ -235,6 +275,51 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
     ) -> dict[str, Any]:
         rows = SupabaseStore(db).list_rows(FeaturedLocation, limit=limit, offset=offset)
         return {"locations": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
+
+    @app.get("/api/v1/admin/whitelist-settings")
+    @app.get("/api/v1/admin/settings/whitelist")
+    @app.get("/api/v1/admin/whitelist-countries")
+    @app.get("/api/v1/admin/whitelist")
+    async def get_whitelist_settings(
+        db: Session = Depends(get_db),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
+        stored = SupabaseStore(db).get_app_setting(WHITELIST_SETTINGS_KEY)
+        return {"success": True, "data": _whitelist_response(stored)}
+
+    @app.post("/api/v1/admin/whitelist-settings")
+    @app.post("/api/v1/admin/settings/whitelist")
+    @app.post("/api/v1/admin/whitelist-countries")
+    @app.post("/api/v1/admin/whitelist")
+    async def update_whitelist_settings(
+        payload: WhitelistSettingsPayload,
+        db: Session = Depends(get_db),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
+        # Accept any of the alias keys the frontend might send.
+        enabled_value = payload.enabled
+        if enabled_value is None:
+            enabled_value = payload.is_enabled
+        if enabled_value is None and payload.custom_fields is not None:
+            enabled_value = payload.custom_fields.get("enabled") or payload.custom_fields.get("isEnabled")
+        enabled = bool(enabled_value)
+
+        codes_value: list[str] | None = None
+        for candidate in (payload.codes, payload.country_codes, payload.whitelist_codes):
+            if candidate:
+                codes_value = candidate
+                break
+        if codes_value is None and payload.custom_fields is not None:
+            cf_codes = payload.custom_fields.get("codes") or payload.custom_fields.get("countryCodes")
+            if isinstance(cf_codes, list):
+                codes_value = cf_codes
+
+        normalized_codes = _normalize_country_codes(codes_value)
+        SupabaseStore(db).set_app_setting(
+            WHITELIST_SETTINGS_KEY,
+            {"enabled": enabled, "codes": normalized_codes},
+        )
+        return {"success": True, "data": _whitelist_response({"enabled": enabled, "codes": normalized_codes})}
 
     @app.get("/api/v1/featured-locations/public")
     @app.get("/api/v1/esim-access/featured-locations")
