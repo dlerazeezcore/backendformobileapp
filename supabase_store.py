@@ -298,6 +298,9 @@ class AppUser(TimeMixin, Base):
     status: Mapped[str] = mapped_column(String(32), default="active", nullable=False, index=True)
     is_loyalty: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     notes: Mapped[str | None] = mapped_column(Text)
+    preferred_language: Mapped[str | None] = mapped_column(String(8))
+    preferred_currency: Mapped[str | None] = mapped_column(String(8))
+    notifications_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     blocked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -434,14 +437,6 @@ class TelegramSupportMessage(TimeMixin, Base):
     provider_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-class ProviderFieldRule(TimeMixin, Base):
-    __tablename__ = "provider_field_rules"
-    id: Mapped[int] = mapped_column(primary_key=True)
-    provider: Mapped[str] = mapped_column(String(80), index=True, default="esim_access")
-    entity_type: Mapped[str] = mapped_column(String(80), index=True)
-    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    field_paths: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
-
 
 class ExchangeRate(TimeMixin, Base):
     __tablename__ = "exchange_rates"
@@ -507,7 +502,6 @@ class FeaturedLocation(TimeMixin, Base):
     name: Mapped[str] = mapped_column(String(255))
     service_type: Mapped[str] = mapped_column(String(32), index=True, default="esim")
     location_type: Mapped[str] = mapped_column(String(32), default="country")
-    badge_text: Mapped[str | None] = mapped_column(String(64))
     sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     is_popular: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
@@ -535,7 +529,6 @@ class CustomerOrder(TimeMixin, Base):
     user: Mapped[AppUser | None] = relationship(back_populates="customer_orders")
     order_items: Mapped[list["OrderItem"]] = relationship(back_populates="customer_order")
     lifecycle_events: Mapped[list["ESimLifecycleEvent"]] = relationship(back_populates="customer_order")
-    payload_snapshots: Mapped[list["ProviderPayloadSnapshot"]] = relationship(back_populates="customer_order")
     payment_attempts: Mapped[list["PaymentAttempt"]] = relationship(back_populates="customer_order")
 
 
@@ -579,7 +572,6 @@ class OrderItem(TimeMixin, Base):
     customer_order: Mapped[CustomerOrder] = relationship(back_populates="order_items")
     profiles: Mapped[list["ESimProfile"]] = relationship(back_populates="order_item")
     lifecycle_events: Mapped[list["ESimLifecycleEvent"]] = relationship(back_populates="order_item")
-    payload_snapshots: Mapped[list["ProviderPayloadSnapshot"]] = relationship(back_populates="order_item")
     payment_attempts: Mapped[list["PaymentAttempt"]] = relationship(back_populates="order_item")
 
 
@@ -679,8 +671,6 @@ class ESimProfile(TimeMixin, Base):
     user_id: Mapped[str | None] = mapped_column(Uuid(as_uuid=False), ForeignKey("app_users.id", ondelete="SET NULL"), index=True)
     esim_tran_no: Mapped[str | None] = mapped_column(String(120), unique=True)
     iccid: Mapped[str | None] = mapped_column(String(120), unique=True)
-    imsi: Mapped[str | None] = mapped_column(String(120))
-    msisdn: Mapped[str | None] = mapped_column(String(120))
     activation_code: Mapped[str | None] = mapped_column(Text)
     qr_code_url: Mapped[str | None] = mapped_column(Text)
     install_url: Mapped[str | None] = mapped_column(Text)
@@ -705,7 +695,6 @@ class ESimProfile(TimeMixin, Base):
     order_item: Mapped[OrderItem | None] = relationship(back_populates="profiles")
     user: Mapped[AppUser | None] = relationship(back_populates="profiles")
     lifecycle_events: Mapped[list["ESimLifecycleEvent"]] = relationship(back_populates="profile")
-    payload_snapshots: Mapped[list["ProviderPayloadSnapshot"]] = relationship(back_populates="profile")
 
 
 @dataclass
@@ -756,22 +745,6 @@ class ESimLifecycleEvent(TimeMixin, Base):
     profile: Mapped[ESimProfile | None] = relationship(back_populates="lifecycle_events")
 
 
-class ProviderPayloadSnapshot(TimeMixin, Base):
-    __tablename__ = "provider_payload_snapshots"
-    id: Mapped[int] = mapped_column(primary_key=True)
-    provider: Mapped[str] = mapped_column(String(80), index=True, default="esim_access")
-    entity_type: Mapped[str] = mapped_column(String(80), index=True)
-    direction: Mapped[str] = mapped_column(String(32), default="response")
-    customer_order_id: Mapped[int | None] = mapped_column(ForeignKey("customer_orders.id", ondelete="SET NULL"), index=True)
-    order_item_id: Mapped[int | None] = mapped_column(ForeignKey("order_items.id", ondelete="SET NULL"), index=True)
-    profile_id: Mapped[int | None] = mapped_column(ForeignKey("esim_profiles.id", ondelete="SET NULL"), index=True)
-    selected_field_paths: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
-    filtered_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
-    customer_order: Mapped[CustomerOrder | None] = relationship(back_populates="payload_snapshots")
-    order_item: Mapped[OrderItem | None] = relationship(back_populates="payload_snapshots")
-    profile: Mapped[ESimProfile | None] = relationship(back_populates="payload_snapshots")
-
-
 def create_database(database_url: str) -> sessionmaker[Session]:
     database_url = normalize_database_url(database_url)
     pool_class = _read_pool_class_env(default="auto")
@@ -811,50 +784,6 @@ def create_database(database_url: str) -> sessionmaker[Session]:
             }
     engine = create_engine(database_url, future=True, connect_args=connect_args, **engine_options)
     return sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
-
-
-def extract_selected_fields(payload: dict[str, Any], field_paths: list[str]) -> dict[str, Any]:
-    if not field_paths:
-        return payload
-
-    def merge_nested(target: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
-        for key, value in incoming.items():
-            if key in target and isinstance(target[key], dict) and isinstance(value, dict):
-                merge_nested(target[key], value)
-            else:
-                target[key] = value
-        return target
-
-    def extract_path(data: Any, tokens: list[str]) -> Any:
-        if not tokens:
-            return data
-        token = tokens[0]
-        is_array = token.endswith("[]")
-        key = token[:-2] if is_array else token
-        if not isinstance(data, dict) or key not in data:
-            return None
-        value = data[key]
-        if is_array:
-            if not isinstance(value, list):
-                return None
-            items = []
-            for item in value:
-                partial = extract_path(item, tokens[1:])
-                if partial is not None:
-                    items.append(partial)
-            return {key: items}
-        partial = extract_path(value, tokens[1:])
-        if partial is None:
-            return None
-        return {key: partial}
-
-    filtered: dict[str, Any] = {}
-    for path in field_paths:
-        tokens = [token for token in path.split(".") if token]
-        partial = extract_path(payload, tokens)
-        if partial is not None:
-            merge_nested(filtered, partial)
-    return filtered
 
 
 class SupabaseStore:
@@ -2058,22 +1987,6 @@ class SupabaseStore:
         self.session.flush()
         return admin_user
 
-    def save_field_rule(self, entity_type: str, field_paths: list[str], provider: str = "esim_access", enabled: bool = True) -> ProviderFieldRule:
-        rule = self.session.scalar(
-            select(ProviderFieldRule).where(
-                ProviderFieldRule.provider == provider,
-                ProviderFieldRule.entity_type == entity_type,
-            )
-        )
-        if rule is None:
-            rule = ProviderFieldRule(provider=provider, entity_type=entity_type)
-            self.session.add(rule)
-        rule.enabled = enabled
-        rule.field_paths = field_paths
-        self.session.commit()
-        self.session.refresh(rule)
-        return rule
-
     def build_order_number(self) -> str:
         return f"ORD-{utcnow().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
 
@@ -2399,8 +2312,6 @@ class SupabaseStore:
                 },
             },
         )
-        self.save_payload("order_request", "request", order_request, customer_order=order, order_item=item)
-        self.save_payload("order_response", "response", provider_response, customer_order=order, order_item=item)
         if auto_commit:
             self.session.commit()
             self.session.refresh(order)
@@ -2536,8 +2447,6 @@ class SupabaseStore:
             profile.user = order_item.customer_order.user
             profile.esim_tran_no = item.get("esimTranNo")
             profile.iccid = item.get("iccid")
-            profile.imsi = item.get("imsi")
-            profile.msisdn = item.get("msisdn")
             profile.activation_code = item.get("ac")
             profile.qr_code_url = item.get("qrCodeUrl")
             profile.install_url = item.get("shortUrl")
@@ -2593,14 +2502,6 @@ class SupabaseStore:
                 status_after=profile.app_status,
                 note="Profile synced from provider query",
                 payload=item,
-            )
-            self.save_payload(
-                "profile_query_response",
-                "response",
-                item,
-                customer_order=order_item.customer_order,
-                order_item=order_item,
-                profile=profile,
             )
             result.append(profile)
         self.session.commit()
@@ -2692,14 +2593,6 @@ class SupabaseStore:
                 status_after=None if used_data_mb is None else str(used_data_mb),
                 note="Profile usage synced from provider usage query",
                 payload=record,
-            )
-            self.save_payload(
-                "usage_query_response",
-                "response",
-                record,
-                customer_order=customer_order,
-                order_item=order_item,
-                profile=profile,
             )
             result.append(profile)
         self.session.commit()
@@ -2811,14 +2704,6 @@ class SupabaseStore:
             note=note,
             payload=payload or {},
         )
-        self.save_payload(
-            f"{action}_response",
-            "response",
-            payload or {},
-            customer_order=customer_order,
-            order_item=order_item,
-            profile=profile,
-        )
         self.session.commit()
         self.session.refresh(profile)
         return profile
@@ -2862,7 +2747,6 @@ class SupabaseStore:
             note="Webhook received from eSIM Access",
             payload=payload,
         )
-        self.save_payload("webhook_event", "response", payload, customer_order=customer_order, order_item=order_item, profile=profile)
         self.session.commit()
         self.session.refresh(event)
         return event
@@ -3249,39 +3133,6 @@ class SupabaseStore:
             reverse=True,
         )
         return merged_rows
-
-    def save_payload(
-        self,
-        entity_type: str,
-        direction: str,
-        payload: dict[str, Any],
-        *,
-        customer_order: CustomerOrder | None = None,
-        order_item: OrderItem | None = None,
-        profile: ESimProfile | None = None,
-    ) -> ProviderPayloadSnapshot:
-        rule = self.session.scalar(
-            select(ProviderFieldRule).where(
-                ProviderFieldRule.provider == "esim_access",
-                ProviderFieldRule.entity_type == entity_type,
-                ProviderFieldRule.enabled.is_(True),
-            )
-        )
-        field_paths = rule.field_paths if rule else []
-        filtered_payload = extract_selected_fields(payload, field_paths)
-        snapshot = ProviderPayloadSnapshot(
-            provider="esim_access",
-            entity_type=entity_type,
-            direction=direction,
-            customer_order=customer_order,
-            order_item=order_item,
-            profile=profile,
-            selected_field_paths=field_paths,
-            filtered_payload=filtered_payload,
-        )
-        self.session.add(snapshot)
-        self.session.flush()
-        return snapshot
 
     def add_event(
         self,

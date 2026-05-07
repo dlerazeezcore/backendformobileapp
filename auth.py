@@ -81,6 +81,11 @@ class LogoutPayload(BaseModel):
 class AuthMeUpdatePayload(BaseModel):
     name: str | None = Field(default=None, max_length=255)
     email: str | None = Field(default=None, max_length=255)
+    preferred_language: str | None = Field(default=None, max_length=8, alias="preferredLanguage")
+    preferred_currency: str | None = Field(default=None, max_length=8, alias="preferredCurrency")
+    notifications_enabled: bool | None = Field(default=None, alias="notificationsEnabled")
+
+    model_config = {"populate_by_name": True}
 
 
 class TokenResponse(BaseModel):
@@ -838,6 +843,9 @@ def register_auth_routes(
             "email": row.email,
             "status": row.status,
             "isLoyalty": row.is_loyalty,
+            "preferredLanguage": row.preferred_language,
+            "preferredCurrency": row.preferred_currency,
+            "notificationsEnabled": row.notifications_enabled,
         }
 
     @app.patch("/api/v1/auth/me")
@@ -894,6 +902,17 @@ def register_auth_routes(
                     )
             row.email = normalized_email
 
+        if "preferred_language" in provided_fields and isinstance(row, AppUser):
+            value = (payload.preferred_language or "").strip().lower() if payload.preferred_language is not None else None
+            row.preferred_language = value or None
+
+        if "preferred_currency" in provided_fields and isinstance(row, AppUser):
+            value = (payload.preferred_currency or "").strip().upper() if payload.preferred_currency is not None else None
+            row.preferred_currency = value or None
+
+        if "notifications_enabled" in provided_fields and isinstance(row, AppUser):
+            row.notifications_enabled = bool(payload.notifications_enabled)
+
         row.updated_at = utcnow()
         db.commit()
         db.refresh(row)
@@ -925,6 +944,9 @@ def register_auth_routes(
             "email": row.email,
             "status": row.status,
             "isLoyalty": row.is_loyalty,
+            "preferredLanguage": row.preferred_language,
+            "preferredCurrency": row.preferred_currency,
+            "notificationsEnabled": row.notifications_enabled,
         }
 
     @app.delete("/api/v1/auth/me")

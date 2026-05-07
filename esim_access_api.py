@@ -480,6 +480,14 @@ def _serialize_profile(row: ESimProfile | ProfileInventoryRow, *, now: datetime)
         else custom_fields.get("providerOrderNo") or custom_fields.get("provider_order_no")
     )
     support_topup_type = _resolve_support_topup_type(custom_fields)
+    is_expired = status_value == "expired"
+    can_show_qr = bool(row.qr_code_url) and not is_expired
+    can_activate = (
+        status_value == "inactive"
+        and not installed_flag
+        and bool(row.activation_code or row.qr_code_url or row.install_url)
+    )
+    can_top_up = not is_expired and support_topup_type > 0
     return {
         "id": row.id,
         "userId": row.user_id,
@@ -494,6 +502,10 @@ def _serialize_profile(row: ESimProfile | ProfileInventoryRow, *, now: datetime)
         "countryName": country_name,
         "country_name": country_name,
         "status": status_value,
+        "isExpired": is_expired,
+        "canActivate": can_activate,
+        "canTopUp": can_top_up,
+        "canShowQr": can_show_qr,
         "installed": installed_flag,
         "installedAt": _to_utc_z(row.installed_at),
         "installed_at": _to_utc_z(row.installed_at),
