@@ -510,6 +510,13 @@ class FeaturedLocation(TimeMixin, Base):
     custom_fields: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
 
 
+class AppSetting(TimeMixin, Base):
+    """Generic key/value store for global admin-managed settings (whitelist, feature toggles, etc.)."""
+    __tablename__ = "app_settings"
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+
+
 class CustomerOrder(TimeMixin, Base):
     __tablename__ = "customer_orders"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -1989,6 +1996,23 @@ class SupabaseStore:
 
     def build_order_number(self) -> str:
         return f"ORD-{utcnow().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
+
+    def get_app_setting(self, key: str, *, default: dict[str, Any] | None = None) -> dict[str, Any]:
+        row = self.session.get(AppSetting, key)
+        if row is None or not isinstance(row.value, dict):
+            return dict(default or {})
+        return dict(row.value)
+
+    def set_app_setting(self, key: str, value: dict[str, Any]) -> AppSetting:
+        row = self.session.get(AppSetting, key)
+        if row is None:
+            row = AppSetting(key=key, value=dict(value))
+            self.session.add(row)
+        else:
+            row.value = dict(value)
+        self.session.commit()
+        self.session.refresh(row)
+        return row
 
     def get_active_exchange_rate(
         self,
