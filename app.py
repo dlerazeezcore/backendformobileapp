@@ -6,6 +6,7 @@ import inspect
 import logging
 import os
 from pathlib import Path
+from time import monotonic
 import uuid
 from typing import Any, AsyncIterator
 
@@ -174,10 +175,40 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             payload.update(extra)
         return payload
 
+    def _warm_db_pool(session_factory) -> None:
+        """Open one connection and run SELECT 1 to prime the pool before traffic arrives."""
+        db = session_factory()
+        try:
+            db.scalar(text("select 1"))
+        finally:
+            db.close()
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         cfg = settings or get_settings()
         app.state.db_session_factory = create_database(cfg.database_url)
+        # Warm the DB connection pool so the first /health/db (and first user request)
+        # doesn't pay the Supabase pooler cold-start cost. Falling back to lazy init
+        # if warm-up fails is intentional: a transient pooler hiccup must not block
+        # the entire process from booting.
+        warmup_timeout_seconds = _read_float_env("DATABASE_WARMUP_TIMEOUT_SECONDS", 15.0, minimum=1.0)
+        warmup_started_at = monotonic()
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(_warm_db_pool, app.state.db_session_factory),
+                timeout=warmup_timeout_seconds,
+            )
+            LOGGER.info(
+                "database.warmup_complete elapsed_ms=%.0f",
+                (monotonic() - warmup_started_at) * 1000.0,
+            )
+        except asyncio.TimeoutError:
+            LOGGER.warning(
+                "database.warmup_timeout timeout_seconds=%.1f -- continuing with lazy init",
+                warmup_timeout_seconds,
+            )
+        except Exception as exc:  # pragma: no cover - defensive: never block boot on warmup
+            LOGGER.warning("database.warmup_failed detail=%s", exc)
         app.state.esim_access_api = ESimAccessAPI(
             access_code=cfg.esim_access_access_code,
             secret_key=cfg.esim_access_secret_key,
