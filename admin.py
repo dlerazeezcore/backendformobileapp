@@ -24,7 +24,6 @@ from supabase_store import (
     PricingRule,
     PaymentAttempt,
     PaymentProviderEvent,
-    ProviderFieldRule,
     SupabaseStore,
 )
 from esim_access_api import ActionContext
@@ -52,13 +51,6 @@ class RefundPayload(BaseModel):
 class ProfileStatePayload(BaseModel):
     iccid: str
     context: ActionContext
-
-
-class ProviderFieldRulePayload(BaseModel):
-    entity_type: str = Field(alias="entityType")
-    field_paths: list[str] = Field(default_factory=list, alias="fieldPaths")
-    enabled: bool = True
-    provider: str = "esim_access"
 
 
 class PricingRulePayload(BaseModel):
@@ -113,7 +105,6 @@ class FeaturedLocationPayload(BaseModel):
     name: str
     service_type: str = Field(default="esim", alias="serviceType")
     location_type: str = Field(default="country", alias="locationType")
-    badge_text: str | None = Field(default=None, alias="badgeText")
     sort_order: int = Field(default=0, alias="sortOrder")
     is_popular: bool = Field(default=True, alias="isPopular")
     enabled: bool = True
@@ -182,25 +173,6 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
             payload={"iccid": payload.iccid},
         )
         return {"database": {"profileId": profile.id if profile else None}}
-
-    @app.post("/api/v1/admin/provider-field-rules")
-    async def save_field_rule(
-        payload: ProviderFieldRulePayload,
-        db: Session = Depends(get_db),
-        _: AdminUser = Depends(_require_admin_actor),
-    ) -> dict[str, Any]:
-        rule = SupabaseStore(db).save_field_rule(payload.entity_type, payload.field_paths, payload.provider, payload.enabled)
-        return {"rule": {"id": rule.id, "entityType": rule.entity_type, "fieldPaths": rule.field_paths}}
-
-    @app.get("/api/v1/admin/provider-field-rules")
-    async def list_field_rules(
-        db: Session = Depends(get_db),
-        limit: int = Query(default=100, ge=1, le=500),
-        offset: int = Query(default=0, ge=0),
-        _: AdminUser = Depends(_require_admin_actor),
-    ) -> dict[str, Any]:
-        rows = SupabaseStore(db).list_rows(ProviderFieldRule, limit=limit, offset=offset)
-        return {"rules": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
 
     @app.post("/api/v1/admin/pricing-rules")
     @app.post("/api/v1/admin/prices")
