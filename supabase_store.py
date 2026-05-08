@@ -409,10 +409,15 @@ class PushNotification(TimeMixin, Base):
 
 class TelegramSupportMessage(TimeMixin, Base):
     __tablename__ = "telegram_support_messages"
+    # Migration 0032 also creates a partial index
+    # ix_telegram_support_messages_admin_self_created (admin_user_id, created_at DESC)
+    # WHERE user_id IS NULL — partial indexes aren't expressible portably in
+    # SQLAlchemy declarative form, so we keep that one migration-only.
     __table_args__ = (
         Index("ix_telegram_support_messages_user_created", "user_id", "created_at"),
         Index("ix_telegram_support_messages_direction_created", "direction", "created_at"),
         Index("ix_telegram_support_messages_status_created", "status", "created_at"),
+        Index("ix_telegram_support_messages_chat_created", "telegram_chat_id", "created_at"),
     )
 
     id: Mapped[str] = mapped_column(Uuid(as_uuid=False), primary_key=True, default=lambda: str(uuid.uuid4()))
@@ -428,8 +433,8 @@ class TelegramSupportMessage(TimeMixin, Base):
         nullable=True,
         index=True,
     )
-    direction: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
-    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False, index=True)
+    direction: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
     message_text: Mapped[str] = mapped_column(Text, nullable=False)
     telegram_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     telegram_message_id: Mapped[int | None] = mapped_column(BigInteger, unique=True, nullable=True)

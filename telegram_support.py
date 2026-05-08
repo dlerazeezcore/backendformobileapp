@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import hmac
+import json
+import logging
 import mimetypes
 import re
 import threading
@@ -21,6 +24,10 @@ from config import get_settings
 from push_notification import PushNotificationService
 from phone_utils import phone_lookup_candidates
 from supabase_store import AdminUser, AppUser, PushDevice, TelegramSupportMessage, utcnow
+
+LOGGER = logging.getLogger("uvicorn.error")
+SUPPORT_ERROR_MESSAGE_MAX_LEN = 4096
+SUPPORT_PROVIDER_PAYLOAD_MAX_BYTES = 16384
 
 TELEGRAM_SUPPORT_CHAT_ID = -5169340336
 USER_ID_PATTERN = re.compile(r"User ID:\s*([0-9a-fA-F-]{36})")
@@ -58,6 +65,78 @@ except Exception:  # pragma: no cover - runtime dependency handling
     boto3 = None
     botocore = None
     BotoConfig = None
+
+
+def _truncate_error_message(message: str | None) -> str | None:
+    """Cap error_message length so a runaway provider stack trace can't bloat
+    the row beyond what the UI / log lines can ingest cleanly.
+    """
+    if message is None:
+        return None
+    text = str(message)
+    if len(text) <= SUPPORT_ERROR_MESSAGE_MAX_LEN:
+        return text
+    return text[: SUPPORT_ERROR_MESSAGE_MAX_LEN - 16] + "...[truncated]"
+
+
+def _truncate_provider_payload(
+    payload: dict[str, Any],
+    *,
+    max_bytes: int = SUPPORT_PROVIDER_PAYLOAD_MAX_BYTES,
+) -> dict[str, Any]:
+    """Cap the JSON serialization size of a provider_payload dict.
+
+    If the payload (json-serialized) exceeds ``max_bytes``, replace the body
+    with a truncation marker plus a short preview. We never return a payload
+    larger than ``max_bytes + ~256`` bytes once truncated.
+    """
+    try:
+        encoded = json.dumps(payload, default=str)
+    except Exception:  # pragma: no cover - defensive: never block on bad payloads
+        return {
+            "_truncated": True,
+            "originalSize": -1,
+            "preview": "<unserializable>",
+        }
+    size = len(encoded.encode("utf-8"))
+    if size <= max_bytes:
+        return payload
+    preview_chars = max_bytes // 2
+    return {
+        "_truncated": True,
+        "originalSize": size,
+        "preview": encoded[:preview_chars],
+    }
+
+
+def _log_push_failure(
+    *,
+    support_message_id: str | None,
+    target_user_id: str | None = None,
+    target_admin_user_id: str | None = None,
+    direction: str | None = None,
+    error: BaseException | None = None,
+    reason: str | None = None,
+) -> None:
+    """Emit a structured warning so push delivery failures are searchable in logs.
+
+    Push fan-out is intentionally fire-and-forget (no retry queue); this gives
+    us per-message visibility without changing the delivery contract.
+    """
+    error_class = error.__class__.__name__ if error is not None else None
+    error_text = str(error) if error is not None else None
+    LOGGER.warning(
+        "support.push_delivery_failure "
+        "support_message_id=%s target_user_id=%s target_admin_user_id=%s "
+        "direction=%s reason=%s error_class=%s error=%s",
+        support_message_id,
+        target_user_id,
+        target_admin_user_id,
+        direction,
+        reason,
+        error_class,
+        error_text,
+    )
 
 
 class SupportAttachmentPayload(BaseModel):
@@ -110,12 +189,99 @@ def _normalize_support_attachment(attachment: SupportAttachmentPayload) -> dict[
     }
 
 
-def _normalize_support_attachments(attachments: list[SupportAttachmentPayload]) -> list[dict[str, Any]]:
+def _expected_actor_attachment_prefix(*, settings: Any, actor: AppUser | AdminUser) -> str:
+    """Build the only S3 key prefix that a client can legitimately reference in
+    a support message. Any attachment whose ``objectPath`` falls outside this
+    prefix did not come from this actor's own presigned upload and must be
+    rejected (closes a SSRF-via-arbitrary-publicUrl + cross-actor-spoofing surface).
+    """
+    object_prefix = str(getattr(settings, "support_uploads_object_prefix", None) or "support").strip().strip("/")
+    subject_type = "admin" if isinstance(actor, AdminUser) else "user"
+    return f"{object_prefix}/{subject_type}/{actor.id}/"
+
+
+def _is_safe_attachment_public_url(*, settings: Any, public_url: str) -> bool:
+    """Accept a client-supplied publicUrl only if it starts with one of the
+    deployment's known storage prefixes. Defense-in-depth alongside the
+    objectPath prefix check.
+
+    Trusted prefixes (in order):
+      1. ``support_uploads_public_base_url`` env var (preferred)
+      2. ``support_uploads_s3_endpoint`` env var (when public base derives from
+         the same Supabase project)
+    A URL that matches neither is rejected.
+    """
+    candidates: list[str] = []
+    base = str(getattr(settings, "support_uploads_public_base_url", None) or "").strip()
+    if base:
+        candidates.append(base.rstrip("/"))
+    endpoint = str(getattr(settings, "support_uploads_s3_endpoint", None) or "").strip()
+    if endpoint:
+        # Mirror _derive_supabase_public_base_url_from_s3_endpoint to accept
+        # URLs the server itself would have generated.
+        derived = _derive_supabase_public_base_url_from_s3_endpoint(endpoint)
+        if derived:
+            candidates.append(derived.rstrip("/"))
+        candidates.append(endpoint.rstrip("/"))
+    if not candidates:
+        return False
+    return any(public_url.startswith(prefix) for prefix in candidates)
+
+
+def _normalize_support_attachments(
+    attachments: list[SupportAttachmentPayload],
+    *,
+    settings: Any | None = None,
+    actor: AppUser | AdminUser | None = None,
+) -> list[dict[str, Any]]:
+    """Normalize and validate client-supplied attachment metadata.
+
+    When ``settings`` and ``actor`` are provided (the production path from POST
+    /messages), enforce that every attachment's ``objectPath`` is rooted in the
+    actor's own upload prefix. This prevents one user from forwarding another
+    user's uploads, and blocks arbitrary URLs being handed to the Telegram bot.
+    Server-side internal calls (which never trust client input) may pass None
+    for backward compatibility — but no such call exists in this module today.
+    """
     normalized: list[dict[str, Any]] = []
+    expected_prefix = (
+        _expected_actor_attachment_prefix(settings=settings, actor=actor)
+        if (settings is not None and actor is not None)
+        else None
+    )
     for attachment in attachments:
         item = _normalize_support_attachment(attachment)
         if not item["publicUrl"] and not item["objectPath"]:
             continue
+        if expected_prefix is not None:
+            object_path = item.get("objectPath") or ""
+            if object_path:
+                # Strong check: every client-supplied objectPath must live under
+                # the caller's own upload prefix. The server then fetches bytes
+                # from S3 by objectPath (never by publicUrl) for image delivery,
+                # so this single check closes the spoofing surface.
+                if not object_path.startswith(expected_prefix):
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail=(
+                            "Attachment objectPath must match the caller's upload prefix"
+                        ),
+                    )
+            else:
+                # Without an objectPath, the only thing identifying the file is
+                # the publicUrl — that path *must* be inside the deployment's
+                # storage host whitelist or we'd risk handing arbitrary URLs to
+                # the Telegram bot.
+                public_url = item.get("publicUrl") or ""
+                if not _is_safe_attachment_public_url(
+                    settings=settings, public_url=public_url
+                ):
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail=(
+                            "Attachment publicUrl host is not allowed for this deployment"
+                        ),
+                    )
         normalized.append(item)
     return normalized
 
@@ -399,13 +565,42 @@ async def _telegram_get_file_path(*, bot_token: str, file_id: str) -> str | None
     return file_path or None
 
 
-async def _telegram_download_file(*, bot_token: str, file_path: str) -> tuple[bytes, str | None]:
+async def _telegram_download_file(
+    *,
+    bot_token: str,
+    file_path: str,
+    max_bytes: int,
+) -> tuple[bytes, str | None]:
+    """Download a file from Telegram, capping size to ``max_bytes``.
+
+    Streams the body so we don't buffer arbitrarily large payloads in memory.
+    Aborts with HTTP 413 the moment the running byte count would exceed the cap.
+    """
     api_url = f"https://api.telegram.org/file/bot{bot_token}/{file_path}"
     async with httpx.AsyncClient(timeout=20.0) as client:
-        response = await client.get(api_url)
-    if response.status_code >= 400:
-        raise HTTPException(status_code=502, detail="Telegram provider rejected file download request")
-    return response.content, response.headers.get("content-type")
+        async with client.stream("GET", api_url) as response:
+            if response.status_code >= 400:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Telegram provider rejected file download request",
+                )
+            content_type = response.headers.get("content-type")
+            chunks: list[bytes] = []
+            received = 0
+            async for chunk in response.aiter_bytes():
+                if not chunk:
+                    continue
+                received += len(chunk)
+                if received > max_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"Telegram attachment exceeds the maximum allowed size "
+                            f"({max_bytes} bytes)"
+                        ),
+                    )
+                chunks.append(chunk)
+            return b"".join(chunks), content_type
 
 
 async def _telegram_get_webhook_info(*, bot_token: str) -> dict[str, Any]:
@@ -525,7 +720,9 @@ async def _send_support_message_to_telegram(
             object_path = str(attachment.get("objectPath") or "").strip()
             try:
                 if object_path:
-                    photo_bytes, content_type = _load_support_attachment_bytes(
+                    # boto3 is sync; offload S3 GET so we don't block the event loop.
+                    photo_bytes, content_type = await asyncio.to_thread(
+                        _load_support_attachment_bytes,
                         settings=settings,
                         object_path=object_path,
                     )
@@ -630,7 +827,12 @@ async def _mirror_telegram_attachment_to_support_bucket(
     file_path = await _telegram_get_file_path(bot_token=bot_token, file_id=file_id)
     if not file_path:
         return None
-    file_bytes, downloaded_content_type = await _telegram_download_file(bot_token=bot_token, file_path=file_path)
+    max_bytes = int(getattr(settings, "support_uploads_max_file_bytes", 0) or 10 * 1024 * 1024)
+    file_bytes, downloaded_content_type = await _telegram_download_file(
+        bot_token=bot_token,
+        file_path=file_path,
+        max_bytes=max_bytes,
+    )
     guessed_name = file_path.split("/")[-1] if "/" in file_path else file_path
     file_name = _sanitize_support_filename(guessed_name or fallback_name)
     content_type = downloaded_content_type or fallback_content_type
@@ -638,7 +840,9 @@ async def _mirror_telegram_attachment_to_support_bucket(
         guessed_content_type, _ = mimetypes.guess_type(file_name)
         content_type = guessed_content_type or "application/octet-stream"
     object_path = _build_inbound_support_object_path(settings=settings, file_name=file_name)
-    public_url = _upload_support_file_bytes(
+    # boto3 PUT is sync; offload to keep the webhook handler non-blocking.
+    public_url = await asyncio.to_thread(
+        _upload_support_file_bytes,
         settings=settings,
         object_path=object_path,
         file_bytes=file_bytes,
@@ -697,8 +901,26 @@ def _is_valid_webhook_secret(
     query_secret: str | None,
     path_secret: str | None,
 ) -> bool:
-    values = [str(header_secret or ""), str(query_secret or ""), str(path_secret or "")]
-    return any(hmac.compare_digest(candidate, configured_secret) for candidate in values)
+    """Validate the inbound webhook secret.
+
+    SECURITY: Reject when the configured secret is empty. The previous behaviour
+    (`hmac.compare_digest("", "")` returns True) meant an unset env var left the
+    webhook open to anyone — Telegram impersonation included. We now require an
+    explicit, non-empty secret; if the operator hasn't configured one, every
+    inbound request is rejected.
+    """
+    expected = str(configured_secret or "").strip()
+    if not expected:
+        return False
+    candidates = [
+        str(header_secret or ""),
+        str(query_secret or ""),
+        str(path_secret or ""),
+    ]
+    return any(
+        candidate and hmac.compare_digest(candidate, expected)
+        for candidate in candidates
+    )
 
 
 def _extract_telegram_message(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -807,6 +1029,11 @@ def _serialize_support_message_response(
         else:
             is_from_current_actor = bool(sender_type == "admin" and sender_admin_user_id == actor.id)
 
+    # senderRole collapses the legacy "system" fallback into "support" so the
+    # frontend only ever has to switch on user / admin / support. senderType
+    # is preserved for any consumer still relying on the four-state shape.
+    sender_role = sender_type if sender_type in {"user", "admin", "support"} else "support"
+
     return {
         "id": row.id,
         "conversationId": _conversation_id_for_message(row),
@@ -816,6 +1043,7 @@ def _serialize_support_message_response(
         "senderAdminUserId": sender_admin_user_id,
         "direction": direction,
         "senderType": sender_type,
+        "senderRole": sender_role,
         "isFromCurrentActor": is_from_current_actor,
         "status": row.status,
         "message": row.message_text,
@@ -844,7 +1072,11 @@ def register_telegram_support_routes(
         push_provider: PushNotificationService = Depends(get_push_provider),
     ) -> dict[str, Any]:
         settings = get_settings()
-        attachments = _normalize_support_attachments(payload.attachments)
+        attachments = _normalize_support_attachments(
+            payload.attachments,
+            settings=settings,
+            actor=actor,
+        )
         message_text = payload.message.strip()
         if isinstance(actor, AppUser):
             bot_token = str(settings.telegram_support_bot_token or "").strip()
@@ -888,15 +1120,15 @@ def register_telegram_support_routes(
                     if first_result.get("message_id") is not None
                     else None
                 )
-                row.provider_payload = {
+                row.provider_payload = _truncate_provider_payload({
                     "telegramResponses": sent_responses,
                     "attachments": attachments,
                     "photoSendErrors": photo_send_errors,
-                }
+                })
                 row.status = "sent"
             except HTTPException as exc:
                 row.status = "failed"
-                row.error_message = str(exc.detail)
+                row.error_message = _truncate_error_message(str(exc.detail))
                 row.updated_at = utcnow()
                 db.commit()
                 raise
@@ -999,15 +1231,15 @@ def register_telegram_support_routes(
                     if first_result.get("message_id") is not None
                     else None
                 )
-                row.provider_payload = {
+                row.provider_payload = _truncate_provider_payload({
                     "telegramResponses": sent_responses,
                     "attachments": attachments,
                     "photoSendErrors": photo_send_errors,
-                }
+                })
                 row.status = "sent"
             except HTTPException as exc:
                 row.status = "failed"
-                row.error_message = str(exc.detail)
+                row.error_message = _truncate_error_message(str(exc.detail))
                 row.updated_at = utcnow()
                 db.commit()
                 raise
@@ -1055,10 +1287,23 @@ def register_telegram_support_routes(
                 else:
                     row.push_delivery_status = "failed"
                     row.status = "failed"
+                    _log_push_failure(
+                        support_message_id=row.id,
+                        target_user_id=target_user_id,
+                        direction="admin_to_user",
+                        reason="provider_zero_success",
+                    )
             except Exception as exc:  # noqa: BLE001
                 row.push_delivery_status = "failed"
                 row.status = "failed"
-                row.error_message = str(exc)
+                row.error_message = _truncate_error_message(str(exc))
+                _log_push_failure(
+                    support_message_id=row.id,
+                    target_user_id=target_user_id,
+                    direction="admin_to_user",
+                    error=exc,
+                    reason="provider_exception",
+                )
         else:
             row.push_delivery_status = "no_devices"
             row.status = "sent"
@@ -1093,7 +1338,13 @@ def register_telegram_support_routes(
         )
         expires_in_seconds = max(60, min(int(settings.support_uploads_url_ttl_seconds), 3600))
         client = _build_support_upload_client(settings)
-        bucket = _resolve_support_bucket_name(settings=settings, client=client)
+        # Bucket resolution can hit the network on cache miss (list_buckets);
+        # offload from the async route handler to avoid blocking the loop.
+        bucket = await asyncio.to_thread(
+            _resolve_support_bucket_name,
+            settings=settings,
+            client=client,
+        )
         upload_url = client.generate_presigned_url(
             "put_object",
             Params={"Bucket": bucket, "Key": object_path, "ContentType": payload.content_type},
@@ -1149,15 +1400,16 @@ def register_telegram_support_routes(
             _serialize_support_message_response(row=row, settings=settings, actor=actor)
             for row in rows
         ]
-        response_payload = {
-            "messages": serialized_messages,
-            "pagination": {"limit": limit, "offset": offset, "count": len(rows)},
+        # Single envelope to match the rest of the API surface. Frontend already
+        # reads from `data:` first; the previous duplicated top-level keys were
+        # legacy and add noise to the response without value.
+        return {
+            "success": True,
+            "data": {
+                "messages": serialized_messages,
+                "pagination": {"limit": limit, "offset": offset, "count": len(rows)},
+            },
         }
-        response_payload["data"] = {
-            "messages": response_payload["messages"],
-            "pagination": response_payload["pagination"],
-        }
-        return response_payload
 
     async def _process_telegram_webhook(
         payload: dict[str, Any],
@@ -1309,7 +1561,9 @@ def register_telegram_support_routes(
             message_text=text or "[Attachment only]",
             telegram_chat_id=chat_id,
             telegram_message_id=telegram_message_id,
-            provider_payload={"telegramWebhook": payload, "attachments": mirrored_attachments},
+            provider_payload=_truncate_provider_payload(
+                {"telegramWebhook": payload, "attachments": mirrored_attachments}
+            ),
         )
         db.add(row)
         try:
@@ -1358,9 +1612,24 @@ def register_telegram_support_routes(
                     row.push_delivery_status = "sent"
                 else:
                     row.push_delivery_status = "failed"
+                    _log_push_failure(
+                        support_message_id=row.id,
+                        target_user_id=user_id,
+                        target_admin_user_id=admin_user_id,
+                        direction=row.direction,
+                        reason="provider_zero_success",
+                    )
             except Exception as exc:  # pragma: no cover - provider runtime failure
                 row.push_delivery_status = "failed"
-                row.error_message = str(exc)
+                row.error_message = _truncate_error_message(str(exc))
+                _log_push_failure(
+                    support_message_id=row.id,
+                    target_user_id=user_id,
+                    target_admin_user_id=admin_user_id,
+                    direction=row.direction,
+                    error=exc,
+                    reason="provider_exception",
+                )
         elif user_id or admin_user_id:
             row.push_delivery_status = "no_devices"
         else:
