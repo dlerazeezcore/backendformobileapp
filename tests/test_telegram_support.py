@@ -307,14 +307,17 @@ class TelegramSupportRoutesTest(unittest.TestCase):
                 )
                 self.assertEqual(response.status_code, 200)
                 payload = response.json()
-                self.assertGreaterEqual(payload["pagination"]["count"], 1)
-                self.assertEqual(payload["messages"][0]["userId"], "22222222-2222-2222-2222-222222222222")
-                self.assertIn("senderType", payload["messages"][0])
-                self.assertIn("isFromCurrentActor", payload["messages"][0])
-                self.assertIn("adminUserId", payload["messages"][0])
-                self.assertIn("conversationId", payload["messages"][0])
-                self.assertIn("senderUserId", payload["messages"][0])
-                self.assertIn("senderAdminUserId", payload["messages"][0])
+                self.assertEqual(payload.get("success"), True)
+                data = payload["data"]
+                self.assertGreaterEqual(data["pagination"]["count"], 1)
+                self.assertEqual(data["messages"][0]["userId"], "22222222-2222-2222-2222-222222222222")
+                self.assertIn("senderType", data["messages"][0])
+                self.assertIn("senderRole", data["messages"][0])
+                self.assertIn("isFromCurrentActor", data["messages"][0])
+                self.assertIn("adminUserId", data["messages"][0])
+                self.assertIn("conversationId", data["messages"][0])
+                self.assertIn("senderUserId", data["messages"][0])
+                self.assertIn("senderAdminUserId", data["messages"][0])
         finally:
             telegram_support._telegram_send_message = original
             telegram_support._ensure_telegram_webhook = original_ensure
@@ -354,7 +357,7 @@ class TelegramSupportRoutesTest(unittest.TestCase):
                 headers={"Authorization": f"Bearer {self._admin_token()}"},
             )
             self.assertEqual(response.status_code, 200)
-            rows = response.json().get("messages", [])
+            rows = response.json().get("data", {}).get("messages", [])
             message_ids = {item.get("id") for item in rows}
             self.assertIn(own_row_id, message_ids)
             self.assertNotIn(other_admin_row_id, message_ids)
@@ -378,7 +381,8 @@ class TelegramSupportRoutesTest(unittest.TestCase):
                 headers={"Authorization": f"Bearer {self._admin_token()}"},
             )
             self.assertEqual(response.status_code, 200)
-            row = next((item for item in response.json().get("messages", []) if item.get("id") == legacy_row_id), None)
+            messages_payload = response.json().get("data", {}).get("messages", [])
+            row = next((item for item in messages_payload if item.get("id") == legacy_row_id), None)
             self.assertIsNotNone(row)
             self.assertEqual(row["direction"], "user_to_support")
             self.assertEqual(row["senderType"], "user")
@@ -732,6 +736,190 @@ class TelegramSupportRoutesTest(unittest.TestCase):
             )
             self.assertEqual(second.status_code, 200)
             self.assertTrue(second.json().get("duplicate"))
+
+    # ------------------------------------------------------------------
+    # Phase 1.4 hardening tests added with migration 0032
+    # ------------------------------------------------------------------
+
+    def test_webhook_rejects_when_secret_empty_in_config(self) -> None:
+        """Empty TELEGRAM_SUPPORT_WEBHOOK_SECRET must close the webhook entirely.
+
+        The previous behaviour returned 200 because hmac.compare_digest("","")
+        is True; that left the bot impersonable whenever the env var was unset.
+        """
+        os.environ["TELEGRAM_SUPPORT_WEBHOOK_SECRET"] = ""
+        get_settings.cache_clear()
+        try:
+            with TestClient(create_app()) as client:
+                response = client.post(
+                    "/api/v1/support/telegram/webhook",
+                    json={
+                        "message": {
+                            "message_id": 700,
+                            "text": "noop",
+                            "chat": {"id": -5169340336},
+                        }
+                    },
+                )
+                self.assertEqual(response.status_code, 403)
+        finally:
+            os.environ["TELEGRAM_SUPPORT_WEBHOOK_SECRET"] = "webhook-secret"
+            get_settings.cache_clear()
+
+    def test_webhook_attachment_oversize_is_rejected(self) -> None:
+        """A Telegram-inbound attachment exceeding the configured cap raises 413
+        from the streaming downloader and must NOT land an S3 object.
+        """
+        import telegram_support
+        from fastapi import HTTPException
+
+        async def fake_get_file_path(*, bot_token: str, file_id: str):
+            return f"photos/{file_id}.jpg"
+
+        async def fake_download_oversize(*, bot_token: str, file_path: str, max_bytes: int):
+            raise HTTPException(
+                status_code=413,
+                detail=f"Telegram attachment exceeds the maximum allowed size ({max_bytes} bytes)",
+            )
+
+        upload_calls: list[tuple] = []
+
+        def fake_upload(*, settings, object_path, file_bytes, content_type):
+            upload_calls.append((object_path, len(file_bytes)))
+            return f"https://example.local/{object_path}"
+
+        original_path = telegram_support._telegram_get_file_path
+        original_download = telegram_support._telegram_download_file
+        original_upload = telegram_support._upload_support_file_bytes
+        telegram_support._telegram_get_file_path = fake_get_file_path
+        telegram_support._telegram_download_file = fake_download_oversize
+        telegram_support._upload_support_file_bytes = fake_upload
+        try:
+            with TestClient(create_app()) as client:
+                response = client.post(
+                    "/api/v1/support/telegram/webhook",
+                    headers={"X-Telegram-Bot-Api-Secret-Token": "webhook-secret"},
+                    json={
+                        "message": {
+                            "message_id": 711,
+                            "chat": {"id": -5169340336},
+                            "photo": [{"file_id": "huge", "file_size": 50 * 1024 * 1024}],
+                            "caption": "Phone: +9647700000002",
+                        }
+                    },
+                )
+                # Webhook returns 502/413/etc on the chained HTTPException;
+                # the critical assertion is that NO S3 object was written.
+                self.assertNotEqual(response.status_code, 200)
+                self.assertEqual(upload_calls, [])
+        finally:
+            telegram_support._telegram_get_file_path = original_path
+            telegram_support._telegram_download_file = original_download
+            telegram_support._upload_support_file_bytes = original_upload
+
+    def test_attachment_objectpath_must_match_actor_prefix(self) -> None:
+        """A user submitting an attachment whose objectPath belongs to another
+        user (or to no actor at all) gets a 422 — closes the spoofing surface.
+        """
+        with TestClient(create_app()) as client:
+            response = client.post(
+                "/api/v1/support/telegram/messages",
+                headers={"Authorization": f"Bearer {self._user_token()}"},
+                json={
+                    "message": "",
+                    "attachments": [
+                        {
+                            # this prefix belongs to a different user
+                            "objectPath": "support/user/99999999-9999-9999-9999-999999999999/2026/05/08/foreign.jpg",
+                            "publicUrl": "https://example.local/foreign.jpg",
+                            "fileName": "foreign.jpg",
+                            "contentType": "image/jpeg",
+                            "sizeBytes": 1024,
+                        }
+                    ],
+                },
+            )
+            self.assertEqual(response.status_code, 422)
+            self.assertIn("upload prefix", str(response.json()).lower())
+
+    def test_orm_index_topology_matches_migration_0032(self) -> None:
+        """Regression guard: the ORM's __table_args__ must expose the new
+        ix_telegram_support_messages_chat_created composite (added in 0032)
+        and must NOT redeclare the dropped single-column indexes for
+        ``direction`` or ``status``. The partial index
+        ix_telegram_support_messages_admin_self_created is intentionally
+        migration-only (partial WHERE clauses aren't portable in SQLAlchemy
+        declarative) so it isn't asserted here.
+        """
+        from sqlalchemy import create_engine, inspect
+        from supabase_store import normalize_database_url
+
+        engine = create_engine(
+            normalize_database_url(os.environ["DATABASE_URL"]),
+            connect_args={"check_same_thread": False},
+            future=True,
+        )
+        try:
+            inspector = inspect(engine)
+            index_names = {ix["name"] for ix in inspector.get_indexes("telegram_support_messages")}
+            self.assertIn("ix_telegram_support_messages_chat_created", index_names)
+            # The redundant single-column indexes dropped in 0032 must NOT come
+            # back via the ORM declarative on table-create-from-metadata.
+            self.assertNotIn("ix_telegram_support_messages_direction", index_names)
+            self.assertNotIn("ix_telegram_support_messages_status", index_names)
+        finally:
+            engine.dispose()
+
+    def test_provider_payload_is_truncated_when_huge(self) -> None:
+        """An inbound Telegram update larger than 16KB must be stored in
+        truncated form (provider_payload['_truncated'] == True) so we don't
+        bloat the table with full Telegram update bodies.
+        """
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from supabase_store import normalize_database_url
+
+        # Build a payload whose JSON serialization is well over 16KB.
+        big_text = "x" * 32768
+        with TestClient(create_app()) as client:
+            response = client.post(
+                "/api/v1/support/telegram/webhook",
+                headers={"X-Telegram-Bot-Api-Secret-Token": "webhook-secret"},
+                json={
+                    "message": {
+                        "message_id": 911,
+                        "text": f"{big_text}\nPhone: +9647700000002",
+                        "chat": {"id": -5169340336},
+                    }
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+            message_id = response.json().get("messageId")
+            self.assertTrue(message_id)
+
+        # Re-open the DB and verify the row's stored provider_payload is
+        # the truncated marker, not the full ~32KB body.
+        engine = create_engine(
+            normalize_database_url(os.environ["DATABASE_URL"]),
+            connect_args={"check_same_thread": False},
+            future=True,
+        )
+        try:
+            session_factory = sessionmaker(bind=engine, future=True)
+            with session_factory() as session:
+                row = session.scalar(
+                    select(TelegramSupportMessage).where(TelegramSupportMessage.id == message_id)
+                )
+                self.assertIsNotNone(row)
+                payload = row.provider_payload
+                self.assertIsInstance(payload, dict)
+                self.assertTrue(payload.get("_truncated"))
+                self.assertGreater(int(payload.get("originalSize") or 0), 16384)
+                # The preview is bounded by max_bytes // 2 = 8192 chars.
+                self.assertLessEqual(len(str(payload.get("preview") or "")), 8192)
+        finally:
+            engine.dispose()
+
 
 if __name__ == "__main__":
     unittest.main()
