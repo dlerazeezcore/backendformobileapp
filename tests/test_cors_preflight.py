@@ -26,21 +26,6 @@ class CorsPreflightTest(unittest.TestCase):
             os.remove(self.db_path)
         get_settings.cache_clear()
 
-    def test_support_messages_preflight_accepts_extended_request_headers(self) -> None:
-        with TestClient(create_app()) as client:
-            response = client.options(
-                "/api/v1/support/telegram/messages?limit=200&offset=0",
-                headers={
-                    "Origin": "http://localhost:5173",
-                    "Access-Control-Request-Method": "GET",
-                    "Access-Control-Request-Headers": "authorization,content-type,baggage,sentry-trace,x-client-info,apikey",
-                },
-            )
-            self.assertEqual(response.status_code, 200)
-            self.assertEqual(response.headers.get("access-control-allow-origin"), "http://localhost:5173")
-            allowed_headers = str(response.headers.get("access-control-allow-headers") or "").lower()
-            self.assertIn("authorization", allowed_headers)
-
     def test_user_scoped_read_routes_support_preflight(self) -> None:
         with TestClient(create_app()) as client:
             exchange_preflight = client.options(

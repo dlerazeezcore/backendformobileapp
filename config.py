@@ -28,43 +28,9 @@ class Settings(BaseSettings):
     database_url: str = Field(default="sqlite:///./esim_access.db", alias="DATABASE_URL")
     auth_secret_key: str = Field(default=DEFAULT_AUTH_SECRET_KEY, alias="AUTH_SECRET_KEY")
     auth_token_ttl_seconds: int = Field(default=DEFAULT_AUTH_TOKEN_TTL_SECONDS, alias="AUTH_TOKEN_TTL_SECONDS")
-    telegram_support_bot_token: str | None = Field(default=None, alias="TELEGRAM_SUPPORT_BOT_TOKEN")
-    telegram_support_webhook_secret: str | None = Field(default=None, alias="TELEGRAM_SUPPORT_WEBHOOK_SECRET")
-    telegram_support_webhook_base_url: str = Field(
-        default="https://mean-lettie-corevia-0bd7cc91.koyeb.app",
-        alias="TELEGRAM_SUPPORT_WEBHOOK_BASE_URL",
-    )
-    telegram_support_auto_sync_on_list: bool = Field(default=True, alias="TELEGRAM_SUPPORT_AUTO_SYNC_ON_LIST")
     twilio_account_sid: str | None = Field(default=None, alias="TWILIO_ACCOUNT_SID")
     twilio_auth_token: str | None = Field(default=None, alias="TWILIO_AUTH_TOKEN")
     twilio_verify_service_sid: str | None = Field(default=None, alias="TWILIO_VERIFY_SERVICE_SID")
-    # SECURITY: All Supabase storage credentials must come from Koyeb env vars.
-    # Empty defaults here mean: if the env var isn't set, the support-uploads
-    # feature returns 503 instead of silently falling back to a baked-in secret.
-    # The previous defaults also pointed at the legacy Sydney project ref
-    # (splzxivzahitxmjcqstn); leaving them would silently route uploads to the
-    # paused project after the Frankfurt cutover.
-    support_uploads_s3_endpoint: str | None = Field(
-        default=None,
-        alias="SUPPORT_UPLOADS_S3_ENDPOINT",
-    )
-    support_uploads_s3_region: str = Field(default="eu-central-1", alias="SUPPORT_UPLOADS_S3_REGION")
-    support_uploads_access_key_id: str | None = Field(
-        default=None,
-        alias="SUPPORT_UPLOADS_ACCESS_KEY_ID",
-    )
-    support_uploads_secret_access_key: str | None = Field(
-        default=None,
-        alias="SUPPORT_UPLOADS_SECRET_ACCESS_KEY",
-    )
-    support_uploads_bucket: str = Field(default="Tulip Mobile APP", alias="SUPPORT_UPLOADS_BUCKET")
-    support_uploads_object_prefix: str = Field(default="support", alias="SUPPORT_UPLOADS_OBJECT_PREFIX")
-    support_uploads_url_ttl_seconds: int = Field(default=600, alias="SUPPORT_UPLOADS_URL_TTL_SECONDS")
-    support_uploads_max_file_bytes: int = Field(default=10 * 1024 * 1024, alias="SUPPORT_UPLOADS_MAX_FILE_BYTES")
-    support_uploads_public_base_url: str | None = Field(
-        default=None,
-        alias="SUPPORT_UPLOADS_PUBLIC_BASE_URL",
-    )
 
     @model_validator(mode="after")
     def validate_production_secrets(self) -> "Settings":

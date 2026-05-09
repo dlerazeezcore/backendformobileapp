@@ -407,41 +407,6 @@ class PushNotification(TimeMixin, Base):
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     sent_by_admin: Mapped[AdminUser | None] = relationship(back_populates="push_notifications")
 
-class TelegramSupportMessage(TimeMixin, Base):
-    __tablename__ = "telegram_support_messages"
-    # Migration 0032 also creates a partial index
-    # ix_telegram_support_messages_admin_self_created (admin_user_id, created_at DESC)
-    # WHERE user_id IS NULL — partial indexes aren't expressible portably in
-    # SQLAlchemy declarative form, so we keep that one migration-only.
-    __table_args__ = (
-        Index("ix_telegram_support_messages_user_created", "user_id", "created_at"),
-        Index("ix_telegram_support_messages_direction_created", "direction", "created_at"),
-        Index("ix_telegram_support_messages_status_created", "status", "created_at"),
-        Index("ix_telegram_support_messages_chat_created", "telegram_chat_id", "created_at"),
-    )
-
-    id: Mapped[str] = mapped_column(Uuid(as_uuid=False), primary_key=True, default=lambda: str(uuid.uuid4()))
-    user_id: Mapped[str | None] = mapped_column(
-        Uuid(as_uuid=False),
-        ForeignKey("app_users.id", ondelete="SET NULL"),
-        nullable=True,
-        index=True,
-    )
-    admin_user_id: Mapped[str | None] = mapped_column(
-        Uuid(as_uuid=False),
-        ForeignKey("admin_users.id", ondelete="SET NULL"),
-        nullable=True,
-        index=True,
-    )
-    direction: Mapped[str] = mapped_column(String(32), nullable=False)
-    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
-    message_text: Mapped[str] = mapped_column(Text, nullable=False)
-    telegram_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    telegram_message_id: Mapped[int | None] = mapped_column(BigInteger, unique=True, nullable=True)
-    push_delivery_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    provider_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
-    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
-
 
 class ExchangeRate(TimeMixin, Base):
     __tablename__ = "exchange_rates"
