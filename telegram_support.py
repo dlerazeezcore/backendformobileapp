@@ -1274,7 +1274,10 @@ def register_telegram_support_routes(
         tokens = db.scalars(select(PushDevice.token).where(PushDevice.user_id == target_user_id, PushDevice.active.is_(True))).all()
         if tokens:
             try:
-                send_result = push_provider.send_push_notification(
+                # Firebase Admin SDK is sync; offload so a slow FCM round-trip
+                # cannot block the asyncio event loop and freeze the whole worker.
+                send_result = await asyncio.to_thread(
+                    push_provider.send_push_notification,
                     tokens=tokens,
                     title="Support reply",
                     body=(message_text or "Support sent an attachment.")[:2000],
@@ -1597,7 +1600,10 @@ def register_telegram_support_routes(
             tokens = []
         if tokens:
             try:
-                send_result = push_provider.send_push_notification(
+                # Firebase Admin SDK is sync; offload so a slow FCM round-trip
+                # cannot block the asyncio event loop and freeze the whole worker.
+                send_result = await asyncio.to_thread(
+                    push_provider.send_push_notification,
                     tokens=tokens,
                     title="Support reply",
                     body=(text or "Support sent an image.")[:2000],
