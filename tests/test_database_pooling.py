@@ -7,7 +7,7 @@ from unittest.mock import patch
 from sqlalchemy.pool import NullPool
 from sqlalchemy.pool import QueuePool
 
-from supabase_store import create_database, normalize_database_url
+from supabase_store import build_database_connect_args, create_database, normalize_database_url
 
 
 class DatabasePoolingTest(unittest.TestCase):
@@ -25,6 +25,10 @@ class DatabasePoolingTest(unittest.TestCase):
             "DATABASE_APPLICATION_NAME",
             "DATABASE_POOL_CLASS",
             "SUPABASE_FORCE_TRANSACTION_POOLER",
+            "DATABASE_TCP_KEEPALIVES_IDLE",
+            "DATABASE_TCP_KEEPALIVES_INTERVAL",
+            "DATABASE_TCP_KEEPALIVES_COUNT",
+            "DATABASE_TCP_USER_TIMEOUT_MS",
         ):
             os.environ.pop(name, None)
 
@@ -36,7 +40,7 @@ class DatabasePoolingTest(unittest.TestCase):
             self.assertEqual(engine.pool.size(), 2)
             self.assertEqual(engine.pool._max_overflow, 1)
             self.assertEqual(engine.pool._timeout, 15)
-            self.assertEqual(engine.pool._recycle, 300)
+            self.assertEqual(engine.pool._recycle, 180)
             self.assertTrue(engine.pool._pre_ping)
         finally:
             engine.dispose()
@@ -50,7 +54,7 @@ class DatabasePoolingTest(unittest.TestCase):
             self.assertIsInstance(engine.pool, QueuePool)
             self.assertEqual(engine.pool.size(), 2)
             self.assertEqual(engine.pool._max_overflow, 0)
-            self.assertEqual(engine.pool._timeout, 3)
+            self.assertEqual(engine.pool._timeout, 10)
         finally:
             engine.dispose()
 
@@ -63,7 +67,7 @@ class DatabasePoolingTest(unittest.TestCase):
             self.assertIsInstance(engine.pool, QueuePool)
             self.assertEqual(engine.pool.size(), 2)
             self.assertEqual(engine.pool._max_overflow, 0)
-            self.assertEqual(engine.pool._timeout, 3)
+            self.assertEqual(engine.pool._timeout, 10)
             self.assertEqual(engine.url.port, 6543)
         finally:
             engine.dispose()
@@ -77,7 +81,7 @@ class DatabasePoolingTest(unittest.TestCase):
             self.assertIsInstance(engine.pool, QueuePool)
             self.assertEqual(engine.pool.size(), 2)
             self.assertEqual(engine.pool._max_overflow, 0)
-            self.assertEqual(engine.pool._timeout, 3)
+            self.assertEqual(engine.pool._timeout, 10)
             self.assertEqual(engine.url.port, 6543)
         finally:
             engine.dispose()
@@ -181,6 +185,50 @@ class DatabasePoolingTest(unittest.TestCase):
             self.assertTrue(engine.pool._pre_ping)
         finally:
             engine.dispose()
+
+
+    def test_postgres_connections_enable_tcp_keepalives_and_user_timeout(self) -> None:
+        connect_args = build_database_connect_args(
+            "postgresql://user:password@aws-1-ap-southeast-2.pooler.supabase.com:6543/postgres"
+        )
+        self.assertEqual(connect_args["keepalives"], 1)
+        self.assertEqual(connect_args["keepalives_idle"], 30)
+        self.assertEqual(connect_args["keepalives_interval"], 10)
+        self.assertEqual(connect_args["keepalives_count"], 3)
+        self.assertEqual(connect_args["tcp_user_timeout"], 30000)
+
+    def test_non_pooler_postgres_connections_also_enable_tcp_keepalives(self) -> None:
+        connect_args = build_database_connect_args("postgresql://user:password@example.com:5432/postgres")
+        self.assertEqual(connect_args["keepalives"], 1)
+        self.assertEqual(connect_args["keepalives_idle"], 30)
+        self.assertEqual(connect_args["tcp_user_timeout"], 30000)
+
+    def test_sqlite_path_does_not_inject_tcp_keepalives(self) -> None:
+        with patch("supabase_store.create_engine") as mocked_create_engine:
+            mocked_create_engine.return_value = object()
+            create_database("sqlite:///./test.db")
+            connect_args = mocked_create_engine.call_args.kwargs["connect_args"]
+            self.assertNotIn("keepalives", connect_args)
+            self.assertNotIn("tcp_user_timeout", connect_args)
+            self.assertEqual(connect_args, {"check_same_thread": False})
+
+    def test_tcp_keepalive_values_can_be_overridden_by_environment(self) -> None:
+        os.environ["DATABASE_TCP_KEEPALIVES_IDLE"] = "15"
+        os.environ["DATABASE_TCP_KEEPALIVES_INTERVAL"] = "5"
+        os.environ["DATABASE_TCP_KEEPALIVES_COUNT"] = "4"
+        os.environ["DATABASE_TCP_USER_TIMEOUT_MS"] = "12000"
+        connect_args = build_database_connect_args("postgresql://user:password@example.com:5432/postgres")
+        self.assertEqual(connect_args["keepalives_idle"], 15)
+        self.assertEqual(connect_args["keepalives_interval"], 5)
+        self.assertEqual(connect_args["keepalives_count"], 4)
+        self.assertEqual(connect_args["tcp_user_timeout"], 12000)
+
+    def test_tcp_user_timeout_zero_omits_the_key(self) -> None:
+        os.environ["DATABASE_TCP_USER_TIMEOUT_MS"] = "0"
+        connect_args = build_database_connect_args("postgresql://user:password@example.com:5432/postgres")
+        self.assertNotIn("tcp_user_timeout", connect_args)
+        # keepalives are still present
+        self.assertEqual(connect_args["keepalives"], 1)
 
 
 if __name__ == "__main__":
