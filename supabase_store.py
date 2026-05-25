@@ -272,6 +272,28 @@ def build_database_connect_args(database_url: str, *, for_migrations: bool = Fal
         ),
         "application_name": os.getenv("DATABASE_APPLICATION_NAME", "tulip_mobile_backend"),
     }
+    # TCP keepalives + tcp_user_timeout are the primary defense against indefinite
+    # hangs. `connect_timeout` only bounds connection establishment and the server-side
+    # statement_timeout only fires while a live backend is processing the session. When
+    # the Supabase pooler (PgBouncer) or an intermediate NAT silently drops an idle
+    # connection, the client socket has no way to notice and a checkout / pool_pre_ping
+    # `SELECT 1` blocks forever -- which freezes the (single) async worker. Keepalives
+    # make the kernel probe the peer so a dead socket errors out (then pool_pre_ping
+    # evicts it and reconnects); tcp_user_timeout (libpq, ms, Linux-only) bounds how long
+    # an unacked send waits before failing. All values are env-tunable. These are libpq
+    # connection parameters that psycopg forwards to the driver and are harmless on any
+    # Postgres connection.
+    connect_args.update(
+        {
+            "keepalives": 1,
+            "keepalives_idle": _read_int_env("DATABASE_TCP_KEEPALIVES_IDLE", 30, minimum=1),
+            "keepalives_interval": _read_int_env("DATABASE_TCP_KEEPALIVES_INTERVAL", 10, minimum=1),
+            "keepalives_count": _read_int_env("DATABASE_TCP_KEEPALIVES_COUNT", 3, minimum=1),
+        }
+    )
+    tcp_user_timeout_ms = _read_int_env("DATABASE_TCP_USER_TIMEOUT_MS", 30000, minimum=0)
+    if tcp_user_timeout_ms > 0:
+        connect_args["tcp_user_timeout"] = tcp_user_timeout_ms
     if is_supabase_pooler:
         # Supabase pooler (PgBouncer) can fail with DuplicatePreparedStatement when
         # server-side prepared statements are enabled across pooled connections.
@@ -748,7 +770,7 @@ def create_database(database_url: str) -> sessionmaker[Session]:
                 "pool_size": _read_int_env("DATABASE_POOL_SIZE", default_pool_size, minimum=1),
                 "max_overflow": _read_int_env("DATABASE_MAX_OVERFLOW", default_max_overflow),
                 "pool_timeout": _read_int_env("DATABASE_POOL_TIMEOUT_SECONDS", default_pool_timeout, minimum=1),
-                "pool_recycle": _read_int_env("DATABASE_POOL_RECYCLE_SECONDS", 300, minimum=1),
+                "pool_recycle": _read_int_env("DATABASE_POOL_RECYCLE_SECONDS", 180, minimum=30),
                 "pool_pre_ping": True,
                 "pool_use_lifo": True,
             }
