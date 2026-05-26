@@ -25,7 +25,8 @@ from twilio_whatsapp import TwilioWhatsAppVerifyAPI
 
 
 class LoginPayload(BaseModel):
-    phone: str
+    phone: str | None = None
+    email: str | None = None
     password: str | None = Field(default=None, min_length=8)
     otp_code: str | None = Field(default=None, alias="otpCode")
     otp_channel: str | None = Field(default=None, alias="otpChannel")
@@ -33,6 +34,13 @@ class LoginPayload(BaseModel):
 
     @model_validator(mode="after")
     def validate_auth_factor(self) -> "LoginPayload":
+        has_phone = bool(self.phone and self.phone.strip())
+        has_email = bool(self.email and self.email.strip())
+        if not has_phone and not has_email:
+            raise ValueError("phone or email is required")
+        # Phone is the default identifier; email is the password-only alternative.
+        if has_email and not has_phone and self.otp_code:
+            raise ValueError("OTP login requires a phone number")
         if self.password or self.otp_code:
             return self
         raise ValueError("password or otpCode is required")
@@ -330,6 +338,20 @@ def _lookup_user_by_phone(db: Session, phone: str) -> AppUser | None:
     return row
 
 
+def _lookup_user_by_email(db: Session, email: str) -> AppUser | None:
+    normalized = str(email or "").strip().lower()
+    if not normalized:
+        return None
+    return db.scalar(select(AppUser).where(func.lower(AppUser.email) == normalized).limit(1))
+
+
+def _lookup_admin_by_email(db: Session, email: str) -> AdminUser | None:
+    normalized = str(email or "").strip().lower()
+    if not normalized:
+        return None
+    return db.scalar(select(AdminUser).where(func.lower(AdminUser.email) == normalized).limit(1))
+
+
 def _issue_token(row: AppUser | AdminUser, *, subject_type: str) -> dict[str, Any]:
     settings = get_settings()
     token = create_access_token(
@@ -511,12 +533,16 @@ def _issue_login_for_subject_id(
 def _login_subject_with_password(
     session_factory: Callable[[], Session],
     *,
-    phone: str,
+    phone: str | None = None,
+    email: str | None = None,
     password: str,
 ) -> dict[str, Any]:
     db = session_factory()
     try:
-        user_row = _lookup_user_by_phone(db, phone)
+        if email:
+            user_row = _lookup_user_by_email(db, email)
+        else:
+            user_row = _lookup_user_by_phone(db, phone)
         if user_row is not None:
             if not _is_row_active(user_row):
                 raise HTTPException(
@@ -526,9 +552,9 @@ def _login_subject_with_password(
             if verify_password(password, user_row.password_hash):
                 _touch_last_login_if_due(db, user_row)
                 return _issue_subject_session(user_row, subject_type="user")
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid phone or password")
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
-        admin_row = _lookup_admin_by_phone(db, phone)
+        admin_row = _lookup_admin_by_email(db, email) if email else _lookup_admin_by_phone(db, phone)
         if admin_row is not None:
             if not _is_row_active(admin_row):
                 raise HTTPException(
@@ -538,11 +564,11 @@ def _login_subject_with_password(
             if verify_password(password, admin_row.password_hash):
                 _touch_last_login_if_due(db, admin_row)
                 return _issue_subject_session(admin_row, subject_type="admin")
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid phone or password")
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="User account not found. Please sign up first.",
+            detail="Account not found. Please sign up first.",
         )
     finally:
         db.close()
@@ -681,11 +707,14 @@ def register_auth_routes(
 
     @app.post("/api/v1/auth/admin/login")
     def admin_login(payload: LoginPayload, db: Session = Depends(get_db)) -> dict[str, Any]:
-        row = _lookup_admin_by_phone(db, payload.phone)
         if payload.password is None:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="password is required")
+        if payload.email and not payload.phone:
+            row = _lookup_admin_by_email(db, payload.email)
+        else:
+            row = _lookup_admin_by_phone(db, payload.phone)
         if row is None or not _is_row_active(row) or not verify_password(payload.password, row.password_hash):
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid phone or password")
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
         row.last_login_at = utcnow()
         db.commit()
         return _issue_subject_session(row, subject_type="admin")
@@ -696,9 +725,22 @@ def register_auth_routes(
         request: Request,
         provider: TwilioWhatsAppVerifyAPI | None = Depends(_get_optional_twilio_provider),
     ) -> dict[str, Any]:
+        session_factory = request.app.state.db_session_factory
+        # Email is the password-only alternative identifier (phone stays default).
+        if payload.email and not payload.phone:
+            if payload.password is None:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail="password is required for email login",
+                )
+            return await _run_login_db_worker(
+                _login_subject_with_password,
+                session_factory,
+                email=payload.email.strip(),
+                password=payload.password,
+            )
         normalized_phone = _normalize_and_validate_signup_phone(payload.phone)
         _log_phone_lookup("auth.user.login", payload.phone, normalized_phone)
-        session_factory = request.app.state.db_session_factory
         if payload.otp_code:
             requested_channel = _normalize_otp_channel(payload.otp_channel, field_name="otpChannel")
             subject_type, subject_id = await _run_login_db_worker(

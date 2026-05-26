@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -28,12 +29,39 @@ from sqlalchemy import (
     or_,
     select,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, joinedload, mapped_column, relationship, sessionmaker
 from sqlalchemy.pool import NullPool
 
 from phone_utils import normalize_phone, phone_lookup_candidates
 
+# JSONB on Postgres (binary, indexable, deduped keys); plain JSON elsewhere (e.g. SQLite tests).
+_JSONB = JSON().with_variant(JSONB(), "postgresql")
+
 APP_TIMEZONE = timezone(timedelta(hours=3), name="GMT+3")
+
+LOGGER = logging.getLogger("uvicorn.error")
+
+# eSIM Access quotes package prices in 1/10000 of the provider currency unit
+# (e.g. price 23000 == 2.30 USD). Normalize to provider-currency major units
+# before applying the FX rate so the IQD sale price is correct.
+ESIM_ACCESS_PRICE_UNIT = 10000
+
+
+def parse_provider_float(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
+    return None
 
 
 def utcnow() -> datetime:
@@ -95,6 +123,33 @@ def _pick_first_provider_int(payload: dict[str, Any], keys: tuple[str, ...]) -> 
         if parsed is not None:
             return parsed
     return None
+
+
+# eSIM Access reports these fields in bytes; suffix-tagged fields name their unit.
+_BYTES_PROVIDER_KEYS = {"totalVolume", "orderUsage", "totalData", "dataUsage"}
+
+
+def _provider_unit_for_key(key: str) -> str | None:
+    lowered = key.lower()
+    if lowered.endswith("bytes"):
+        return "bytes"
+    if lowered.endswith("kb"):
+        return "kb"
+    if lowered.endswith("mb"):
+        return "mb"
+    if key in _BYTES_PROVIDER_KEYS:
+        return "bytes"
+    return None
+
+
+def _pick_first_provider_int_with_unit(
+    payload: dict[str, Any], keys: tuple[str, ...]
+) -> tuple[int | None, str | None]:
+    for key in keys:
+        parsed = parse_provider_int(payload.get(key))
+        if parsed is not None:
+            return parsed, _provider_unit_for_key(key)
+    return None, None
 
 
 def _usage_unit_from_hint(unit_hint: str | None, *, total_raw: int | None, used_raw: int | None) -> str:
@@ -349,7 +404,7 @@ class AdminUser(TimeMixin, Base):
     blocked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    custom_fields: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    custom_fields: Mapped[dict[str, Any]] = mapped_column(_JSONB, default=dict, nullable=False)
     payment_attempts: Mapped[list["PaymentAttempt"]] = relationship(back_populates="admin_user")
     push_notifications: Mapped[list["PushNotification"]] = relationship(back_populates="sent_by_admin")
     push_devices: Mapped[list["PushDevice"]] = relationship(
@@ -393,7 +448,7 @@ class PushDevice(TimeMixin, Base):
     timezone_name: Mapped[str | None] = mapped_column(String(64))
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
-    custom_fields: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    custom_fields: Mapped[dict[str, Any]] = mapped_column(_JSONB, default=dict, nullable=False)
     user: Mapped[AppUser | None] = relationship(back_populates="push_devices", foreign_keys=[user_id])
     admin_user: Mapped[AdminUser | None] = relationship(back_populates="push_devices", foreign_keys=[admin_user_id])
 
@@ -409,8 +464,8 @@ class PushNotification(TimeMixin, Base):
     recipient_scope: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False)
-    data_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
-    target_user_ids: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    data_payload: Mapped[dict[str, Any]] = mapped_column(_JSONB, default=dict, nullable=False)
+    target_user_ids: Mapped[list[str]] = mapped_column(_JSONB, default=list, nullable=False)
     channel_id: Mapped[str] = mapped_column(String(64), default="general", nullable=False)
     image_url: Mapped[str | None] = mapped_column(Text)
     provider: Mapped[str] = mapped_column(String(64), default="firebase_fcm", nullable=False)
@@ -418,8 +473,8 @@ class PushNotification(TimeMixin, Base):
     success_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     failure_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     invalid_token_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    invalid_tokens: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
-    provider_response: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    invalid_tokens: Mapped[list[str]] = mapped_column(_JSONB, default=list, nullable=False)
+    provider_response: Mapped[dict[str, Any]] = mapped_column(_JSONB, default=dict, nullable=False)
     error_message: Mapped[str | None] = mapped_column(Text)
     sent_by_admin_id: Mapped[str | None] = mapped_column(
         Uuid(as_uuid=False),
@@ -432,6 +487,15 @@ class PushNotification(TimeMixin, Base):
 
 class ExchangeRate(TimeMixin, Base):
     __tablename__ = "exchange_rates"
+    __table_args__ = (
+        Index(
+            "ix_exchange_rates_lookup_active",
+            "base_currency",
+            "quote_currency",
+            "active",
+            "effective_at",
+        ),
+    )
     id: Mapped[int] = mapped_column(primary_key=True)
     base_currency: Mapped[str] = mapped_column(String(8), index=True)
     quote_currency: Mapped[str] = mapped_column(String(8), index=True)
@@ -440,11 +504,24 @@ class ExchangeRate(TimeMixin, Base):
     effective_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    custom_fields: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    custom_fields: Mapped[dict[str, Any]] = mapped_column(_JSONB, default=dict, nullable=False)
 
 
 class PricingRule(TimeMixin, Base):
     __tablename__ = "pricing_rules"
+    __table_args__ = (
+        Index(
+            "ix_pricing_rules_active_scope",
+            "service_type",
+            "active",
+            "rule_scope",
+            "package_code",
+            "country_code",
+            "provider_code",
+            "priority",
+            "created_at",
+        ),
+    )
     id: Mapped[int] = mapped_column(primary_key=True)
     service_type: Mapped[str] = mapped_column(String(32), index=True, default="esim")
     rule_scope: Mapped[str] = mapped_column(String(32), index=True, default="global")
@@ -460,11 +537,24 @@ class PricingRule(TimeMixin, Base):
     starts_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     notes: Mapped[str | None] = mapped_column(Text)
-    custom_fields: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    custom_fields: Mapped[dict[str, Any]] = mapped_column(_JSONB, default=dict, nullable=False)
 
 
 class DiscountRule(TimeMixin, Base):
     __tablename__ = "discount_rules"
+    __table_args__ = (
+        Index(
+            "ix_discount_rules_active_scope",
+            "service_type",
+            "active",
+            "rule_scope",
+            "package_code",
+            "country_code",
+            "provider_code",
+            "priority",
+            "created_at",
+        ),
+    )
     id: Mapped[int] = mapped_column(primary_key=True)
     service_type: Mapped[str] = mapped_column(String(32), index=True, default="esim")
     rule_scope: Mapped[str] = mapped_column(String(32), index=True, default="global")
@@ -480,7 +570,7 @@ class DiscountRule(TimeMixin, Base):
     starts_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     reason: Mapped[str | None] = mapped_column(Text)
-    custom_fields: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    custom_fields: Mapped[dict[str, Any]] = mapped_column(_JSONB, default=dict, nullable=False)
 
 
 class FeaturedLocation(TimeMixin, Base):
@@ -499,11 +589,14 @@ class FeaturedLocation(TimeMixin, Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     starts_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    custom_fields: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    custom_fields: Mapped[dict[str, Any]] = mapped_column(_JSONB, default=dict, nullable=False)
 
 
 class CustomerOrder(TimeMixin, Base):
     __tablename__ = "customer_orders"
+    __table_args__ = (
+        Index("ix_customer_orders_user_booked_created", "user_id", "booked_at", "created_at"),
+    )
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[str | None] = mapped_column(Uuid(as_uuid=False), ForeignKey("app_users.id", ondelete="SET NULL"), index=True)
     order_number: Mapped[str] = mapped_column(String(64), unique=True)
@@ -526,6 +619,15 @@ class CustomerOrder(TimeMixin, Base):
 
 class OrderItem(TimeMixin, Base):
     __tablename__ = "order_items"
+    __table_args__ = (
+        Index(
+            "ix_order_items_customer_order_service_booked_created",
+            "customer_order_id",
+            "service_type",
+            "booked_at",
+            "created_at",
+        ),
+    )
     id: Mapped[int] = mapped_column(primary_key=True)
     customer_order_id: Mapped[int] = mapped_column(ForeignKey("customer_orders.id", ondelete="CASCADE"), index=True)
     service_type: Mapped[str] = mapped_column(String(32), default="esim", nullable=False, index=True)
@@ -560,7 +662,7 @@ class OrderItem(TimeMixin, Base):
     refunded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_provider_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    custom_fields: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    custom_fields: Mapped[dict[str, Any]] = mapped_column(_JSONB, default=dict, nullable=False)
     customer_order: Mapped[CustomerOrder] = relationship(back_populates="order_items")
     profiles: Mapped[list["ESimProfile"]] = relationship(back_populates="order_item")
     lifecycle_events: Mapped[list["ESimLifecycleEvent"]] = relationship(back_populates="order_item")
@@ -615,9 +717,9 @@ class PaymentAttempt(TimeMixin, Base):
     transaction_id: Mapped[str] = mapped_column(String(255), nullable=False)
     idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
-    metadata_payload: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict, nullable=False)
-    provider_request: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
-    provider_response: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    metadata_payload: Mapped[dict[str, Any]] = mapped_column("metadata", _JSONB, default=dict, nullable=False)
+    provider_request: Mapped[dict[str, Any]] = mapped_column(_JSONB, default=dict, nullable=False)
+    provider_response: Mapped[dict[str, Any]] = mapped_column(_JSONB, default=dict, nullable=False)
     paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     canceled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -649,7 +751,7 @@ class PaymentProviderEvent(Base):
     event_type: Mapped[str] = mapped_column(String(128), nullable=False)
     provider_event_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     signature_valid: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
-    raw_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    raw_payload: Mapped[dict[str, Any]] = mapped_column(_JSONB, default=dict, nullable=False)
     processed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     processing_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
@@ -658,6 +760,9 @@ class PaymentProviderEvent(Base):
 
 class ESimProfile(TimeMixin, Base):
     __tablename__ = "esim_profiles"
+    __table_args__ = (
+        Index("ix_esim_profiles_user_updated_created", "user_id", "updated_at", "created_at"),
+    )
     id: Mapped[int] = mapped_column(primary_key=True)
     order_item_id: Mapped[int | None] = mapped_column(ForeignKey("order_items.id", ondelete="SET NULL"), index=True)
     user_id: Mapped[str | None] = mapped_column(Uuid(as_uuid=False), ForeignKey("app_users.id", ondelete="SET NULL"), index=True)
@@ -683,7 +788,7 @@ class ESimProfile(TimeMixin, Base):
     suspended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     unsuspended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_provider_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    custom_fields: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    custom_fields: Mapped[dict[str, Any]] = mapped_column(_JSONB, default=dict, nullable=False)
     order_item: Mapped[OrderItem | None] = relationship(back_populates="profiles")
     user: Mapped[AppUser | None] = relationship(back_populates="profiles")
     lifecycle_events: Mapped[list["ESimLifecycleEvent"]] = relationship(back_populates="profile")
@@ -731,7 +836,7 @@ class ESimLifecycleEvent(TimeMixin, Base):
     status_after: Mapped[str | None] = mapped_column(String(80))
     note: Mapped[str | None] = mapped_column(Text)
     event_timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
-    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(_JSONB, default=dict, nullable=False)
     customer_order: Mapped[CustomerOrder | None] = relationship(back_populates="lifecycle_events")
     order_item: Mapped[OrderItem | None] = relationship(back_populates="lifecycle_events")
     profile: Mapped[ESimProfile | None] = relationship(back_populates="lifecycle_events")
@@ -2113,6 +2218,19 @@ class SupabaseStore:
             return max(int(round(adjustment_value)), 0)
         return max(int(round(basis_minor * (adjustment_value / 100.0))), 0)
 
+    @staticmethod
+    def _markup_percent_from_exchange(rate_row: "ExchangeRate | None") -> float:
+        # Markup is configured on the active sale-currency exchange-rate row
+        # (exchange_rates.custom_fields.markupPercent), the single source of truth
+        # the admin panel + public /exchange-rates/current endpoint already use.
+        if rate_row is None:
+            return 0.0
+        custom = rate_row.custom_fields or {}
+        parsed = parse_provider_float(custom.get("markupPercent", custom.get("markup_percent")))
+        if parsed is None or parsed < 0:
+            return 0.0
+        return parsed
+
     def save_managed_order(
         self,
         *,
@@ -2162,22 +2280,29 @@ class SupabaseStore:
             source_provider_price_minor = 0
         source_currency_code = provider_currency_code or "USD"
         sale_currency_code = currency_code or source_currency_code
+        # Always resolve the active sale-currency exchange-rate row so we can read
+        # the configured markup, even when the client supplies its own FX rate.
+        rate_row = (
+            self.get_active_exchange_rate(
+                base_currency=source_currency_code,
+                quote_currency=sale_currency_code,
+                at_time=now,
+            )
+            if source_currency_code != sale_currency_code
+            else None
+        )
         applied_exchange_rate = exchange_rate
         if applied_exchange_rate is None:
             if source_currency_code == sale_currency_code:
                 applied_exchange_rate = 1.0
             else:
-                rate_row = self.get_active_exchange_rate(
-                    base_currency=source_currency_code,
-                    quote_currency=sale_currency_code,
-                    at_time=now,
-                )
                 if rate_row is None:
                     raise ValueError(
                         f"No active exchange rate for {source_currency_code} -> {sale_currency_code}"
                     )
                 applied_exchange_rate = rate_row.rate
-        converted_provider_price_minor = int(round(source_provider_price_minor * applied_exchange_rate))
+        provider_price_major = source_provider_price_minor / ESIM_ACCESS_PRICE_UNIT
+        converted_provider_price_minor = int(round(provider_price_major * applied_exchange_rate))
         pricing_rule = self.get_best_pricing_rule(
             service_type="esim",
             package_code=package_code or package_info.get("packageCode"),
@@ -2193,6 +2318,15 @@ class SupabaseStore:
                 adjustment_value=pricing_rule.adjustment_value,
                 basis_minor=pricing_basis_minor,
             )
+        else:
+            # No explicit pricing rule: apply the configured exchange-rate markup.
+            markup_percent = self._markup_percent_from_exchange(rate_row)
+            if markup_percent > 0:
+                markup_minor = self._calculate_adjustment_minor(
+                    adjustment_type="percent",
+                    adjustment_value=markup_percent,
+                    basis_minor=pricing_basis_minor,
+                )
         subtotal_minor = converted_provider_price_minor
         total_before_discount_minor = subtotal_minor + markup_minor
         discount_rule = self.get_best_discount_rule(
@@ -2213,11 +2347,20 @@ class SupabaseStore:
                 basis_minor=discount_basis_minor,
             )
         computed_sale_price_minor = max(total_before_discount_minor - discount_minor, 0)
-        final_sale_price = (
-            sale_price_minor
-            if sale_price_minor is not None and pricing_rule is None and discount_rule is None
-            else computed_sale_price_minor
-        )
+        # Server-authoritative pricing: the server-computed IQD price is the source of
+        # truth so a tampered client cannot underpay. The client-supplied salePriceMinor
+        # is recorded for audit and a deviation is logged.
+        final_sale_price = computed_sale_price_minor
+        if sale_price_minor is not None and sale_price_minor != final_sale_price:
+            LOGGER.warning(
+                "managed_order.price_deviation client=%s server=%s currency=%s provider_minor=%s rate=%s markup_minor=%s",
+                sale_price_minor,
+                final_sale_price,
+                sale_currency_code,
+                source_provider_price_minor,
+                applied_exchange_rate,
+                markup_minor,
+            )
         order.user = user
         order.order_status = "BOOKED" if provider_response.get("success") else "FAILED"
         order.payment_method = str(payment_method or "").strip().lower() or None
@@ -2268,6 +2411,8 @@ class SupabaseStore:
             {
                 "checkoutSnapshot": checkout_snapshot,
                 "packageMetadata": package_metadata,
+                "clientSalePriceMinor": sale_price_minor,
+                "serverSalePriceMinor": final_sale_price,
             },
         )
         self.session.flush()
@@ -2299,6 +2444,7 @@ class SupabaseStore:
                     "markupMinor": markup_minor,
                     "discountMinor": discount_minor,
                     "salePriceMinor": final_sale_price,
+                    "clientSalePriceMinor": sale_price_minor,
                     "pricingRuleId": pricing_rule.id if pricing_rule else None,
                     "discountRuleId": discount_rule.id if discount_rule else None,
                 },
@@ -2393,11 +2539,24 @@ class SupabaseStore:
                 profile = self.session.scalar(select(ESimProfile).where(ESimProfile.iccid == item["iccid"]))
             if profile is None and item.get("esimTranNo"):
                 profile = self.session.scalar(select(ESimProfile).where(ESimProfile.esim_tran_no == item["esimTranNo"]))
+            if profile is None and order_item is not None:
+                # Reuse the order's placeholder row (created at purchase time) instead of
+                # inserting a second profile, which previously produced duplicate cards.
+                profile = self.session.scalar(
+                    select(ESimProfile)
+                    .where(
+                        ESimProfile.order_item_id == order_item.id,
+                        ESimProfile.iccid.is_(None),
+                        ESimProfile.esim_tran_no.is_(None),
+                    )
+                    .order_by(ESimProfile.id.asc())
+                    .limit(1)
+                )
             if profile is None:
                 profile = ESimProfile()
                 self.session.add(profile)
             before = profile.app_status
-            raw_total = _pick_first_provider_int(
+            raw_total, total_unit = _pick_first_provider_int_with_unit(
                 item,
                 (
                     "totalDataMb",
@@ -2407,7 +2566,7 @@ class SupabaseStore:
                     "totalDataBytes",
                 ),
             )
-            raw_used = _pick_first_provider_int(
+            raw_used, used_unit = _pick_first_provider_int_with_unit(
                 item,
                 (
                     "usedDataMb",
@@ -2421,12 +2580,16 @@ class SupabaseStore:
             total_data_mb, used_data_mb, _detected_unit = normalize_usage_pair_to_mb(
                 total_raw=raw_total,
                 used_raw=raw_used,
-                unit_hint=str(
-                    item.get("usageUnit")
-                    or item.get("dataUnit")
-                    or item.get("volumeUnit")
-                    or item.get("unit")
-                    or ""
+                unit_hint=(
+                    total_unit
+                    or used_unit
+                    or str(
+                        item.get("usageUnit")
+                        or item.get("dataUnit")
+                        or item.get("volumeUnit")
+                        or item.get("unit")
+                        or ""
+                    )
                 ),
             )
             remaining_data_mb = None
@@ -2515,7 +2678,7 @@ class SupabaseStore:
             if profile is None:
                 continue
             before = profile.used_data_mb
-            raw_total = _pick_first_provider_int(
+            raw_total, total_unit = _pick_first_provider_int_with_unit(
                 record,
                 (
                     "totalDataMb",
@@ -2524,7 +2687,7 @@ class SupabaseStore:
                     "totalDataBytes",
                 ),
             )
-            raw_used = _pick_first_provider_int(
+            raw_used, used_unit = _pick_first_provider_int_with_unit(
                 record,
                 (
                     "usedDataMb",
@@ -2537,12 +2700,16 @@ class SupabaseStore:
             total_data_mb, used_data_mb, _detected_unit = normalize_usage_pair_to_mb(
                 total_raw=raw_total,
                 used_raw=raw_used,
-                unit_hint=str(
-                    record.get("usageUnit")
-                    or record.get("dataUnit")
-                    or record.get("volumeUnit")
-                    or record.get("unit")
-                    or ""
+                unit_hint=(
+                    total_unit
+                    or used_unit
+                    or str(
+                        record.get("usageUnit")
+                        or record.get("dataUnit")
+                        or record.get("volumeUnit")
+                        or record.get("unit")
+                        or ""
+                    )
                 ),
             )
             remaining_data_mb = None
@@ -2842,34 +3009,34 @@ class SupabaseStore:
         return row
 
     def save_featured_location(self, payload: dict[str, Any]) -> FeaturedLocation:
+        # Upsert in place by (service_type, location_type, code) so editing a featured
+        # location updates the existing row instead of appending a new row and disabling
+        # the old one (which previously grew the table without bound).
         payload = dict(payload)
-        if payload.get("enabled", True) is False:
-            ended_at = self._to_app_timezone(payload.get("starts_at")) or utcnow()
-            updated_rows = self._deactivate_matching_rows_without_insert(
-                model=FeaturedLocation,
-                flag_field="enabled",
-                key_fields=["service_type", "location_type", "code"],
-                payload=payload,
-                end_field="ends_at",
-                end_at=ended_at,
-            )
-            if updated_rows:
-                self.session.commit()
-                self.session.refresh(updated_rows[0])
-                return updated_rows[0]
+        service_type = payload.get("service_type") or "esim"
+        location_type = payload.get("location_type") or "country"
+        code = payload.get("code")
         if payload.get("enabled", True) and payload.get("starts_at") is None:
             payload["starts_at"] = utcnow()
-        row = FeaturedLocation(**payload)
-        self.session.add(row)
+        row = None
+        if code is not None:
+            row = self.session.scalar(
+                select(FeaturedLocation)
+                .where(
+                    FeaturedLocation.service_type == service_type,
+                    FeaturedLocation.location_type == location_type,
+                    FeaturedLocation.code == code,
+                )
+                .order_by(FeaturedLocation.id.desc())
+                .limit(1)
+            )
+        if row is None:
+            row = FeaturedLocation(**payload)
+            self.session.add(row)
+        else:
+            for key, value in payload.items():
+                setattr(row, key, value)
         self.session.flush()
-        self._deactivate_previous_flagged_rows(
-            model=FeaturedLocation,
-            row=row,
-            flag_field="enabled",
-            key_fields=["service_type", "location_type", "code"],
-            new_start_field="starts_at",
-            previous_end_field="ends_at",
-        )
         self.session.commit()
         self.session.refresh(row)
         return row

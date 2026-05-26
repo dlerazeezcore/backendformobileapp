@@ -74,11 +74,17 @@ def run_migrations_online() -> None:
     retry_delay_seconds = max(float(os.getenv("ALEMBIC_DB_CONNECT_RETRY_DELAY_SECONDS", "0.5")), 0.1)
     allow_skip_on_pool_saturation = _as_bool(os.getenv("ALEMBIC_ALLOW_SKIP_ON_POOL_SATURATION"), default=True)
 
+    # SQLite (local/test) does not accept the libpq/psycopg connect args we build for
+    # Postgres; only pass them for real Postgres URLs.
+    if database_url.startswith("sqlite"):
+        migration_connect_args: dict = {}
+    else:
+        migration_connect_args = build_database_connect_args(database_url, for_migrations=True)
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
-        connect_args=build_database_connect_args(database_url, for_migrations=True),
+        connect_args=migration_connect_args,
     )
 
     try:

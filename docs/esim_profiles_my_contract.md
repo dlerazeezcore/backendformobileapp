@@ -57,8 +57,20 @@ Each profile row includes both camelCase and snake_case aliases for key lifecycl
 - `expiresAt`, `expires_at`
 - `supportTopUpType`
 - `activationCode`, `activation_code`
+- `qrCodeUrl`, `qr_code_url`
 - `installUrl`, `install_url`
+- `appleInstallUrl`, `apple_install_url` (iOS 17.4+ one-tap Universal Link, derived from the LPA activation code; `null` when expired)
+- `smdpAddress`, `smdp_address` and `matchingId`, `matching_id` (parsed from the LPA string)
+- `manualEntry`, `manual_entry` (`{ "smdpAddress", "activationCode" }` for manual install; `null` when expired)
 - `customFields`, `custom_fields` (contains `checkoutSnapshot` and `packageMetadata`)
+
+### Install targets
+
+The front end has three install paths, all derived from the same provider LPA activation code:
+
+- **QR**: render `qrCodeUrl` (provider-hosted PNG).
+- **iPhone one-tap**: open `appleInstallUrl` with the OS (`Linking.openURL`). Available on iOS 17.4+; `null` on expired profiles.
+- **Manual**: show `manualEntry.smdpAddress` (SM-DP+ address) and `manualEntry.activationCode` for hand entry on any device.
 
 ## Sample rows
 

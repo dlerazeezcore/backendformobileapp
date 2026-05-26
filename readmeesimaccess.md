@@ -665,7 +665,6 @@ These tables are the eSIM order/profile core:
 - `order_items`
 - `esim_profiles`
 - `esim_lifecycle_events`
-- `provider_payload_snapshots`
 - `payment_attempts`
 
 ### `customer_orders`
@@ -775,8 +774,6 @@ Required columns in model and Alembic:
 | `user_id` | Owning app user |
 | `esim_tran_no` | Provider eSIM transaction number |
 | `iccid` | eSIM ICCID |
-| `imsi` | IMSI |
-| `msisdn` | MSISDN |
 | `activation_code` | LPA activation code |
 | `qr_code_url` | Provider QR code URL |
 | `install_url` | Provider short/install URL |
@@ -840,24 +837,6 @@ Columns:
 - `note`
 - `event_timestamp`
 - `payload`
-- `created_at`
-- `updated_at`
-
-### `provider_payload_snapshots`
-
-Purpose: filtered request/response snapshots for provider debugging.
-
-Columns:
-
-- `id`
-- `provider`
-- `entity_type`
-- `direction`
-- `customer_order_id`
-- `order_item_id`
-- `profile_id`
-- `selected_field_paths`
-- `filtered_payload`
 - `created_at`
 - `updated_at`
 
@@ -958,7 +937,6 @@ where table_schema = 'public'
     'order_items',
     'esim_profiles',
     'esim_lifecycle_events',
-    'provider_payload_snapshots',
     'payment_attempts'
   )
 order by table_name, ordinal_position;
@@ -1189,7 +1167,11 @@ Call `POST /api/v1/esim-access/usage/sync/my` on app open or pull-to-refresh to 
 
 Use `supportTopUpType > 0` to decide whether to show a top-up affordance. Then call `/packages/query` with `type="TOPUP"` and `iccid`.
 
-Use `activationCode`, `qrCodeUrl`, and `installUrl` for installation UI.
+Use `qrCodeUrl` (QR), `appleInstallUrl` (iPhone one-tap, iOS 17.4+), and `manualEntry` (`smdpAddress` + `activationCode`) for installation UI. `appleInstallUrl`/`manualEntry` are `null` on expired profiles.
+
+Pricing is server-authoritative and always in IQD. eSIM Access quotes package prices in 1/10000 USD (e.g. `price: 23000` == $2.30), so the backend computes `salePriceMinor = (providerPrice / 10000) × activeRate × (1 + markupPercent/100)` from the active `USD→IQD` exchange-rate row (`exchange_rates.custom_fields.markupPercent`). Example: 23000 → $2.30 × 1550 × 2 = 7130 IQD. The client may send `salePriceMinor` for display, but the server recomputes and overrides it (stored under `custom_fields.clientSalePriceMinor` for audit). Read the rate + markup from `GET /api/v1/esim-access/exchange-rates/current`.
+
+Login accepts **phone by default** and **email as an alternative** (`POST /auth/user/login` with either `phone` or `email`; email is password-only, phone supports password or OTP). Email uniqueness is enforced case-insensitively.
 
 Do not calculate lifecycle from `expiresAt` alone. `expiresAt` can represent provider retention or provider expiry. The app bundle countdown is `bundleExpiresAt`.
 

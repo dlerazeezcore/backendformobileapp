@@ -12,6 +12,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from time import monotonic, time
 from typing import Any, Callable, Generic, TypeVar
+from urllib.parse import quote
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
@@ -370,6 +371,38 @@ def _resolve_support_topup_type(custom_fields: dict[str, Any]) -> int:
     return 0
 
 
+def _parse_lpa_activation_code(activation_code: str | None) -> tuple[str | None, str | None]:
+    """Parse an LPA string 'LPA:1$<smdp-address>$<matching-id>' into (smdpAddress, matchingId).
+
+    Tolerates a missing 'LPA:' scheme or format-version token, and returns
+    (None, None) for empty/unparseable input.
+    """
+    if not activation_code:
+        return None, None
+    body = activation_code.strip()
+    if not body:
+        return None, None
+    if body[:4].upper() == "LPA:":
+        body = body[4:]
+    parts = body.split("$")
+    # Drop a leading format-version token ('1') when present.
+    if parts and parts[0].strip() in {"1", ""}:
+        parts = parts[1:]
+    smdp = parts[0].strip() if len(parts) >= 1 and parts[0].strip() else None
+    matching_id = parts[1].strip() if len(parts) >= 2 and parts[1].strip() else None
+    return smdp, matching_id
+
+
+def _build_apple_install_url(activation_code: str | None) -> str | None:
+    """Apple one-tap eSIM install Universal Link (iOS 17.4+) built from the LPA string."""
+    if not activation_code or not activation_code.strip():
+        return None
+    return (
+        "https://esimsetup.apple.com/esim_qrcode_provisioning?carddata="
+        + quote(activation_code.strip(), safe=":$")
+    )
+
+
 def _serialize_profile(row: ESimProfile | ProfileInventoryRow, *, now: datetime) -> dict[str, Any]:
     custom_fields = row.custom_fields or {}
     if not isinstance(custom_fields, dict):
@@ -488,6 +521,13 @@ def _serialize_profile(row: ESimProfile | ProfileInventoryRow, *, now: datetime)
         and bool(row.activation_code or row.qr_code_url or row.install_url)
     )
     can_top_up = not is_expired and support_topup_type > 0
+    smdp_address, matching_id = _parse_lpa_activation_code(row.activation_code)
+    apple_install_url = _build_apple_install_url(row.activation_code) if not is_expired else None
+    manual_entry = (
+        {"smdpAddress": smdp_address, "activationCode": row.activation_code}
+        if row.activation_code and not is_expired
+        else None
+    )
     return {
         "id": row.id,
         "userId": row.user_id,
@@ -532,6 +572,14 @@ def _serialize_profile(row: ESimProfile | ProfileInventoryRow, *, now: datetime)
         "qr_code_url": row.qr_code_url,
         "installUrl": row.install_url,
         "install_url": row.install_url,
+        "appleInstallUrl": apple_install_url,
+        "apple_install_url": apple_install_url,
+        "smdpAddress": smdp_address,
+        "smdp_address": smdp_address,
+        "matchingId": matching_id,
+        "matching_id": matching_id,
+        "manualEntry": manual_entry,
+        "manual_entry": manual_entry,
         "customFields": custom_fields,
         "custom_fields": custom_fields,
     }
