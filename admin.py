@@ -6,7 +6,7 @@ import os
 from time import monotonic
 from typing import Any, Callable
 
-from fastapi import Depends, FastAPI, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -236,6 +236,20 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
     ) -> dict[str, Any]:
         rows = SupabaseStore(db).list_rows(FeaturedLocation, limit=limit, offset=offset)
         return {"locations": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
+
+    @app.delete("/api/v1/admin/featured-locations/{location_id}")
+    async def delete_featured_location(
+        location_id: int,
+        db: Session = Depends(get_db),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
+        deleted = SupabaseStore(db).delete_featured_location(location_id)
+        # Bust public caches across all service types so the change shows immediately.
+        _PUBLIC_FEATURED_LOCATIONS_CACHE.clear()
+        _PUBLIC_FEATURED_LOCATIONS_RETRY_AFTER.clear()
+        if not deleted:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Featured location not found")
+        return {"deleted": True, "id": location_id}
 
     @app.get("/api/v1/featured-locations/public")
     @app.get("/api/v1/esim-access/featured-locations")

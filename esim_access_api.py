@@ -18,13 +18,13 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from auth import get_token_claims, require_active_subject
 from config import get_settings
-from supabase_store import AdminUser, AppUser, ESimProfile, OrderItem, PaymentAttempt, ProfileInventoryRow, SupabaseStore, utcnow
+from supabase_store import AdminUser, AppUser, CustomerOrder, ESimProfile, OrderItem, PaymentAttempt, ProfileInventoryRow, SupabaseStore, utcnow
 from users import UserPayload
 
 LOGGER = logging.getLogger("uvicorn.error")
@@ -582,6 +582,40 @@ def _serialize_profile(row: ESimProfile | ProfileInventoryRow, *, now: datetime)
         "manual_entry": manual_entry,
         "customFields": custom_fields,
         "custom_fields": custom_fields,
+    }
+
+
+def _serialize_order(order: CustomerOrder) -> dict[str, Any]:
+    items = []
+    for it in (order.order_items or []):
+        items.append(
+            {
+                "id": it.id,
+                "serviceType": it.service_type,
+                "status": it.item_status,
+                "providerOrderNo": it.provider_order_no,
+                "countryCode": it.country_code,
+                "countryName": it.country_name,
+                "packageCode": it.package_code,
+                "packageName": it.package_name,
+                "quantity": it.quantity,
+                "salePriceMinor": it.sale_price_minor,
+            }
+        )
+    return {
+        "id": order.id,
+        "orderNumber": order.order_number,
+        "status": order.order_status,
+        "currencyCode": order.currency_code,
+        "totalMinor": order.total_minor,
+        "subtotalMinor": order.subtotal_minor,
+        "markupMinor": order.markup_minor,
+        "discountMinor": order.discount_minor,
+        "paymentMethod": order.payment_method,
+        "paymentProvider": order.payment_provider,
+        "bookedAt": _to_utc_z(order.booked_at),
+        "createdAt": _to_utc_z(order.created_at),
+        "items": items,
     }
 
 
@@ -2099,6 +2133,44 @@ def register_esim_access_routes(
                 "success": True,
                 "data": {**_default_exchange_rate_settings(), "cacheStatus": "db_unavailable"},
             }
+
+    @app.get(
+        "/api/v1/esim-access/orders/my",
+        summary="List customer orders for the authenticated subject",
+    )
+    async def list_my_orders(
+        db: Session = Depends(get_db),
+        claims: dict[str, Any] = Depends(get_token_claims),
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+        user_id: str | None = Query(default=None, alias="userId"),
+    ) -> dict[str, Any]:
+        actor = require_active_subject(db, claims=claims)
+        target_user_id = _resolve_target_user_id(actor=actor, claims=claims, requested_user_id=user_id)
+        rows = (
+            db.scalars(
+                select(CustomerOrder)
+                .options(joinedload(CustomerOrder.order_items))
+                .where(CustomerOrder.user_id == target_user_id)
+                .order_by(
+                    func.coalesce(CustomerOrder.booked_at, CustomerOrder.created_at).desc(),
+                    CustomerOrder.id.desc(),
+                )
+            )
+            .unique()
+            .all()
+        )
+        total = len(rows)
+        paged = rows[offset : offset + limit]
+        return {
+            "success": True,
+            "data": {
+                "orders": [_serialize_order(order) for order in paged],
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+            },
+        }
 
     @app.get(
         "/api/v1/esim-access/profiles/my",

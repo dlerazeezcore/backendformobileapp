@@ -120,11 +120,11 @@ class ServerAuthoritativePricingTest(_DbTestCase):
                 country_name="United States",
                 package_code="PK1",
             )
-            # 2.30 USD * 1500 = 3450 IQD subtotal; +100% markup = 6900 authoritative total.
+            # 2.30 USD * 1500 = 3450 IQD subtotal; +100% markup = 6900; round-250 -> 7000.
             self.assertEqual(item.provider_price_minor, 3450)
             self.assertEqual(item.markup_minor, 3450)
-            self.assertEqual(item.sale_price_minor, 6900)
-            self.assertEqual(order.total_minor, 6900)
+            self.assertEqual(item.sale_price_minor, 7000)
+            self.assertEqual(order.total_minor, 7000)
             self.assertEqual(item.custom_fields.get("clientSalePriceMinor"), 1)
 
 
@@ -189,6 +189,56 @@ class PlaceholderReconciliationTest(_DbTestCase):
             rows = session.scalars(select(ESimProfile).where(ESimProfile.order_item_id == item.id)).all()
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0].iccid, "ICCID-DUP-1")
+
+
+class TravelersStoreTest(_DbTestCase):
+    def test_traveler_crud_round_trip(self) -> None:
+        user_id = str(uuid.uuid4())
+        with self.Session() as session:
+            session.add(AppUser(id=user_id, phone="+9647509990001", name="Trav User", status="active"))
+            session.commit()
+            store = SupabaseStore(session)
+            t1 = store.add_traveler(user_id=user_id, name="Jane Olsen", relation="Spouse", dob="1990-01-02")
+            store.add_traveler(user_id=user_id, name="Kid One", relation="Child")
+            rows = store.list_travelers(user_id=user_id)
+            self.assertEqual(len(rows), 2)
+            store.update_traveler(t1, name="Jane O.", relation="Primary")
+            self.assertEqual(store.get_traveler(traveler_id=t1.id, user_id=user_id).name, "Jane O.")
+            store.delete_traveler(t1)
+            self.assertEqual(len(store.list_travelers(user_id=user_id)), 1)
+            # scoping: another user sees none
+            self.assertEqual(len(store.list_travelers(user_id=str(uuid.uuid4()))), 0)
+
+
+class OrderSerializeTest(_DbTestCase):
+    def test_managed_order_serializes_for_orders_my(self) -> None:
+        from esim_access_api import _serialize_order
+
+        with self.Session() as session:
+            session.add(
+                ExchangeRate(
+                    base_currency="USD", quote_currency="IQD", rate=1550.0, source="tulip-admin",
+                    active=True, effective_at=utcnow(), custom_fields={"enableIQD": True, "markupPercent": "100"},
+                )
+            )
+            session.commit()
+            store = SupabaseStore(session)
+            order, item = store.save_managed_order(
+                user_data={"phone": "+9647509990002", "name": "Order User", "email": None},
+                platform_code="mobile_app", platform_name=None,
+                order_request={"transactionId": "TX-OM-1", "packageInfoList": [{"packageCode": "PK", "count": 1, "price": 10000, "periodNum": 7}]},
+                provider_response={"success": True, "obj": {"orderNo": "ORD-OM-1", "transactionId": "TX-OM-1"}},
+                currency_code="IQD", provider_currency_code="USD", exchange_rate=1550.0,
+                provider_price_minor=10000, country_code="US", country_name="United States", package_code="PK",
+            )
+            session.refresh(order)
+            data = _serialize_order(order)
+            # $1 * 1550 * 2 = 3100 -> round250 -> 3000
+            self.assertEqual(data["totalMinor"], 3000)
+            self.assertEqual(data["currencyCode"], "IQD")
+            self.assertEqual(data["orderNumber"], order.order_number)
+            self.assertEqual(len(data["items"]), 1)
+            self.assertEqual(data["items"][0]["countryCode"], "US")
 
 
 if __name__ == "__main__":

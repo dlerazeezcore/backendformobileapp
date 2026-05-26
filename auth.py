@@ -445,8 +445,10 @@ def _issue_subject_session(row: AppUser | AdminUser, *, subject_type: str) -> di
             "id": row.id,
             "phone": row.phone,
             "name": row.name,
+            "email": row.email,
             "subjectType": "admin",
             "isAdmin": True,
+            "createdAt": row.created_at,
         }
     return {
         **token_payload,
@@ -454,8 +456,11 @@ def _issue_subject_session(row: AppUser | AdminUser, *, subject_type: str) -> di
         "id": row.id,
         "phone": row.phone,
         "name": row.name,
+        "email": row.email,
         "subjectType": "user",
         "isAdmin": False,
+        "isLoyalty": bool(getattr(row, "is_loyalty", False)),
+        "createdAt": row.created_at,
     }
 
 
@@ -866,6 +871,7 @@ def register_auth_routes(
                 "email": row.email,
                 "status": row.status,
                 "role": row.role,
+                "createdAt": row.created_at,
                 "permissions": {
                     "canManageUsers": row.can_manage_users,
                     "canManageOrders": row.can_manage_orders,
@@ -885,6 +891,7 @@ def register_auth_routes(
             "email": row.email,
             "status": row.status,
             "isLoyalty": row.is_loyalty,
+            "createdAt": row.created_at,
             "preferredLanguage": row.preferred_language,
             "preferredCurrency": row.preferred_currency,
             "notificationsEnabled": row.notifications_enabled,

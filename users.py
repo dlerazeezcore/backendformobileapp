@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from auth import get_token_claims, hash_password, require_active_subject
 from phone_utils import phone_lookup_candidates
-from supabase_store import AdminUser, AppUser, SupabaseStore, utcnow
+from supabase_store import AdminUser, AppUser, AppUserTraveler, SupabaseStore, utcnow
 
 
 class UserPayload(BaseModel):
@@ -45,6 +45,29 @@ class AdminUserPayload(BaseModel):
     custom_fields: dict[str, Any] = Field(default_factory=dict, alias="customFields")
 
 
+class TravelerPayload(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    relation: str | None = None
+    dob: str | None = None
+
+
+class TravelerUpdatePayload(BaseModel):
+    name: str | None = Field(default=None, max_length=255)
+    relation: str | None = None
+    dob: str | None = None
+
+
+def _serialize_traveler(row: AppUserTraveler) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "name": row.name,
+        "relation": row.relation,
+        "dob": row.dob,
+        "createdAt": row.created_at,
+        "updatedAt": row.updated_at,
+    }
+
+
 def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
     async def _require_admin_actor(
         claims: dict[str, Any] = Depends(get_token_claims),
@@ -61,6 +84,63 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         row = require_active_subject(db, claims=claims)
         assert isinstance(row, (AdminUser, AppUser))
         return row
+
+    async def _require_user_actor(
+        claims: dict[str, Any] = Depends(get_token_claims),
+        db: Session = Depends(get_db),
+    ) -> AppUser:
+        row = require_active_subject(db, claims=claims, subject_type="user")
+        assert isinstance(row, AppUser)
+        return row
+
+    @app.get("/api/v1/travelers/my")
+    async def list_my_travelers(
+        db: Session = Depends(get_db),
+        actor: AppUser = Depends(_require_user_actor),
+    ) -> dict[str, Any]:
+        rows = SupabaseStore(db).list_travelers(user_id=actor.id)
+        return {"success": True, "data": {"travelers": [_serialize_traveler(r) for r in rows]}}
+
+    @app.post("/api/v1/travelers/my")
+    async def create_my_traveler(
+        payload: TravelerPayload,
+        db: Session = Depends(get_db),
+        actor: AppUser = Depends(_require_user_actor),
+    ) -> dict[str, Any]:
+        row = SupabaseStore(db).add_traveler(
+            user_id=actor.id,
+            name=payload.name,
+            relation=payload.relation,
+            dob=payload.dob,
+        )
+        return {"success": True, "data": {"traveler": _serialize_traveler(row)}}
+
+    @app.patch("/api/v1/travelers/my/{traveler_id}")
+    async def update_my_traveler(
+        traveler_id: int,
+        payload: TravelerUpdatePayload,
+        db: Session = Depends(get_db),
+        actor: AppUser = Depends(_require_user_actor),
+    ) -> dict[str, Any]:
+        store = SupabaseStore(db)
+        row = store.get_traveler(traveler_id=traveler_id, user_id=actor.id)
+        if row is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Traveler not found")
+        updated = store.update_traveler(row, name=payload.name, relation=payload.relation, dob=payload.dob)
+        return {"success": True, "data": {"traveler": _serialize_traveler(updated)}}
+
+    @app.delete("/api/v1/travelers/my/{traveler_id}")
+    async def delete_my_traveler(
+        traveler_id: int,
+        db: Session = Depends(get_db),
+        actor: AppUser = Depends(_require_user_actor),
+    ) -> dict[str, Any]:
+        store = SupabaseStore(db)
+        row = store.get_traveler(traveler_id=traveler_id, user_id=actor.id)
+        if row is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Traveler not found")
+        store.delete_traveler(row)
+        return {"success": True, "data": {"deleted": True, "id": traveler_id}}
 
     def _soft_delete_user_row(user: AppUser) -> dict[str, Any]:
         if user.deleted_at is None or user.status != "deleted":

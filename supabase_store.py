@@ -28,6 +28,7 @@ from sqlalchemy import (
     func,
     or_,
     select,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, joinedload, mapped_column, relationship, sessionmaker
@@ -46,6 +47,15 @@ LOGGER = logging.getLogger("uvicorn.error")
 # (e.g. price 23000 == 2.30 USD). Normalize to provider-currency major units
 # before applying the FX rate so the IQD sale price is correct.
 ESIM_ACCESS_PRICE_UNIT = 10000
+
+# Consumer IQD prices are rounded to the nearest 250 dinars (half-up).
+IQD_ROUNDING_STEP = 250
+
+
+def round_to_step(value: int, step: int = IQD_ROUNDING_STEP) -> int:
+    if step <= 0:
+        return int(value)
+    return int((value + step / 2) // step) * step
 
 
 def parse_provider_float(value: Any) -> float | None:
@@ -411,6 +421,25 @@ class AdminUser(TimeMixin, Base):
         back_populates="admin_user",
         foreign_keys="PushDevice.admin_user_id",
     )
+
+
+# Case-insensitive partial unique email indexes (created in migration 0035).
+# Declared at module level so the column attributes exist; keeps models in sync
+# with the DB so autogenerate does not try to drop them.
+Index(
+    "uq_app_users_email_ci",
+    func.lower(AppUser.email),
+    unique=True,
+    postgresql_where=text("email IS NOT NULL"),
+    sqlite_where=text("email IS NOT NULL"),
+)
+Index(
+    "uq_admin_users_email_ci",
+    func.lower(AdminUser.email),
+    unique=True,
+    postgresql_where=text("email IS NOT NULL"),
+    sqlite_where=text("email IS NOT NULL"),
+)
 
 
 class PushDevice(TimeMixin, Base):
@@ -840,6 +869,21 @@ class ESimLifecycleEvent(TimeMixin, Base):
     customer_order: Mapped[CustomerOrder | None] = relationship(back_populates="lifecycle_events")
     order_item: Mapped[OrderItem | None] = relationship(back_populates="lifecycle_events")
     profile: Mapped[ESimProfile | None] = relationship(back_populates="lifecycle_events")
+
+
+class AppUserTraveler(TimeMixin, Base):
+    __tablename__ = "app_user_travelers"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[str] = mapped_column(
+        Uuid(as_uuid=False),
+        ForeignKey("app_users.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    relation: Mapped[str | None] = mapped_column(String(64))
+    dob: Mapped[str | None] = mapped_column(String(32))
+    custom_fields: Mapped[dict[str, Any]] = mapped_column(_JSONB, default=dict, nullable=False)
 
 
 def create_database(database_url: str) -> sessionmaker[Session]:
@@ -2347,6 +2391,9 @@ class SupabaseStore:
                 basis_minor=discount_basis_minor,
             )
         computed_sale_price_minor = max(total_before_discount_minor - discount_minor, 0)
+        # Consumer IQD prices are rounded to the nearest 250 dinars.
+        if (sale_currency_code or "").upper() == "IQD":
+            computed_sale_price_minor = round_to_step(computed_sale_price_minor, IQD_ROUNDING_STEP)
         # Server-authoritative pricing: the server-computed IQD price is the source of
         # truth so a tampered client cannot underpay. The client-supplied salePriceMinor
         # is recorded for audit and a deviation is logged.
@@ -3041,6 +3088,14 @@ class SupabaseStore:
         self.session.refresh(row)
         return row
 
+    def delete_featured_location(self, featured_location_id: int) -> bool:
+        row = self.session.get(FeaturedLocation, featured_location_id)
+        if row is None:
+            return False
+        self.session.delete(row)
+        self.session.commit()
+        return True
+
     def save_exchange_rate(self, payload: dict[str, Any]) -> ExchangeRate:
         payload = dict(payload)
         if payload.get("active", True) is False:
@@ -3329,3 +3384,60 @@ class SupabaseStore:
         self.session.add(event)
         self.session.flush()
         return event
+
+    # ── Saved travelers ──────────────────────────────────────────────
+    def list_travelers(self, *, user_id: str) -> list["AppUserTraveler"]:
+        return self.session.scalars(
+            select(AppUserTraveler)
+            .where(AppUserTraveler.user_id == user_id)
+            .order_by(AppUserTraveler.created_at.asc(), AppUserTraveler.id.asc())
+        ).all()
+
+    def get_traveler(self, *, traveler_id: int, user_id: str) -> "AppUserTraveler | None":
+        return self.session.scalar(
+            select(AppUserTraveler).where(
+                AppUserTraveler.id == traveler_id,
+                AppUserTraveler.user_id == user_id,
+            )
+        )
+
+    def add_traveler(
+        self,
+        *,
+        user_id: str,
+        name: str,
+        relation: str | None = None,
+        dob: str | None = None,
+    ) -> "AppUserTraveler":
+        row = AppUserTraveler(
+            user_id=user_id,
+            name=name.strip(),
+            relation=(relation or "").strip() or None,
+            dob=(dob or "").strip() or None,
+        )
+        self.session.add(row)
+        self.session.commit()
+        self.session.refresh(row)
+        return row
+
+    def update_traveler(
+        self,
+        row: "AppUserTraveler",
+        *,
+        name: str | None = None,
+        relation: str | None = None,
+        dob: str | None = None,
+    ) -> "AppUserTraveler":
+        if name is not None:
+            row.name = name.strip()
+        if relation is not None:
+            row.relation = relation.strip() or None
+        if dob is not None:
+            row.dob = dob.strip() or None
+        self.session.commit()
+        self.session.refresh(row)
+        return row
+
+    def delete_traveler(self, row: "AppUserTraveler") -> None:
+        self.session.delete(row)
+        self.session.commit()
