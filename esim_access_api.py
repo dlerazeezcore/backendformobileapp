@@ -619,6 +619,45 @@ def _serialize_order(order: CustomerOrder) -> dict[str, Any]:
     }
 
 
+def _esim_status_bucket(profile_view: dict[str, Any] | None) -> str:
+    if profile_view is None:
+        return "pending"
+    status = str(profile_view.get("status") or "").lower()
+    if status == "expired":
+        return "expired"
+    remaining = profile_view.get("remainingDataMb")
+    total = profile_view.get("totalDataMb")
+    if remaining == 0 and total:
+        return "used"
+    if profile_view.get("installed"):
+        return "installed"
+    return "not_installed"
+
+
+def _serialize_admin_order(order: CustomerOrder, *, now: datetime) -> dict[str, Any]:
+    base = _serialize_order(order)
+    user = order.user
+    base["user"] = (
+        {"id": user.id, "name": user.name, "phone": user.phone} if user is not None else None
+    )
+    primary: dict[str, Any] | None = None
+    for item in (order.order_items or []):
+        for profile in (item.profiles or []):
+            view = _serialize_profile(profile, now=now)
+            primary = {
+                "status": view["status"],
+                "installed": view["installed"],
+                "remainingDataMb": view["remainingDataMb"],
+                "totalDataMb": view["totalDataMb"],
+            }
+            break
+        if primary is not None:
+            break
+    base["esim"] = primary
+    base["esimStatus"] = _esim_status_bucket(primary)
+    return base
+
+
 def _resolve_target_user_id(
     *,
     actor: AppUser | AdminUser,
@@ -2166,6 +2205,49 @@ def register_esim_access_routes(
             "success": True,
             "data": {
                 "orders": [_serialize_order(order) for order in paged],
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+            },
+        }
+
+    @app.get("/api/v1/admin/orders/detailed")
+    async def list_admin_orders_detailed(
+        db: Session = Depends(get_db),
+        claims: dict[str, Any] = Depends(get_token_claims),
+        month: str | None = Query(default=None),
+        limit: int = Query(default=500, ge=1, le=1000),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict[str, Any]:
+        require_active_subject(db, claims=claims, subject_type="admin")
+        query = (
+            select(CustomerOrder)
+            .options(
+                joinedload(CustomerOrder.user),
+                joinedload(CustomerOrder.order_items).joinedload(OrderItem.profiles),
+            )
+            .order_by(
+                func.coalesce(CustomerOrder.booked_at, CustomerOrder.created_at).desc(),
+                CustomerOrder.id.desc(),
+            )
+        )
+        rows = db.scalars(query).unique().all()
+
+        # Optional month filter (YYYY-MM) on booked/created date.
+        if month and re.fullmatch(r"\d{4}-\d{2}", month.strip()):
+            year, mon = (int(part) for part in month.strip().split("-"))
+            def _in_month(order: CustomerOrder) -> bool:
+                ref = order.booked_at or order.created_at
+                return bool(ref and ref.year == year and ref.month == mon)
+            rows = [order for order in rows if _in_month(order)]
+
+        total = len(rows)
+        paged = rows[offset : offset + limit]
+        now = utcnow()
+        return {
+            "success": True,
+            "data": {
+                "orders": [_serialize_admin_order(order, now=now) for order in paged],
                 "total": total,
                 "limit": limit,
                 "offset": offset,

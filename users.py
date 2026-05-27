@@ -45,6 +45,15 @@ class AdminUserPayload(BaseModel):
     custom_fields: dict[str, Any] = Field(default_factory=dict, alias="customFields")
 
 
+class AdminUserUpdatePayload(BaseModel):
+    name: str | None = None
+    is_loyalty: bool | None = Field(default=None, alias="isLoyalty")
+    blocked: bool | None = None
+    status: str | None = None
+
+    model_config = {"populate_by_name": True}
+
+
 class TravelerPayload(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     relation: str | None = None
@@ -263,6 +272,46 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
                 }
             )
         return {"users": normalized_rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
+
+    @app.patch("/api/v1/admin/users/{user_id}")
+    async def admin_update_user(
+        user_id: str,
+        payload: AdminUserUpdatePayload,
+        db: Session = Depends(get_db),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
+        row = db.scalar(select(AppUser).where(AppUser.id == user_id))
+        if row is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+        if payload.name is not None and payload.name.strip():
+            row.name = payload.name.strip()
+        if payload.is_loyalty is not None:
+            row.is_loyalty = bool(payload.is_loyalty)
+        if payload.blocked is not None:
+            if payload.blocked:
+                row.blocked_at = row.blocked_at or utcnow()
+                row.status = "blocked"
+            else:
+                row.blocked_at = None
+                if row.status == "blocked":
+                    row.status = "active"
+        if payload.status is not None and payload.status.strip():
+            row.status = payload.status.strip().lower()
+        row.updated_at = utcnow()
+        db.commit()
+        db.refresh(row)
+        return {
+            "user": {
+                "id": row.id,
+                "userId": row.id,
+                "name": row.name,
+                "phone": row.phone,
+                "email": row.email,
+                "status": row.status,
+                "isLoyalty": bool(row.is_loyalty),
+                "isBlocked": row.status == "blocked" or row.blocked_at is not None,
+            }
+        }
 
     @app.delete("/api/v1/admin/users/{user_id}")
     @app.delete("/admin/users/{user_id}")
