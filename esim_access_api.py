@@ -20,7 +20,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, sta
 from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from auth import get_token_claims, require_active_subject
 from config import get_settings
@@ -2212,42 +2212,53 @@ def register_esim_access_routes(
         }
 
     @app.get("/api/v1/admin/orders/detailed")
-    async def list_admin_orders_detailed(
+    def list_admin_orders_detailed(
         db: Session = Depends(get_db),
         claims: dict[str, Any] = Depends(get_token_claims),
         month: str | None = Query(default=None),
         limit: int = Query(default=500, ge=1, le=1000),
         offset: int = Query(default=0, ge=0),
     ) -> dict[str, Any]:
+        # IMPORTANT: this is a *sync* def on purpose. The query + serialization
+        # is synchronous SQLAlchemy work over potentially many orders; running it
+        # in an `async def` would block the event loop, so /health would time out
+        # and Koyeb would kill the instance. As a plain def, FastAPI runs it in a
+        # worker thread instead. Filtering, counting and pagination happen in SQL
+        # (with selectinload to avoid a joinedload cartesian blow-up) so we never
+        # materialise the whole orders table in memory.
         require_active_subject(db, claims=claims, subject_type="admin")
-        query = (
-            select(CustomerOrder)
-            .options(
-                joinedload(CustomerOrder.user),
-                joinedload(CustomerOrder.order_items).joinedload(OrderItem.profiles),
-            )
-            .order_by(
-                func.coalesce(CustomerOrder.booked_at, CustomerOrder.created_at).desc(),
-                CustomerOrder.id.desc(),
-            )
-        )
-        rows = db.scalars(query).unique().all()
+        ref = func.coalesce(CustomerOrder.booked_at, CustomerOrder.created_at)
+        base = select(CustomerOrder)
+        count_query = select(func.count()).select_from(CustomerOrder)
 
-        # Optional month filter (YYYY-MM) on booked/created date.
+        # Optional month filter (YYYY-MM) applied in SQL as a half-open range.
         if month and re.fullmatch(r"\d{4}-\d{2}", month.strip()):
             year, mon = (int(part) for part in month.strip().split("-"))
-            def _in_month(order: CustomerOrder) -> bool:
-                ref = order.booked_at or order.created_at
-                return bool(ref and ref.year == year and ref.month == mon)
-            rows = [order for order in rows if _in_month(order)]
+            start = datetime(year, mon, 1, tzinfo=timezone.utc)
+            end = (
+                datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+                if mon == 12
+                else datetime(year, mon + 1, 1, tzinfo=timezone.utc)
+            )
+            base = base.where(ref >= start, ref < end)
+            count_query = count_query.where(ref >= start, ref < end)
 
-        total = len(rows)
-        paged = rows[offset : offset + limit]
+        total = int(db.scalar(count_query) or 0)
+        query = (
+            base.options(
+                selectinload(CustomerOrder.user),
+                selectinload(CustomerOrder.order_items).selectinload(OrderItem.profiles),
+            )
+            .order_by(ref.desc(), CustomerOrder.id.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        rows = db.scalars(query).unique().all()
         now = utcnow()
         return {
             "success": True,
             "data": {
-                "orders": [_serialize_admin_order(order, now=now) for order in paged],
+                "orders": [_serialize_admin_order(order, now=now) for order in rows],
                 "total": total,
                 "limit": limit,
                 "offset": offset,
