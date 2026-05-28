@@ -643,18 +643,32 @@ def _serialize_admin_order(order: CustomerOrder, *, now: datetime) -> dict[str, 
         {"id": user.id, "name": user.name, "phone": user.phone} if user is not None else None
     )
     primary: dict[str, Any] | None = None
+    # First profile per order item, so each line can show its data + validity.
+    views_by_item: dict[int, dict[str, Any]] = {}
     for item in (order.order_items or []):
         for profile in (item.profiles or []):
             view = _serialize_profile(profile, now=now)
-            primary = {
-                "status": view["status"],
-                "installed": view["installed"],
-                "remainingDataMb": view["remainingDataMb"],
-                "totalDataMb": view["totalDataMb"],
-            }
+            views_by_item[item.id] = view
+            if primary is None:
+                primary = {
+                    "status": view["status"],
+                    "installed": view["installed"],
+                    "remainingDataMb": view["remainingDataMb"],
+                    "totalDataMb": view["totalDataMb"],
+                }
             break
-        if primary is not None:
-            break
+    # Annotate each serialized item with the bundle spec (GB + days) so the admin
+    # UI can show "5 GB · 7 days" instead of a package code.
+    for out in base["items"]:
+        view = views_by_item.get(out["id"])
+        if view is not None:
+            out["dataGb"] = view.get("totalDataGb")
+            out["validityDays"] = view.get("validityDays")
+            out["unlimited"] = not view.get("totalDataMb")
+        else:
+            out["dataGb"] = None
+            out["validityDays"] = None
+            out["unlimited"] = False
     base["esim"] = primary
     base["esimStatus"] = _esim_status_bucket(primary)
     return base
