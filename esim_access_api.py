@@ -564,6 +564,8 @@ def _serialize_profile(row: ESimProfile | ProfileInventoryRow, *, now: datetime)
         "remainingDataGb": _to_gb(remaining_data_mb),
         "dataUnit": "MB",
         "usageUnit": "MB",
+        "validityDays": int(row.validity_days) if row.validity_days else None,
+        "validity_days": int(row.validity_days) if row.validity_days else None,
         "daysLeft": days_left,
         "supportTopUpType": support_topup_type,
         "activationCode": row.activation_code,
