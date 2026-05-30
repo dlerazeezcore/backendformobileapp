@@ -321,8 +321,11 @@ class SendPushNotificationPayload(Model):
 
 
 class SendAppUpdateNotificationPayload(Model):
-    app_store_url: str = Field(alias="appStoreUrl", min_length=1)
-    play_store_url: str = Field(alias="playStoreUrl", min_length=1)
+    # Store URLs are optional in the payload. When omitted, the handler reads the
+    # latest values from the app_release_info singleton row. The handler errors
+    # 422 only when BOTH the payload AND the stored row are empty.
+    app_store_url: str | None = Field(default=None, alias="appStoreUrl")
+    play_store_url: str | None = Field(default=None, alias="playStoreUrl")
     ios_external_url: str | None = Field(default=None, alias="iosExternalUrl")
     android_external_url: str | None = Field(default=None, alias="androidExternalUrl")
     ios_url: str | None = Field(default=None, alias="iosUrl")
@@ -343,14 +346,14 @@ class SendAppUpdateNotificationPayload(Model):
         if normalized_audience not in ALLOWED_APP_UPDATE_AUDIENCES:
             raise ValueError("audience must be one of: all, authenticated, loyalty, active_esim, all_devices")
         self.audience = normalized_audience
-        app_store_url = str(self.app_store_url or "").strip()
-        play_store_url = str(self.play_store_url or "").strip()
-        if not app_store_url.lower().startswith(("https://", "http://")):
-            raise ValueError("appStoreUrl must be a valid URL.")
-        if not play_store_url.lower().startswith(("https://", "http://")):
-            raise ValueError("playStoreUrl must be a valid URL.")
-        self.app_store_url = app_store_url
-        self.play_store_url = play_store_url
+        # Normalize URLs: keep empty as None for downstream lookup; reject only
+        # values that are present-and-malformed.
+        for attr, alias in (("app_store_url", "appStoreUrl"), ("play_store_url", "playStoreUrl")):
+            raw = getattr(self, attr)
+            cleaned = str(raw or "").strip()
+            if cleaned and not cleaned.lower().startswith(("https://", "http://")):
+                raise ValueError(f"{alias} must be a valid URL when provided.")
+            setattr(self, attr, cleaned or None)
         # Normalize optional localized maps. When neither maps nor explicit title/body
         # are supplied, the handler falls back to the pre-baked APP_UPDATE_MESSAGES.
         titles_norm = normalize_maps(self.titles)
@@ -974,6 +977,26 @@ def register_push_notification_routes(
         db: Session = Depends(get_db),
         admin_user: AdminUser = Depends(_require_admin_sender),
     ) -> Any:
+        # Fall back to the app_release_info singleton row when the admin omits
+        # either store URL (most common case — admin set them once via the
+        # version-info endpoint and doesn't want to re-enter them on every send).
+        app_store_url = payload.app_store_url
+        play_store_url = payload.play_store_url
+        if not app_store_url or not play_store_url:
+            from supabase_store import AppReleaseInfo  # local import to avoid cycle on module load
+            from sqlalchemy import select as _select
+            row = db.scalar(_select(AppReleaseInfo).where(AppReleaseInfo.id == 1))
+            if row is not None:
+                app_store_url = app_store_url or (row.app_store_url or "").strip() or None
+                play_store_url = play_store_url or (row.play_store_url or "").strip() or None
+        if not app_store_url and not play_store_url:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=(
+                    "No store URLs available. Set appStoreUrl and/or playStoreUrl via "
+                    "PUT /api/v1/admin/app/version-info, or provide them on this request."
+                ),
+            )
         merged_data = dict(payload.data or {})
         merged_data.update(
             {
@@ -981,10 +1004,12 @@ def register_push_notification_routes(
                 "type": "app_update",
                 "notificationType": "app_update",
                 "action": "open_store_update",
-                "appStoreUrl": payload.app_store_url,
-                "playStoreUrl": payload.play_store_url,
             }
         )
+        if app_store_url:
+            merged_data["appStoreUrl"] = app_store_url
+        if play_store_url:
+            merged_data["playStoreUrl"] = play_store_url
         optional_app_update_fields = {
             "iosExternalUrl": payload.ios_external_url,
             "androidExternalUrl": payload.android_external_url,

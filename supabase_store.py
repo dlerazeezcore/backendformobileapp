@@ -1693,7 +1693,20 @@ class SupabaseStore:
         limit: int = 10000,
     ) -> list[str]:
         effective_limit = max(1, min(limit, 20000))
-        query = select(PushDevice)
+        # Respect AppUser.notifications_enabled for the broadcast audience: a
+        # user who turned notifications off in profile should not receive bulk
+        # pushes. Anonymous devices (user_id IS NULL) are kept — they registered
+        # explicitly and have no other opt-out surface.
+        query = (
+            select(PushDevice)
+            .outerjoin(AppUser, AppUser.id == PushDevice.user_id)
+            .where(
+                or_(
+                    PushDevice.user_id.is_(None),
+                    AppUser.notifications_enabled.is_(True),
+                )
+            )
+        )
         if active_only:
             query = query.where(PushDevice.active.is_(True))
         rows = self.session.scalars(query.limit(effective_limit)).all()
@@ -1809,6 +1822,7 @@ class SupabaseStore:
             AppUser.status == "active",
             AppUser.deleted_at.is_(None),
             AppUser.blocked_at.is_(None),
+            AppUser.notifications_enabled.is_(True),
         ]
         query = select(AppUser.id).where(*active_user_filters)
         if normalized_audience == "loyalty":
