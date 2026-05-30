@@ -232,6 +232,55 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         db.commit()
         return {"userId": user_id, "deactivated": deactivated, "count": len(deactivated)}
 
+    @app.get("/api/v1/admin/users/{user_id}/profiles-raw")
+    async def list_user_profiles_raw(
+        user_id: str,
+        db: Session = Depends(get_db),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
+        """Admin diagnostic: dump raw ESimProfile rows for one user.
+
+        Returns activation_code, smdp, qr_code_url, install_url, app_status,
+        installed flag, expiration — the fields the install screen depends on.
+        Useful for debugging "I tapped Activate and nothing happened" when the
+        backend hasn't filled in the Apple universal URL or QR.
+        """
+        from supabase_store import ESimProfile
+        from sqlalchemy import select as _select
+        rows = db.scalars(
+            _select(ESimProfile).where(ESimProfile.user_id == user_id).order_by(ESimProfile.created_at.desc()).limit(20)
+        ).all()
+        return {
+            "userId": user_id,
+            "count": len(rows),
+            "profiles": [
+                {
+                    "id": r.id,
+                    "iccid": r.iccid,
+                    "esimTranNo": getattr(r, "esim_tran_no", None),
+                    "providerOrderNo": getattr(r, "provider_order_no", None),
+                    "countryCode": getattr(r, "country_code", None),
+                    "countryName": getattr(r, "country_name", None),
+                    "appStatus": getattr(r, "app_status", None),
+                    "providerStatus": getattr(r, "provider_status", None),
+                    "installed": getattr(r, "installed", None),
+                    "installedAt": getattr(r, "installed_at", None),
+                    "activatedAt": getattr(r, "activated_at", None),
+                    "expiresAt": getattr(r, "expires_at", None),
+                    "totalDataMb": getattr(r, "total_data_mb", None),
+                    "usedDataMb": getattr(r, "used_data_mb", None),
+                    "activationCode": r.activation_code,
+                    "activationCodeLen": len(r.activation_code or ""),
+                    "activationCodeStartsWithLPA": bool(r.activation_code and r.activation_code.startswith("LPA:")),
+                    "qrCodeUrl": r.qr_code_url,
+                    "installUrl": getattr(r, "install_url", None),
+                    "createdAt": r.created_at,
+                    "updatedAt": r.updated_at,
+                }
+                for r in rows
+            ],
+        }
+
     @app.delete("/api/v1/admin/admin-users/{admin_id}")
     async def delete_admin_user(
         admin_id: str,
