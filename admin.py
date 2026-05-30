@@ -7,6 +7,8 @@ from time import monotonic
 from typing import Any, Callable
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
+
+from dependencies import get_provider as get_esim_provider
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -236,6 +238,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
     async def resync_profile_from_provider(
         profile_id: int,
         db: Session = Depends(get_db),
+        provider: Any = Depends(get_esim_provider),
         _: AdminUser = Depends(_require_admin_actor),
     ) -> dict[str, Any]:
         """Re-query the eSIM provider for this profile and store the fresh
@@ -247,7 +250,6 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         """
         from supabase_store import CustomerOrder, ESimProfile, OrderItem
         from esim_access_api import ProfileQueryRequest
-        from dependencies import get_provider
         from sqlalchemy import select as _select
         profile = db.scalar(_select(ESimProfile).where(ESimProfile.id == profile_id))
         if profile is None:
@@ -271,7 +273,6 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
                     detail="No provider_order_no available to query the provider with",
                 )
             order_no = order_item.provider_order_no
-        provider = get_provider()
         response = await provider.query_profiles(ProfileQueryRequest(order_no=order_no))
         synced = SupabaseStore(db).sync_profiles(
             response.model_dump(by_alias=True, exclude_none=True),
