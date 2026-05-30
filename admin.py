@@ -27,6 +27,7 @@ from supabase_store import (
     PaymentAttempt,
     PaymentProviderEvent,
     SupabaseStore,
+    utcnow,
 )
 
 from esim_access_api import ActionContext
