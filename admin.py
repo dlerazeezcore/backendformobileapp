@@ -166,6 +166,72 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         rows = db.scalars(query).all()
         return {"admins": [_serialize_admin_user(r) for r in rows]}
 
+    @app.get("/api/v1/admin/users/{user_id}/push-devices")
+    async def list_user_push_devices(
+        user_id: str,
+        db: Session = Depends(get_db),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
+        """Admin diagnostics: dump every push device row for one app user.
+
+        Returns full token (for FCM/APNs distinction) + length + platform +
+        app_version + last_seen so we can tell whether tokens are stale,
+        which build they came from, and whether to deactivate them.
+        """
+        from supabase_store import PushDevice
+        from sqlalchemy import select as _select
+        rows = db.scalars(
+            _select(PushDevice).where(PushDevice.user_id == user_id).order_by(PushDevice.updated_at.desc())
+        ).all()
+        return {
+            "userId": user_id,
+            "count": len(rows),
+            "devices": [
+                {
+                    "id": r.id,
+                    "token": r.token,
+                    "tokenLen": len(r.token or ""),
+                    "tokenLooksLikeApns": bool(r.token and len(r.token) <= 80 and ":" not in r.token),
+                    "platform": r.platform,
+                    "deviceId": r.device_id,
+                    "appVersion": r.app_version,
+                    "locale": r.locale,
+                    "active": r.active,
+                    "lastSeenAt": r.last_seen_at,
+                    "createdAt": r.created_at,
+                    "updatedAt": r.updated_at,
+                    "customFields": r.custom_fields,
+                }
+                for r in rows
+            ],
+        }
+
+    @app.post("/api/v1/admin/users/{user_id}/push-devices/purge-stale")
+    async def purge_stale_user_devices(
+        user_id: str,
+        db: Session = Depends(get_db),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
+        """Deactivate any push device for the user that LOOKS like an APNs token
+        (length <= 80 and no colon). Production FCM tokens are ~140-200 chars
+        with a colon; APNs tokens are ~64-char hex. If a row is left over from
+        a previous (non-rn-firebase) build, FCM accepts it but APNs drops the
+        push silently — visible to the user as 'success but no banner'.
+        """
+        from supabase_store import PushDevice
+        from sqlalchemy import select as _select
+        rows = db.scalars(
+            _select(PushDevice).where(PushDevice.user_id == user_id, PushDevice.active.is_(True))
+        ).all()
+        deactivated = []
+        for r in rows:
+            tok = r.token or ""
+            if len(tok) <= 80 and ":" not in tok:
+                r.active = False
+                deactivated.append({"id": r.id, "tokenLen": len(tok), "platform": r.platform})
+        db.commit()
+        return {"userId": user_id, "deactivated": deactivated, "count": len(deactivated)}
+
     @app.delete("/api/v1/admin/admin-users/{admin_id}")
     async def delete_admin_user(
         admin_id: str,
