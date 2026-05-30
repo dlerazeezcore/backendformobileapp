@@ -301,14 +301,25 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
                 detail="Provide a valid X-Cron-Token header (or Bearer <CRON_TOKEN>)",
             )
 
-        # Two passes:
-        # 1) ACTIVE profiles with ICCID — refresh usage from the provider.
-        # 2) BROKEN placeholders (no iccid + no activation_code) created in the
-        #    last 7 days — try to resync via their order's providerOrderNo. This
-        #    automatically recovers orders that fell through the retry-with-
-        #    backoff window in createManagedOrder (provider slow to materialize).
+        return await _perform_active_usage_refresh(db=db, provider=provider, source="cron")
+
+    async def _perform_active_usage_refresh(
+        *, db: Session, provider: Any, source: str
+    ) -> dict[str, Any]:
+        """Shared core for the cron endpoint AND the admin refresh button.
+
+        Two passes:
+        1) ACTIVE profiles with ICCID — refresh usage from the provider.
+        2) BROKEN placeholders (no iccid + no activation_code) created in the
+           last 7 days — try to resync via their order's providerOrderNo.
+           Recovers orders whose post-buy retry-with-backoff window expired
+           before the provider materialized their activation code.
+        """
+        from supabase_store import ESimProfile
+        from esim_access_api import ProfileQueryRequest
+        from sqlalchemy import or_, select as _select, func
         from datetime import timedelta
-        from sqlalchemy import or_, select as _select  # noqa: F811 — local rebind for this fn
+
         active_rows = db.scalars(
             _select(ESimProfile)
             .where(func.upper(ESimProfile.app_status) == "ACTIVE")
@@ -333,40 +344,38 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
                 resp = await provider.query_profiles(ProfileQueryRequest(iccid=r.iccid))
                 applied = store.sync_profiles(
                     resp.model_dump(by_alias=True, exclude_none=True),
-                    platform_code="cron-refresh",
-                    platform_name="Active usage refresh",
+                    platform_code=f"{source}-refresh",
+                    platform_name=f"Active usage refresh ({source})",
                     actor_phone=None,
                 )
                 if applied:
                     synced += 1
-            except Exception as exc:  # pragma: no cover - cron resilience
+            except Exception as exc:  # pragma: no cover - resilience
                 errors.append({"profileId": r.id, "iccid": r.iccid, "error": str(exc)[:200]})
 
         for r in broken_rows:
             attempted += 1
-            # Look up the parent order_item's providerOrderNo.
             order_no: str | None = None
             if r.order_item_id is not None:
                 oi = db.scalar(_select(OrderItem).where(OrderItem.id == r.order_item_id))
                 if oi is not None:
                     order_no = oi.provider_order_no
             if not order_no:
-                continue  # can't recover without provider order_no
+                continue
             try:
                 resp = await provider.query_profiles(ProfileQueryRequest(order_no=order_no))
                 applied = store.sync_profiles(
                     resp.model_dump(by_alias=True, exclude_none=True),
-                    platform_code="cron-recover",
-                    platform_name="Broken-placeholder recovery",
+                    platform_code=f"{source}-recover",
+                    platform_name=f"Broken-placeholder recovery ({source})",
                     actor_phone=None,
                 )
-                # Did the row actually get activation_code now?
                 db.refresh(r)
                 if r.activation_code:
                     recovered += 1
                 elif applied:
-                    synced += 1  # provider responded but row still empty (unusual)
-            except Exception as exc:  # pragma: no cover - cron resilience
+                    synced += 1
+            except Exception as exc:  # pragma: no cover - resilience
                 errors.append({"profileId": r.id, "orderNo": order_no, "error": str(exc)[:200]})
 
         db.commit()
@@ -378,6 +387,19 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
             "errorCount": len(errors),
             "ranAt": utcnow(),
         }
+
+    @app.post("/api/v1/admin/orders/refresh-from-provider")
+    async def admin_refresh_orders_from_provider(
+        db: Session = Depends(get_db),
+        provider: Any = Depends(get_esim_provider),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
+        """Admin-triggered: same provider sync as the cron endpoint, but auth'd
+        by admin JWT (no CRON_TOKEN). Use the "Refresh from provider" button on
+        the admin Orders page. Takes ~5-30s depending on how many ACTIVE
+        profiles + recent broken placeholders the system has.
+        """
+        return await _perform_active_usage_refresh(db=db, provider=provider, source="admin")
 
     @app.get("/api/v1/admin/profiles/audit")
     async def audit_esim_profiles(
