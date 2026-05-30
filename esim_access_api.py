@@ -507,6 +507,16 @@ def _serialize_profile(row: ESimProfile | ProfileInventoryRow, *, now: datetime)
         if row.order_item is not None
         else custom_fields.get("countryName") or package_metadata.get("countryName")
     )
+    package_name = (
+        row.order_item.package_name
+        if row.order_item is not None
+        else custom_fields.get("packageName") or package_metadata.get("packageName")
+    )
+    package_code = (
+        row.order_item.package_code
+        if row.order_item is not None
+        else custom_fields.get("packageCode") or package_metadata.get("packageCode")
+    )
     provider_order_no = (
         row.order_item.provider_order_no
         if row.order_item is not None
@@ -541,6 +551,10 @@ def _serialize_profile(row: ESimProfile | ProfileInventoryRow, *, now: datetime)
         "country_code": country_code,
         "countryName": country_name,
         "country_name": country_name,
+        "packageName": package_name,
+        "package_name": package_name,
+        "packageCode": package_code,
+        "package_code": package_code,
         "status": status_value,
         "isExpired": is_expired,
         "canActivate": can_activate,
