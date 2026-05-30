@@ -279,26 +279,27 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         from esim_access_api import ProfileQueryRequest
         from sqlalchemy import select as _select, func
 
-        # Auth — either CRON_TOKEN or admin JWT
+        # Auth: shared CRON_TOKEN passed as X-Cron-Token header (or as
+        # `Authorization: Bearer <CRON_TOKEN>`). Set CRON_TOKEN in Koyeb env.
+        # If you also want admin-token access for manual smoke tests, hit
+        # /admin/profiles/normalize-statuses-and-refresh or call this with the
+        # CRON_TOKEN value as Bearer.
         expected = (os.environ.get("CRON_TOKEN") or "").strip()
         provided = (request.headers.get("X-Cron-Token") or "").strip()
         if not provided:
             auth_header = request.headers.get("Authorization") or ""
             if auth_header.lower().startswith("bearer "):
                 provided = auth_header[7:].strip()
-        if not expected or provided != expected:
-            # Fall back to admin auth — re-run the standard subject check.
-            try:
-                claims = get_token_claims(request=request)  # type: ignore[arg-type]
-                if not isinstance(claims, dict):
-                    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Cron auth required")
-                row = require_active_subject(db, claims=claims, subject_type="admin")
-                assert isinstance(row, AdminUser)
-            except Exception as exc:
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Provide a valid X-Cron-Token or admin Bearer token",
-                ) from exc
+        if not expected:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="CRON_TOKEN env var is not configured on this deployment",
+            )
+        if provided != expected:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Provide a valid X-Cron-Token header (or Bearer <CRON_TOKEN>)",
+            )
 
         rows = db.scalars(
             _select(ESimProfile)
