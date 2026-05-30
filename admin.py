@@ -234,6 +234,134 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         db.commit()
         return {"userId": user_id, "deactivated": deactivated, "count": len(deactivated)}
 
+    @app.get("/api/v1/admin/profiles/audit")
+    async def audit_esim_profiles(
+        db: Session = Depends(get_db),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
+        """Aggregate health-check over the esim_profiles table.
+
+        Surfaces data-quality drift the engineering team should fix:
+          - status histograms (look for casing inconsistencies like CANCEL vs CANCELLED)
+          - profiles with empty activation_code that ARE marked installed (broken)
+          - profiles with NULL country (data we should be carrying from the order)
+          - profiles whose last_provider_sync_at is stale (usage data outdated)
+          - orphans: profiles with no order_item, recent orders with no profile
+          - lifecycle event counts
+        """
+        from supabase_store import ESimProfile, OrderItem, CustomerOrder, ESimLifecycleEvent
+        from sqlalchemy import select as _select, func, and_, or_
+        from datetime import timedelta
+
+        now = utcnow()
+        stale_threshold = now - timedelta(days=1)
+
+        total_profiles = db.scalar(_select(func.count(ESimProfile.id))) or 0
+
+        # Status histograms
+        app_status_rows = db.execute(
+            _select(ESimProfile.app_status, func.count(ESimProfile.id))
+            .group_by(ESimProfile.app_status)
+        ).all()
+        app_status_counts = {(r[0] or "(null)"): int(r[1]) for r in app_status_rows}
+
+        provider_status_rows = db.execute(
+            _select(ESimProfile.provider_status, func.count(ESimProfile.id))
+            .group_by(ESimProfile.provider_status)
+        ).all()
+        provider_status_counts = {(r[0] or "(null)"): int(r[1]) for r in provider_status_rows}
+
+        # Profiles marked installed but with NO activation_code (broken)
+        installed_no_activation = db.scalar(
+            _select(func.count(ESimProfile.id))
+            .where(ESimProfile.installed.is_(True))
+            .where(or_(ESimProfile.activation_code.is_(None), ESimProfile.activation_code == ""))
+        ) or 0
+
+        # Profiles with NULL country
+        no_country = db.scalar(
+            _select(func.count(ESimProfile.id))
+            # country lives on OrderItem, not ESimProfile — count via JOIN
+            .select_from(ESimProfile)
+            .outerjoin(OrderItem, OrderItem.id == ESimProfile.order_item_id)
+            .where(or_(OrderItem.country_code.is_(None), OrderItem.country_code == ""))
+        ) or 0
+
+        # ACTIVE profiles with stale last_provider_sync_at (usage data is old)
+        stale_active = db.scalar(
+            _select(func.count(ESimProfile.id))
+            .where(func.upper(ESimProfile.app_status) == "ACTIVE")
+            .where(or_(
+                ESimProfile.last_provider_sync_at.is_(None),
+                ESimProfile.last_provider_sync_at < stale_threshold,
+            ))
+        ) or 0
+
+        # ACTIVE profiles with NULL usage fields (never synced)
+        active_no_usage = db.scalar(
+            _select(func.count(ESimProfile.id))
+            .where(func.upper(ESimProfile.app_status) == "ACTIVE")
+            .where(or_(ESimProfile.total_data_mb.is_(None), ESimProfile.used_data_mb.is_(None)))
+        ) or 0
+
+        # Profiles past expiry but app_status not EXPIRED
+        past_expiry_wrong_status = db.scalar(
+            _select(func.count(ESimProfile.id))
+            .where(ESimProfile.expires_at.is_not(None))
+            .where(ESimProfile.expires_at < now)
+            .where(func.upper(ESimProfile.app_status) != "EXPIRED")
+            .where(func.upper(ESimProfile.app_status) != "CANCELLED")
+            .where(func.upper(ESimProfile.app_status) != "CANCEL")
+            .where(func.upper(ESimProfile.app_status) != "REFUNDED")
+            .where(func.upper(ESimProfile.app_status) != "REVOKED")
+        ) or 0
+
+        # Orphans
+        orphan_profiles_no_order = db.scalar(
+            _select(func.count(ESimProfile.id))
+            .where(ESimProfile.order_item_id.is_(None))
+        ) or 0
+
+        recent_order_items = db.scalars(
+            _select(OrderItem)
+            .where(OrderItem.service_type == "esim")
+            .where(OrderItem.created_at >= now - timedelta(days=30))
+        ).all()
+        orders_without_profile = 0
+        for oi in recent_order_items:
+            has_profile = db.scalar(_select(func.count(ESimProfile.id)).where(ESimProfile.order_item_id == oi.id)) or 0
+            if has_profile == 0:
+                orders_without_profile += 1
+
+        # Lifecycle event totals
+        total_events = db.scalar(_select(func.count(ESimLifecycleEvent.id))) or 0
+        event_types_rows = db.execute(
+            _select(ESimLifecycleEvent.event_type, func.count(ESimLifecycleEvent.id))
+            .group_by(ESimLifecycleEvent.event_type)
+            .order_by(func.count(ESimLifecycleEvent.id).desc())
+        ).all()
+        event_type_counts = {r[0]: int(r[1]) for r in event_types_rows[:20]}
+
+        return {
+            "totalProfiles": total_profiles,
+            "appStatusCounts": app_status_counts,
+            "providerStatusCounts": provider_status_counts,
+            "issues": {
+                "installedWithNoActivationCode": installed_no_activation,
+                "profilesMissingCountry": no_country,
+                "activeStaleSync_olderThan1d": stale_active,
+                "activeMissingUsageFields": active_no_usage,
+                "pastExpiryButStatusNotExpired": past_expiry_wrong_status,
+                "orphanProfilesNoOrderItem": orphan_profiles_no_order,
+                "recent30dEsimOrdersWithoutProfile": orders_without_profile,
+            },
+            "lifecycleEvents": {
+                "total": total_events,
+                "byTypeTop20": event_type_counts,
+            },
+            "auditedAt": now,
+        }
+
     @app.post("/api/v1/admin/profiles/{profile_id}/resync")
     async def resync_profile_from_provider(
         profile_id: int,
