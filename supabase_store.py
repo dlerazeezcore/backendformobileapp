@@ -92,6 +92,7 @@ _ESIM_STATUS_ALIASES: dict[str, str] = {
     "CANCELED": "CANCELLED",      # US spelling -> our canonical UK spelling
     "CANCELLED": "CANCELLED",
     "USED_UP": "EXPIRED",         # data exhausted; surface as expired in UI
+    "USED_EXPIRED": "EXPIRED",    # provider variant for data-exhausted + past-expiry
     "ENDOFLIFE": "EXPIRED",
     "EXPIRED": "EXPIRED",
     "REVOKED": "REVOKED",
