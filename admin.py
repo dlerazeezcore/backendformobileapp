@@ -6,7 +6,7 @@ import os
 from time import monotonic
 from typing import Any, Callable
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 
 from dependencies import get_provider as get_esim_provider
 from pydantic import BaseModel, Field
@@ -27,6 +27,7 @@ from supabase_store import (
     PaymentAttempt,
     PaymentProviderEvent,
     SupabaseStore,
+    normalize_esim_status,
     utcnow,
 )
 
@@ -234,6 +235,102 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
                 deactivated.append({"id": r.id, "tokenLen": len(tok), "platform": r.platform})
         db.commit()
         return {"userId": user_id, "deactivated": deactivated, "count": len(deactivated)}
+
+    @app.post("/api/v1/admin/profiles/normalize-statuses")
+    async def normalize_existing_statuses(
+        db: Session = Depends(get_db),
+        _: AdminUser = Depends(_require_admin_actor),
+    ) -> dict[str, Any]:
+        """One-shot backfill: rewrite app_status on existing rows through
+        normalize_esim_status() so legacy values (CANCEL, GOT_RESOURCE, etc.)
+        become canonical (CANCELLED, INACTIVE). Idempotent — running it again
+        is a no-op on already-normalized rows.
+        """
+        from supabase_store import ESimProfile
+        from sqlalchemy import select as _select
+        rows = db.scalars(_select(ESimProfile)).all()
+        changes: list[dict[str, Any]] = []
+        for r in rows:
+            before = r.app_status
+            after = normalize_esim_status(before)
+            if after and after != before:
+                r.app_status = after
+                changes.append({"id": r.id, "from": before, "to": after})
+        db.commit()
+        return {"profilesScanned": len(rows), "rowsChanged": len(changes), "changes": changes}
+
+    @app.post("/api/v1/internal/cron/refresh-active-usage")
+    async def cron_refresh_active_usage(
+        request: Request,
+        db: Session = Depends(get_db),
+        provider: Any = Depends(get_esim_provider),
+    ) -> dict[str, Any]:
+        """Background job: refresh provider usage for every ACTIVE eSIM profile.
+
+        Auth: shared CRON_TOKEN env var. Caller passes `Authorization: Bearer <token>`
+        OR `X-Cron-Token: <token>`. Falls back to admin auth if a bearer is
+        present but doesn't match CRON_TOKEN.
+
+        For each ACTIVE profile, calls provider.query_profiles by ICCID (the
+        most reliable lookup), then sync_profiles to apply. Returns summary.
+        Designed to be called every 30min by Koyeb's cron scheduler.
+        """
+        from supabase_store import ESimProfile
+        from esim_access_api import ProfileQueryRequest
+        from sqlalchemy import select as _select, func
+
+        # Auth — either CRON_TOKEN or admin JWT
+        expected = (os.environ.get("CRON_TOKEN") or "").strip()
+        provided = (request.headers.get("X-Cron-Token") or "").strip()
+        if not provided:
+            auth_header = request.headers.get("Authorization") or ""
+            if auth_header.lower().startswith("bearer "):
+                provided = auth_header[7:].strip()
+        if not expected or provided != expected:
+            # Fall back to admin auth — re-run the standard subject check.
+            try:
+                claims = get_token_claims(request=request)  # type: ignore[arg-type]
+                if not isinstance(claims, dict):
+                    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Cron auth required")
+                row = require_active_subject(db, claims=claims, subject_type="admin")
+                assert isinstance(row, AdminUser)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Provide a valid X-Cron-Token or admin Bearer token",
+                ) from exc
+
+        rows = db.scalars(
+            _select(ESimProfile)
+            .where(func.upper(ESimProfile.app_status) == "ACTIVE")
+            .where(ESimProfile.iccid.is_not(None))
+        ).all()
+        attempted = 0
+        synced = 0
+        errors: list[dict[str, Any]] = []
+        store = SupabaseStore(db)
+        for r in rows:
+            attempted += 1
+            try:
+                resp = await provider.query_profiles(ProfileQueryRequest(iccid=r.iccid))
+                applied = store.sync_profiles(
+                    resp.model_dump(by_alias=True, exclude_none=True),
+                    platform_code="cron-refresh",
+                    platform_name="Active usage refresh",
+                    actor_phone=None,
+                )
+                if applied:
+                    synced += 1
+            except Exception as exc:  # pragma: no cover - cron resilience
+                errors.append({"profileId": r.id, "iccid": r.iccid, "error": str(exc)[:200]})
+        db.commit()
+        return {
+            "attempted": attempted,
+            "synced": synced,
+            "errors": errors[:20],  # cap response size
+            "errorCount": len(errors),
+            "ranAt": utcnow(),
+        }
 
     @app.get("/api/v1/admin/profiles/audit")
     async def audit_esim_profiles(

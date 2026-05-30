@@ -74,6 +74,48 @@ def parse_provider_float(value: Any) -> float | None:
     return None
 
 
+# Canonical eSIM app_status values used internally.
+# Provider responses sometimes use non-canonical variants (CANCEL vs CANCELLED,
+# GOT_RESOURCE for "ordered but not installed yet", USED_UP for data-exhausted).
+# normalize_esim_status() funnels all of them down to one of these so backend
+# logic that switches on app_status doesn't miss edge cases.
+_ESIM_STATUS_ALIASES: dict[str, str] = {
+    # provider raw → canonical
+    "GOT_RESOURCE": "INACTIVE",   # purchased, profile reserved, not yet installed
+    "RELEASED": "INACTIVE",       # alias some providers use
+    "NEW": "INACTIVE",
+    "INSTALLED": "INACTIVE",      # downloaded to the device but not activated
+    "IN_USE": "ACTIVE",
+    "ENABLED": "ACTIVE",
+    "ACTIVE": "ACTIVE",
+    "CANCEL": "CANCELLED",
+    "CANCELED": "CANCELLED",      # US spelling -> our canonical UK spelling
+    "CANCELLED": "CANCELLED",
+    "USED_UP": "EXPIRED",         # data exhausted; surface as expired in UI
+    "ENDOFLIFE": "EXPIRED",
+    "EXPIRED": "EXPIRED",
+    "REVOKED": "REVOKED",
+    "SUSPENDED": "SUSPENDED",
+    "REFUNDED": "REFUNDED",
+    "BOOKED": "BOOKED",
+}
+
+
+def normalize_esim_status(raw: str | None) -> str | None:
+    """Map any provider-supplied status to our canonical app_status vocabulary.
+
+    Returns None when input is None or unmappable (so callers can decide
+    whether to keep their default). Unknown statuses are upper-cased and
+    returned as-is (defensive — we don't silently lose data).
+    """
+    if raw is None:
+        return None
+    key = str(raw).strip().upper()
+    if not key:
+        return None
+    return _ESIM_STATUS_ALIASES.get(key, key)
+
+
 def utcnow() -> datetime:
     return datetime.now(APP_TIMEZONE)
 
@@ -2717,7 +2759,7 @@ class SupabaseStore:
             profile.qr_code_url = item.get("qrCodeUrl")
             profile.install_url = item.get("shortUrl")
             profile.provider_status = item.get("smdpStatus")
-            profile.app_status = status_after
+            profile.app_status = normalize_esim_status(status_after) or status_after
             profile.data_type = None if item.get("dataType") is None else str(item.get("dataType"))
             profile.total_data_mb = total_data_mb
             profile.used_data_mb = used_data_mb
@@ -2992,7 +3034,7 @@ class SupabaseStore:
             order_item = profile.order_item
         customer_order = order_item.customer_order if order_item is not None else None
         if profile is not None and content.get("esimStatus"):
-            profile.app_status = content["esimStatus"]
+            profile.app_status = normalize_esim_status(content["esimStatus"]) or content["esimStatus"]
             profile.provider_status = content.get("smdpStatus")
             profile.expires_at = parse_provider_datetime(content.get("expiredTime")) or profile.expires_at
             profile.last_provider_sync_at = utcnow()
