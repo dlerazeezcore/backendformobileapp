@@ -123,6 +123,68 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         assert isinstance(row, AdminUser)
         return row
 
+    async def _require_owner_or_super(
+        claims: dict[str, Any] = Depends(get_token_claims),
+        db: Session = Depends(get_db),
+    ) -> AdminUser:
+        row = require_active_subject(db, claims=claims, subject_type="admin")
+        assert isinstance(row, AdminUser)
+        if (row.role or "").strip().lower() not in {"super_admin", "owner"}:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only super_admin or owner can manage admin users",
+            )
+        return row
+
+    def _serialize_admin_user(row: AdminUser) -> dict[str, Any]:
+        return {
+            "id": row.id,
+            "phone": row.phone,
+            "name": row.name,
+            "email": row.email,
+            "role": row.role,
+            "status": row.status,
+            "canSendPush": row.can_send_push,
+            "canManageUsers": row.can_manage_users,
+            "canManageOrders": row.can_manage_orders,
+            "canManagePricing": row.can_manage_pricing,
+            "canManageContent": row.can_manage_content,
+            "createdAt": row.created_at,
+            "updatedAt": row.updated_at,
+        }
+
+    @app.get("/api/v1/admin/admin-users")
+    async def list_admin_users(
+        phone: str | None = None,
+        db: Session = Depends(get_db),
+        _: AdminUser = Depends(_require_owner_or_super),
+    ) -> dict[str, Any]:
+        from sqlalchemy import select as _select
+        query = _select(AdminUser).order_by(AdminUser.created_at.desc()).limit(500)
+        if phone:
+            query = query.where(AdminUser.phone == phone.strip())
+        rows = db.scalars(query).all()
+        return {"admins": [_serialize_admin_user(r) for r in rows]}
+
+    @app.delete("/api/v1/admin/admin-users/{admin_id}")
+    async def delete_admin_user(
+        admin_id: str,
+        db: Session = Depends(get_db),
+        actor: AdminUser = Depends(_require_owner_or_super),
+    ) -> dict[str, Any]:
+        if str(admin_id).strip() == str(actor.id):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot delete your own admin account",
+            )
+        from sqlalchemy import select as _select
+        row = db.scalar(_select(AdminUser).where(AdminUser.id == admin_id))
+        if row is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Admin user not found")
+        db.delete(row)
+        db.commit()
+        return {"deleted": admin_id}
+
     @app.post("/api/v1/admin/profiles/refund")
     async def refund_profile(
         payload: RefundPayload,
