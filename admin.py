@@ -245,21 +245,22 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         Looks up the parent order_item's provider_order_no, calls the provider's
         query_profiles, then sync_profiles to apply the result.
         """
-        from supabase_store import ESimProfile, ESimOrderItem
-        from esim_access_api import ESimAccessAPI, ProfileQueryRequest
+        from supabase_store import ESimProfile, OrderItem
+        from esim_access_api import ProfileQueryRequest
+        from dependencies import get_provider
         from sqlalchemy import select as _select
-        import asyncio
         profile = db.scalar(_select(ESimProfile).where(ESimProfile.id == profile_id))
         if profile is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found")
-        # Resolve the providerOrderNo from any linked order item (most recent).
+        # Resolve providerOrderNo from the profile first, then fall back to the
+        # most recent OrderItem for this user.
         order_no = getattr(profile, "provider_order_no", None)
         if not order_no:
             order_item = db.scalar(
-                _select(ESimOrderItem)
-                .where(ESimOrderItem.user_id == profile.user_id)
-                .where(ESimOrderItem.provider_order_no.is_not(None))
-                .order_by(ESimOrderItem.created_at.desc())
+                _select(OrderItem)
+                .where(OrderItem.user_id == profile.user_id)
+                .where(OrderItem.provider_order_no.is_not(None))
+                .order_by(OrderItem.created_at.desc())
                 .limit(1)
             )
             if order_item is None:
@@ -268,23 +269,8 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
                     detail="No provider_order_no available to query the provider with",
                 )
             order_no = order_item.provider_order_no
-        # Build a fresh provider client from settings (avoid request-scoped dep).
-        from config import get_settings
-        settings = get_settings()
-        provider = ESimAccessAPI(
-            base_url=settings.esim_access_base_url,
-            access_code=settings.esim_access_access_code,
-            secret_key=settings.esim_access_secret_key,
-        )
-        try:
-            response = asyncio.run(provider.query_profiles(ProfileQueryRequest(order_no=order_no)))
-        except RuntimeError:
-            # Already inside an event loop — use the loop's runner.
-            loop = asyncio.new_event_loop()
-            try:
-                response = loop.run_until_complete(provider.query_profiles(ProfileQueryRequest(order_no=order_no)))
-            finally:
-                loop.close()
+        provider = get_provider()
+        response = await provider.query_profiles(ProfileQueryRequest(order_no=order_no))
         synced = SupabaseStore(db).sync_profiles(
             response.model_dump(by_alias=True, exclude_none=True),
             platform_code="admin-resync",
