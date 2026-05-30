@@ -514,6 +514,26 @@ class PushNotification(TimeMixin, Base):
     sent_by_admin: Mapped[AdminUser | None] = relationship(back_populates="push_notifications")
 
 
+class AppReleaseInfo(TimeMixin, Base):
+    """Single-row table holding the current mobile app release metadata.
+
+    Used by GET /api/v1/app/version-info so the mobile app can detect available
+    updates and (when below `min_supported_version`) force the user to update.
+    Updated by admins via PUT /api/v1/admin/app/version-info.
+    """
+
+    __tablename__ = "app_release_info"
+
+    id: Mapped[int] = mapped_column(primary_key=True)  # Always 1 (singleton).
+    latest_version: Mapped[str] = mapped_column(String(32), nullable=False, default="1.0.0")
+    min_supported_version: Mapped[str] = mapped_column(String(32), nullable=False, default="1.0.0")
+    app_store_url: Mapped[str] = mapped_column(String(512), nullable=False, default="")
+    play_store_url: Mapped[str] = mapped_column(String(512), nullable=False, default="")
+    release_notes_en: Mapped[str | None] = mapped_column(Text)
+    release_notes_ar: Mapped[str | None] = mapped_column(Text)
+    release_notes_ku: Mapped[str | None] = mapped_column(Text)
+
+
 class ExchangeRate(TimeMixin, Base):
     __tablename__ = "exchange_rates"
     __table_args__ = (
@@ -1743,6 +1763,36 @@ class SupabaseStore:
             summary["tokenPrefixes"].append(self._token_prefix(token))
         summary["tokenPrefixes"].sort()
         return summary
+
+    def get_push_device_languages(
+        self,
+        *,
+        tokens: list[str],
+    ) -> dict[str, tuple[str | None, str | None]]:
+        """Return {token: (device.locale, user.preferred_language)} for the given tokens.
+
+        Used at send time to fan a localized push out by language. Tokens with no
+        device row or no resolvable user fall back to (None, None) in the result,
+        which the caller resolves to the default language.
+        """
+        cleaned = [str(item).strip() for item in tokens if str(item or "").strip()]
+        if not cleaned:
+            return {}
+        rows = self.session.execute(
+            select(PushDevice.token, PushDevice.locale, AppUser.preferred_language)
+            .outerjoin(AppUser, AppUser.id == PushDevice.user_id)
+            .where(PushDevice.token.in_(cleaned))
+        ).all()
+        out: dict[str, tuple[str | None, str | None]] = {}
+        for token, device_locale, user_pref in rows:
+            key = str(token or "").strip()
+            if not key:
+                continue
+            out[key] = (
+                str(device_locale).strip() if device_locale else None,
+                str(user_pref).strip() if user_pref else None,
+            )
+        return out
 
     def list_push_user_ids_for_audience(
         self,

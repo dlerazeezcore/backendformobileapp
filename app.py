@@ -22,6 +22,7 @@ from sqlalchemy.exc import ProgrammingError as SQLAlchemyProgrammingError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 from admin import register_admin_routes
+from app_meta import register_app_meta_routes
 from auth import register_auth_routes
 from config import (
     DEFAULT_ESIM_ACCESS_BASE_URL,
@@ -500,6 +501,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     register_fib_payment_routes(app, get_fib_provider, get_db)
     register_push_notification_routes(app, get_push_provider, get_db)
     register_admin_routes(app, get_db)
+    register_app_meta_routes(app, get_db)
     register_wings_routes(app)
 
     return app

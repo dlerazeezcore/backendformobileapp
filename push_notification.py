@@ -12,6 +12,13 @@ from sqlalchemy.orm import Session
 
 from auth import decode_access_token, extract_bearer_token, get_token_claims, require_active_subject
 from config import get_settings
+from push_localization import (
+    SUPPORTED_LANGS,
+    APP_UPDATE_MESSAGES,
+    SupportedLang,
+    normalize_maps,
+    resolve_locale,
+)
 from supabase_store import AdminUser, AppUser, PushDevice, PushNotification, SupabaseStore, utcnow
 
 ALLOWED_PUSH_AUDIENCES = {"all", "authenticated", "loyalty", "active_esim", "admins", "all_devices"}
@@ -261,6 +268,8 @@ class UnregisterPushDevicePayload(Model):
 class SendPushNotificationPayload(Model):
     title: str = Field(min_length=1, max_length=255)
     body: str = Field(min_length=1, max_length=2000)
+    titles: dict[str, str] | None = Field(default=None)
+    bodies: dict[str, str] | None = Field(default=None)
     data: dict[str, Any] = Field(default_factory=dict)
     audience: str | None = None
     user_ids: list[str] = Field(default_factory=list, alias="userIds")
@@ -293,6 +302,21 @@ class SendPushNotificationPayload(Model):
             raise ValueError(
                 "Provide at least one target: audience, userIds, tokens, or sendToAllActive=true"
             )
+        # Normalize localized maps. Validator (1) drops blank/unsupported keys, (2) requires
+        # both titles and bodies to be present together, (3) requires at least one supported
+        # language to have non-empty values, (4) requires EN to be present (it's the fallback
+        # for any device whose resolved locale isn't in the map).
+        titles_norm = normalize_maps(self.titles)
+        bodies_norm = normalize_maps(self.bodies)
+        if titles_norm or bodies_norm:
+            if not titles_norm or not bodies_norm:
+                raise ValueError("Both 'titles' and 'bodies' must be provided when localizing.")
+            if "en" not in titles_norm or "en" not in bodies_norm:
+                raise ValueError(
+                    "Localized payload must include an 'en' entry in both titles and bodies (used as fallback)."
+                )
+        self.titles = titles_norm
+        self.bodies = bodies_norm
         return self
 
 
@@ -303,12 +327,10 @@ class SendAppUpdateNotificationPayload(Model):
     android_external_url: str | None = Field(default=None, alias="androidExternalUrl")
     ios_url: str | None = Field(default=None, alias="iosUrl")
     android_url: str | None = Field(default=None, alias="androidUrl")
-    title: str = Field(default="Update Available", min_length=1, max_length=255)
-    body: str = Field(
-        default="A new version is available. Please update to continue with the best experience.",
-        min_length=1,
-        max_length=2000,
-    )
+    title: str | None = Field(default=None, max_length=255)
+    body: str | None = Field(default=None, max_length=2000)
+    titles: dict[str, str] | None = Field(default=None)
+    bodies: dict[str, str] | None = Field(default=None)
     audience: str = Field(default="all")
     data: dict[str, Any] = Field(default_factory=dict)
     channel_id: str | None = Field(default=None, alias="channelId")
@@ -329,6 +351,19 @@ class SendAppUpdateNotificationPayload(Model):
             raise ValueError("playStoreUrl must be a valid URL.")
         self.app_store_url = app_store_url
         self.play_store_url = play_store_url
+        # Normalize optional localized maps. When neither maps nor explicit title/body
+        # are supplied, the handler falls back to the pre-baked APP_UPDATE_MESSAGES.
+        titles_norm = normalize_maps(self.titles)
+        bodies_norm = normalize_maps(self.bodies)
+        if titles_norm or bodies_norm:
+            if not titles_norm or not bodies_norm:
+                raise ValueError("Both 'titles' and 'bodies' must be provided when localizing.")
+            if "en" not in titles_norm or "en" not in bodies_norm:
+                raise ValueError(
+                    "Localized payload must include an 'en' entry in both titles and bodies (used as fallback)."
+                )
+        self.titles = titles_norm
+        self.bodies = bodies_norm
         return self
 
 
@@ -390,6 +425,77 @@ def _merge_app_update_fields(
         if value:
             merged[key] = value
     return merged, True
+
+
+def _send_with_optional_localization(
+    *,
+    provider: "PushNotificationService",
+    tokens: list[str],
+    payload: "SendPushNotificationPayload",
+    data: dict[str, Any],
+    store: SupabaseStore,
+) -> tuple[dict[str, Any], dict[str, int]]:
+    """Send to `tokens`, fanning out per-language if `payload.titles`/`bodies` are set.
+
+    Returns (aggregated_result_dict, per_language_counts). `aggregated_result_dict` has the
+    same shape as `PushNotificationService.send_push_notification` returns so the calling
+    handler doesn't need to branch on the result.
+    """
+    has_localization = bool(payload.titles and payload.bodies)
+    if not has_localization:
+        result = provider.send_push_notification(
+            tokens=tokens,
+            title=payload.title,
+            body=payload.body,
+            data=data,
+            channel_id=payload.channel_id,
+            image=payload.image,
+        )
+        return result, {}
+
+    # Resolve a target language per token.
+    device_langs = store.get_push_device_languages(tokens=tokens)
+    groups: dict[SupportedLang, list[str]] = {}
+    for token in tokens:
+        device_locale, user_pref = device_langs.get(token, (None, None))
+        lang = resolve_locale(device_locale, user_pref)
+        groups.setdefault(lang, []).append(token)
+
+    aggregated: dict[str, Any] = {
+        "successCount": 0,
+        "failureCount": 0,
+        "invalidTokens": [],
+        "failureReasons": {},
+        "tokenResults": [],
+    }
+    per_language_counts: dict[str, int] = {}
+    titles = payload.titles or {}
+    bodies = payload.bodies or {}
+    en_title = titles.get("en") or payload.title
+    en_body = bodies.get("en") or payload.body
+    for lang, group_tokens in groups.items():
+        if not group_tokens:
+            continue
+        title = titles.get(lang) or en_title
+        body = bodies.get(lang) or en_body
+        sub = provider.send_push_notification(
+            tokens=group_tokens,
+            title=title,
+            body=body,
+            data=data,
+            channel_id=payload.channel_id,
+            image=payload.image,
+        )
+        aggregated["successCount"] += int(sub.get("successCount", 0))
+        aggregated["failureCount"] += int(sub.get("failureCount", 0))
+        aggregated["invalidTokens"].extend(sub.get("invalidTokens", []))
+        aggregated["tokenResults"].extend(sub.get("tokenResults", []))
+        for reason, count in (sub.get("failureReasons") or {}).items():
+            aggregated["failureReasons"][reason] = (
+                int(aggregated["failureReasons"].get(reason, 0)) + int(count)
+            )
+        per_language_counts[lang] = len(group_tokens)
+    return aggregated, per_language_counts
 
 
 def _serialize_push_device(row: PushDevice) -> dict[str, Any]:
@@ -765,14 +871,19 @@ def register_push_notification_routes(
             )
 
         try:
-            result = provider.send_push_notification(
+            result, per_language_counts = _send_with_optional_localization(
+                provider=provider,
                 tokens=deduped_tokens,
-                title=payload.title,
-                body=payload.body,
+                payload=payload,
                 data=normalized_data,
-                channel_id=payload.channel_id,
-                image=payload.image,
+                store=store,
             )
+            if per_language_counts:
+                logger.info(
+                    "push.send.localized recipient_scope=%s per_language=%s",
+                    recipient_scope,
+                    per_language_counts,
+                )
         except Exception as exc:
             store.finalize_push_notification(
                 row=notification,
@@ -817,30 +928,38 @@ def register_push_notification_routes(
         else:
             delivery_status = "failed"
 
+        provider_response_audit: dict[str, Any] = {
+            **result,
+            "tokenResults": token_results,
+        }
+        if per_language_counts:
+            provider_response_audit["perLanguageCounts"] = per_language_counts
+            provider_response_audit["localized"] = True
         store.finalize_push_notification(
             row=notification,
             status=delivery_status,
             success_count=success_count,
             failure_count=failure_count,
             invalid_tokens=invalid_tokens,
-            provider_response={
-                **result,
-                "tokenResults": token_results,
-            },
+            provider_response=provider_response_audit,
             sent_at=utcnow(),
         )
         db.commit()
         db.refresh(notification)
+        delivery_summary: dict[str, Any] = {
+            "requestedTokens": len(deduped_tokens),
+            "successCount": success_count,
+            "failureCount": failure_count,
+            "invalidTokenCount": len(invalid_tokens),
+            "invalidTokens": invalid_tokens,
+            "failureReasons": failure_reasons,
+        }
+        if per_language_counts:
+            delivery_summary["perLanguageCounts"] = per_language_counts
+            delivery_summary["localized"] = True
         return {
             "notification": _serialize_push_notification(notification),
-            "delivery": {
-                "requestedTokens": len(deduped_tokens),
-                "successCount": success_count,
-                "failureCount": failure_count,
-                "invalidTokenCount": len(invalid_tokens),
-                "invalidTokens": invalid_tokens,
-                "failureReasons": failure_reasons,
-            },
+            "delivery": delivery_summary,
             "data": {
                 "debug": debug_payload,
                 "tokenResults": token_results,
@@ -875,14 +994,39 @@ def register_push_notification_routes(
         for key, value in optional_app_update_fields.items():
             if value:
                 merged_data[key] = value
+
+        # Decide the text. Priority:
+        #   1. Explicit localized maps from admin (titles + bodies).
+        #   2. Explicit single title + body from admin (back-compat).
+        #   3. Pre-baked APP_UPDATE_MESSAGES — fanned out per language.
+        resolved_titles: dict[str, str] | None = payload.titles
+        resolved_bodies: dict[str, str] | None = payload.bodies
+        resolved_title: str | None = payload.title
+        resolved_body: str | None = payload.body
+        if not resolved_titles and not resolved_bodies and not (resolved_title and resolved_body):
+            resolved_titles = {lang: text[0] for lang, text in APP_UPDATE_MESSAGES.items()}
+            resolved_bodies = {lang: text[1] for lang, text in APP_UPDATE_MESSAGES.items()}
+        # The inner SendPushNotificationPayload still requires non-empty title/body;
+        # use the EN fallback when only maps were supplied.
+        if not resolved_title:
+            resolved_title = (resolved_titles or {}).get("en") or "Update Available"
+        if not resolved_body:
+            resolved_body = (
+                (resolved_bodies or {}).get("en")
+                or "A new version is available. Please update to continue with the best experience."
+            )
+
         send_payload = SendPushNotificationPayload(
-            title=payload.title,
-            body=payload.body,
+            title=resolved_title,
+            body=resolved_body,
+            titles=resolved_titles,
+            bodies=resolved_bodies,
             data=merged_data,
             audience=payload.audience,
             channel_id=payload.channel_id,
             image=payload.image,
             dry_run=payload.dry_run,
+            notification_type="app_update",
         )
         return await send_push_notification(
             payload=send_payload,
