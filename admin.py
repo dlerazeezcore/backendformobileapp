@@ -301,16 +301,33 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
                 detail="Provide a valid X-Cron-Token header (or Bearer <CRON_TOKEN>)",
             )
 
-        rows = db.scalars(
+        # Two passes:
+        # 1) ACTIVE profiles with ICCID — refresh usage from the provider.
+        # 2) BROKEN placeholders (no iccid + no activation_code) created in the
+        #    last 7 days — try to resync via their order's providerOrderNo. This
+        #    automatically recovers orders that fell through the retry-with-
+        #    backoff window in createManagedOrder (provider slow to materialize).
+        from datetime import timedelta
+        from sqlalchemy import or_, select as _select  # noqa: F811 — local rebind for this fn
+        active_rows = db.scalars(
             _select(ESimProfile)
             .where(func.upper(ESimProfile.app_status) == "ACTIVE")
             .where(ESimProfile.iccid.is_not(None))
         ).all()
+        broken_rows = db.scalars(
+            _select(ESimProfile)
+            .where(ESimProfile.iccid.is_(None))
+            .where(or_(ESimProfile.activation_code.is_(None), ESimProfile.activation_code == ""))
+            .where(ESimProfile.created_at >= (utcnow() - timedelta(days=7)))
+        ).all()
+
+        store = SupabaseStore(db)
         attempted = 0
         synced = 0
+        recovered = 0
         errors: list[dict[str, Any]] = []
-        store = SupabaseStore(db)
-        for r in rows:
+
+        for r in active_rows:
             attempted += 1
             try:
                 resp = await provider.query_profiles(ProfileQueryRequest(iccid=r.iccid))
@@ -324,11 +341,40 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
                     synced += 1
             except Exception as exc:  # pragma: no cover - cron resilience
                 errors.append({"profileId": r.id, "iccid": r.iccid, "error": str(exc)[:200]})
+
+        for r in broken_rows:
+            attempted += 1
+            # Look up the parent order_item's providerOrderNo.
+            order_no: str | None = None
+            if r.order_item_id is not None:
+                oi = db.scalar(_select(OrderItem).where(OrderItem.id == r.order_item_id))
+                if oi is not None:
+                    order_no = oi.provider_order_no
+            if not order_no:
+                continue  # can't recover without provider order_no
+            try:
+                resp = await provider.query_profiles(ProfileQueryRequest(order_no=order_no))
+                applied = store.sync_profiles(
+                    resp.model_dump(by_alias=True, exclude_none=True),
+                    platform_code="cron-recover",
+                    platform_name="Broken-placeholder recovery",
+                    actor_phone=None,
+                )
+                # Did the row actually get activation_code now?
+                db.refresh(r)
+                if r.activation_code:
+                    recovered += 1
+                elif applied:
+                    synced += 1  # provider responded but row still empty (unusual)
+            except Exception as exc:  # pragma: no cover - cron resilience
+                errors.append({"profileId": r.id, "orderNo": order_no, "error": str(exc)[:200]})
+
         db.commit()
         return {
             "attempted": attempted,
-            "synced": synced,
-            "errors": errors[:20],  # cap response size
+            "activeRefreshed": synced,
+            "placeholdersRecovered": recovered,
+            "errors": errors[:20],
             "errorCount": len(errors),
             "ranAt": utcnow(),
         }
