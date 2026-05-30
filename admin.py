@@ -245,7 +245,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         Looks up the parent order_item's provider_order_no, calls the provider's
         query_profiles, then sync_profiles to apply the result.
         """
-        from supabase_store import ESimProfile, OrderItem
+        from supabase_store import CustomerOrder, ESimProfile, OrderItem
         from esim_access_api import ProfileQueryRequest
         from dependencies import get_provider
         from sqlalchemy import select as _select
@@ -253,12 +253,14 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         if profile is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found")
         # Resolve providerOrderNo from the profile first, then fall back to the
-        # most recent OrderItem for this user.
+        # most recent OrderItem for this user. OrderItem links to user via the
+        # parent CustomerOrder (no direct OrderItem.user_id column).
         order_no = getattr(profile, "provider_order_no", None)
         if not order_no:
             order_item = db.scalar(
                 _select(OrderItem)
-                .where(OrderItem.user_id == profile.user_id)
+                .join(CustomerOrder, CustomerOrder.id == OrderItem.customer_order_id)
+                .where(CustomerOrder.user_id == profile.user_id)
                 .where(OrderItem.provider_order_no.is_not(None))
                 .order_by(OrderItem.created_at.desc())
                 .limit(1)
