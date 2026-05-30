@@ -1771,25 +1771,59 @@ def register_esim_access_routes(
             db.refresh(payment_attempt)
         profiles_synced = 0
         profile_sync_error: str | None = None
+        profile_sync_attempts = 0
         profile_sync_triggered = bool(order_item.provider_order_no)
+        # Race condition the provider used to put a user into: order_profiles
+        # returns OK with a providerOrderNo, but query_profiles right after may
+        # return empty or a profile with `ac` (activation code) still blank
+        # because the provider hasn't finished materializing it. Result was a
+        # placeholder profile that the user couldn't install — the "I tapped
+        # Activate and nothing happened" bug. Retry with backoff until either
+        # we get a non-empty activation_code or we've burned our budget.
         if profile_sync_triggered and hasattr(provider, "query_profiles"):
-            try:
-                provider_sync_response = await provider.query_profiles(ProfileQueryRequest(order_no=order_item.provider_order_no))
-                synced = store.sync_profiles(
-                    provider_sync_response.model_dump(by_alias=True, exclude_none=True),
-                    platform_code=payload.platform_code,
-                    platform_name=payload.platform_name,
-                    actor_phone=auth_user.phone,
-                )
-                profiles_synced = len(synced)
-                db.refresh(order_item)
-            except Exception as exc:  # pragma: no cover - best-effort sync hardening
-                db.rollback()
-                profile_sync_error = str(exc)
-                db.refresh(customer_order)
-                db.refresh(order_item)
-                if payment_attempt is not None:
-                    db.refresh(payment_attempt)
+            import asyncio as _asyncio
+            from supabase_store import ESimProfile as _ESimProfile
+            from sqlalchemy import select as _select
+            backoffs = (0.0, 2.0, 4.0)  # immediate, then 2s, then 4s — total ~6s worst case
+            for attempt_index, delay in enumerate(backoffs):
+                profile_sync_attempts = attempt_index + 1
+                if delay > 0:
+                    await _asyncio.sleep(delay)
+                try:
+                    provider_sync_response = await provider.query_profiles(
+                        ProfileQueryRequest(order_no=order_item.provider_order_no)
+                    )
+                    synced = store.sync_profiles(
+                        provider_sync_response.model_dump(by_alias=True, exclude_none=True),
+                        platform_code=payload.platform_code,
+                        platform_name=payload.platform_name,
+                        actor_phone=auth_user.phone,
+                    )
+                    profiles_synced = len(synced)
+                    db.refresh(order_item)
+                    # Did we actually get activation data for our profile?
+                    refreshed_profile = db.scalar(
+                        _select(_ESimProfile).where(_ESimProfile.order_item_id == order_item.id)
+                    )
+                    if refreshed_profile and refreshed_profile.activation_code:
+                        profile_sync_error = None
+                        break
+                    if attempt_index == len(backoffs) - 1:
+                        # Final attempt and we still have nothing — record it.
+                        profile_sync_error = (
+                            "Provider returned no activation data after "
+                            f"{profile_sync_attempts} attempts"
+                        )
+                except Exception as exc:  # pragma: no cover - best-effort sync hardening
+                    db.rollback()
+                    profile_sync_error = str(exc)
+                    db.refresh(customer_order)
+                    db.refresh(order_item)
+                    if payment_attempt is not None:
+                        db.refresh(payment_attempt)
+                    # Don't retry on hard errors — provider is unhealthy or we
+                    # have a code bug. Bail.
+                    break
 
         response_payload = {
             "provider": provider_response_payload,
@@ -1822,6 +1856,7 @@ def register_esim_access_routes(
                 "profileSync": {
                     "triggered": profile_sync_triggered,
                     "profilesSynced": profiles_synced,
+                    "attempts": profile_sync_attempts,
                     "error": profile_sync_error,
                 },
             },
