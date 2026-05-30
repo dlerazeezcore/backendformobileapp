@@ -1,0 +1,53 @@
+name: Refresh eSIM usage (cron)
+
+# Calls the backend's POST /api/v1/internal/cron/refresh-active-usage every
+# 30 minutes. The endpoint iterates every ACTIVE eSIM profile, queries the
+# provider for fresh usage (used MB / total MB / expires_at), and updates
+# the row. This keeps the home tab's "remaining GB / days left" accurate
+# without users having to pull-to-refresh.
+#
+# Required secret:
+#   CRON_TOKEN   — random string. Must match the CRON_TOKEN env var set on
+#                  the Koyeb service `backendformobileapp`. Generate with:
+#                    openssl rand -hex 32
+
+on:
+  schedule:
+    # Every 30 minutes. GitHub cron is UTC; the underlying job is timezone-
+    # agnostic anyway (just refreshes data from the provider).
+    - cron: "*/30 * * * *"
+  # Manual trigger for smoke-testing without waiting for the next 30-min slot.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Call cron endpoint
+        env:
+          CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
+        run: |
+          if [ -z "$CRON_TOKEN" ]; then
+            echo "::error::CRON_TOKEN secret is not set on this repo."
+            echo "Add it in Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          # -f makes curl exit non-zero on HTTP >=400 so the workflow turns red.
+          # -sS keeps stderr quiet on success but shows errors when they happen.
+          # Capture the response so we can pretty-print it in the run log.
+          HTTP_CODE=$(curl -sS -o /tmp/resp.json -w '%{http_code}' \
+            -X POST 'https://mean-lettie-corevia-0bd7cc91.koyeb.app/api/v1/internal/cron/refresh-active-usage' \
+            -H "X-Cron-Token: $CRON_TOKEN" \
+            -H 'Content-Type: application/json')
+          echo "HTTP $HTTP_CODE"
+          echo "--- response ---"
+          cat /tmp/resp.json | python3 -m json.tool || cat /tmp/resp.json
+          echo
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Cron call failed with HTTP $HTTP_CODE"
+            exit 1
+          fi
