@@ -1784,7 +1784,15 @@ def register_esim_access_routes(
             import asyncio as _asyncio
             from supabase_store import ESimProfile as _ESimProfile
             from sqlalchemy import select as _select
-            backoffs = (0.0, 2.0, 4.0)  # immediate, then 2s, then 4s — total ~6s worst case
+            # Backoff window extended from 6s to ~31s. The Iraqi-style 1-day
+            # plans the user keeps buying often need 10-20s on the provider's
+            # side before activation_code is materialized. The old 6s budget
+            # left placeholder profiles that the user couldn't install, and the
+            # provider then auto-cancelled them within 24h. Each attempt loop
+            # is also bounded by the route handler's overall request timeout
+            # (~60s), so we still leave ~25s of margin for the SQL writes +
+            # response serialization.
+            backoffs = (0.0, 2.0, 3.0, 5.0, 8.0, 13.0)  # ~31s worst case
             for attempt_index, delay in enumerate(backoffs):
                 profile_sync_attempts = attempt_index + 1
                 if delay > 0:
