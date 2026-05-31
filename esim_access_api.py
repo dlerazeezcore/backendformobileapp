@@ -1806,7 +1806,12 @@ def register_esim_access_routes(
             # is also bounded by the route handler's overall request timeout
             # (~60s), so we still leave ~25s of margin for the SQL writes +
             # response serialization.
-            backoffs = (0.0, 2.0, 3.0, 5.0, 8.0, 13.0)  # ~31s worst case
+            # ~86s worst case. The provider sometimes takes 30-60s to materialize
+            # an ICCID + activation code after orderProfile returns. The earlier
+            # 31s window was too short and frequently left users with empty
+            # placeholder profiles. The frontend ALSO polls /profiles/{id}/recover
+            # after checkout, so this is the first line of defense.
+            backoffs = (0.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, 34.0)
             for attempt_index, delay in enumerate(backoffs):
                 profile_sync_attempts = attempt_index + 1
                 if delay > 0:
@@ -2136,6 +2141,61 @@ def register_esim_access_routes(
         return {
             "provider": provider_response.model_dump(by_alias=True, exclude_none=True),
             "database": {"profilesSynced": len(profiles)},
+        }
+
+    @app.post("/api/v1/esim-access/profiles/{profile_id}/recover")
+    async def user_recover_profile(
+        profile_id: int,
+        provider: ESimAccessAPI = Depends(get_provider),
+        db: Session = Depends(get_db),
+        claims: dict[str, Any] = Depends(get_token_claims),
+    ) -> dict[str, Any]:
+        """User-facing per-profile sync.
+
+        Looks up the order_item's providerOrderNo, calls query_profiles, applies
+        sync_profiles. Returns {ok, hasActivationCode, hasIccid, appStatus}.
+        The detail screen polls this after checkout to fill in activation data
+        the moment the provider materializes it (faster than waiting for cron).
+        """
+        from supabase_store import ESimProfile, OrderItem
+        actor = require_active_subject(db, claims=claims)
+        target_user_id = _resolve_target_user_id(actor=actor, claims=claims, requested_user_id=None)
+        profile = db.scalar(
+            select(ESimProfile).where(
+                ESimProfile.id == profile_id,
+                ESimProfile.user_id == target_user_id,
+            )
+        )
+        if profile is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found")
+        order_no: str | None = None
+        if profile.order_item_id is not None:
+            oi = db.scalar(select(OrderItem).where(OrderItem.id == profile.order_item_id))
+            if oi is not None:
+                order_no = oi.provider_order_no
+        # If profile already has iccid, we can sync by iccid (faster + more reliable)
+        if profile.iccid:
+            resp = await provider.query_profiles(ProfileQueryRequest(iccid=profile.iccid))
+        elif order_no:
+            resp = await provider.query_profiles(ProfileQueryRequest(order_no=order_no))
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No iccid or provider_order_no available to recover",
+            )
+        SupabaseStore(db).sync_profiles(
+            resp.model_dump(by_alias=True, exclude_none=True),
+            platform_code="user-recover",
+            platform_name="User-initiated recovery",
+            actor_phone=str(claims.get("phone") or ""),
+        )
+        db.commit()
+        db.refresh(profile)
+        return {
+            "ok": True,
+            "hasActivationCode": bool(profile.activation_code),
+            "hasIccid": bool(profile.iccid),
+            "appStatus": profile.app_status,
         }
 
     @app.post(
