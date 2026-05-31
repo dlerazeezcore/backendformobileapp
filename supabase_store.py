@@ -2756,9 +2756,33 @@ class SupabaseStore:
         normalized_smdp = normalize_esim_status(provider_smdp_status)
         normalized_fallback = normalize_esim_status(fallback_status)
 
-        for normalized in (normalized_esim, normalized_fallback, normalized_smdp):
-            if _is_terminal_esim_status(normalized):
-                return normalized
+        # Terminal lifecycle is determined ONLY by `esimStatus` (the actual eSIM
+        # lifecycle) and a known-good `fallback_status`. **`smdpStatus` MUST NOT
+        # drive terminal status.** smdpStatus tracks the SM-DP+ provisioning
+        # slot — `RELEASED` means "pending download", `INSTALLATION` means
+        # "downloading", and `DELETED` means "the device has downloaded the
+        # profile and the SM-DP+ slot has been freed". `DELETED` is the *normal
+        # healthy post-install state*. We previously had a bug where
+        # smdpStatus=DELETED leaked into the terminal check and incorrectly
+        # marked working eSIMs as CANCELLED (one such profile: iccid ...6331).
+        if _is_terminal_esim_status(normalized_esim):
+            return normalized_esim
+        # Only honor a terminal fallback when the fresh provider response
+        # didn't give us a non-terminal esimStatus to override it. This is the
+        # recovery path for rows previously stuck on the old smdpStatus bug —
+        # the next sync sees esimStatus=GOT_RESOURCE/ONBOARDING/IN_USE and
+        # discards the stale CANCELLED fallback.
+        if not normalized_esim and _is_terminal_esim_status(normalized_fallback):
+            return normalized_fallback
+
+        # Once a profile has been confirmed installed AND activated (either by
+        # the app's INSTALL action or by provider download evidence), treat
+        # any non-terminal provider state as ACTIVE. The provider can lag
+        # 30-90 s before reporting IN_USE after first connection, and
+        # bouncing the user back to PROVIDER_WAITING for a working eSIM was
+        # confusing them.
+        if profile.installed and profile.activated_at is not None:
+            return "ACTIVE"
 
         provider_active = _has_provider_active_signal(
             provider_esim_status,

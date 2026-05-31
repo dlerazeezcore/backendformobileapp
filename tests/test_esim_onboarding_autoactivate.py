@@ -300,6 +300,118 @@ class EsimOnboardingAutoActivateTest(unittest.TestCase):
             self.assertEqual(row.order_item.item_status, "ACTIVE")
             self.assertEqual(row.order_item.customer_order.order_status, "ACTIVE")
 
+    def test_smdp_deleted_after_install_does_not_cancel_active_profile(self) -> None:
+        """Regression test for the iccid ...6331 bug.
+
+        After the user successfully installs an eSIM, the provider transitions
+        ``smdpStatus`` to ``DELETED`` because the SM-DP+ has released the
+        provisioning slot — the device has the profile, the slot is no longer
+        needed. ``esimStatus`` stays healthy (e.g. ``GOT_RESOURCE`` or
+        ``IN_USE``). The resolver must NOT treat ``smdpStatus=DELETED`` as a
+        terminal lifecycle signal.
+        """
+        profile_id = self._seed_profile()
+        # First sync: provider hands back healthy state, user installs.
+        with self.session_factory() as session:
+            store = SupabaseStore(session)
+            store.sync_profiles(
+                {
+                    "obj": {
+                        "esimList": [
+                            {
+                                "orderNo": "ORD-ONBOARD-1",
+                                "esimTranNo": "ESIM-ONBOARD-1",
+                                "iccid": "ICCID-ONBOARD-1",
+                                "ac": "LPA:1$smdp.example$AC-CODE",
+                                "smdpStatus": "INSTALLATION",
+                                "esimStatus": "GOT_RESOURCE",
+                                "installationTime": "2026-05-31T18:32:16+0000",
+                                "eid": "89043052010008887024021623912688",
+                                "totalDuration": 7,
+                            }
+                        ]
+                    }
+                }
+            )
+            session.commit()
+            row = session.get(ESimProfile, profile_id)
+            self.assertEqual(row.app_status, "ACTIVE")
+            self.assertTrue(row.installed)
+
+        # Second sync (typical post-install state): the provider has freed
+        # the SM-DP+ slot. esimStatus stays healthy, smdpStatus becomes
+        # DELETED. The profile MUST remain ACTIVE.
+        with self.session_factory() as session:
+            store = SupabaseStore(session)
+            store.sync_profiles(
+                {
+                    "obj": {
+                        "esimList": [
+                            {
+                                "orderNo": "ORD-ONBOARD-1",
+                                "esimTranNo": "ESIM-ONBOARD-1",
+                                "iccid": "ICCID-ONBOARD-1",
+                                "ac": "LPA:1$smdp.example$AC-CODE",
+                                "smdpStatus": "DELETED",
+                                "esimStatus": "GOT_RESOURCE",
+                                "totalDuration": 7,
+                            }
+                        ]
+                    }
+                }
+            )
+            session.commit()
+            row = session.get(ESimProfile, profile_id)
+            self.assertEqual(row.app_status, "ACTIVE", "smdpStatus=DELETED must NOT cancel an installed eSIM")
+            self.assertIsNone(row.canceled_at)
+            self.assertTrue(row.installed)
+
+    def test_stale_cancelled_fallback_recovers_when_provider_says_healthy(self) -> None:
+        """Recovery path for profiles already stuck on the old smdpStatus bug.
+
+        The buggy resolver flipped some profiles to CANCELLED based on
+        smdpStatus=DELETED. After the fix lands, the very next provider sync
+        (esimStatus=GOT_RESOURCE/IN_USE etc.) must discard the stale CANCELLED
+        fallback and restore the row to ACTIVE.
+        """
+        profile_id = self._seed_profile()
+        # Simulate the buggy state: row was wrongly marked CANCELLED but the
+        # device has it installed + activated.
+        with self.session_factory() as session:
+            row = session.get(ESimProfile, profile_id)
+            row.iccid = "ICCID-ONBOARD-1"
+            row.esim_tran_no = "ESIM-ONBOARD-1"
+            row.app_status = "CANCELLED"
+            row.installed = True
+            row.installed_at = utcnow()
+            row.activated_at = utcnow()
+            row.provider_status = "DELETED"
+            session.commit()
+
+        # Next sync from the provider: healthy esimStatus, smdpStatus=DELETED.
+        with self.session_factory() as session:
+            store = SupabaseStore(session)
+            store.sync_profiles(
+                {
+                    "obj": {
+                        "esimList": [
+                            {
+                                "orderNo": "ORD-ONBOARD-1",
+                                "esimTranNo": "ESIM-ONBOARD-1",
+                                "iccid": "ICCID-ONBOARD-1",
+                                "ac": "LPA:1$smdp.example$AC-CODE",
+                                "smdpStatus": "DELETED",
+                                "esimStatus": "GOT_RESOURCE",
+                                "totalDuration": 7,
+                            }
+                        ]
+                    }
+                }
+            )
+            session.commit()
+            row = session.get(ESimProfile, profile_id)
+            self.assertEqual(row.app_status, "ACTIVE", "Resolver must recover stuck CANCELLED rows")
+
     def test_provider_download_evidence_activates_installed_profile(self) -> None:
         profile_id = self._seed_profile()
         with self.session_factory() as session:
