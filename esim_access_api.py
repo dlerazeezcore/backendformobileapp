@@ -1071,6 +1071,19 @@ class ESimAccessResponse(Model, Generic[ResultT]):
 
 
 class AsyncRateLimiter:
+    """Spread provider calls across a per-second budget.
+
+    The earlier version held ``self.lock`` across ``asyncio.sleep`` which
+    serialized ALL concurrent provider calls behind a single mutex. Under
+    load (multiple users polling /recover + cron + /usage/sync/my), this
+    made the backend appear frozen: every provider call queued up waiting
+    for the lock to release, holding their DB sessions during the wait.
+
+    The fixed version computes the next allowed timestamp atomically inside
+    the lock, then sleeps OUTSIDE the lock. Concurrent acquires can then
+    overlap their sleeps and proceed in parallel up to the per-second cap.
+    """
+
     def __init__(self, per_second: float) -> None:
         self.per_second = per_second
         self.lock = asyncio.Lock()
@@ -1083,11 +1096,14 @@ class AsyncRateLimiter:
         loop = asyncio.get_running_loop()
         async with self.lock:
             now = loop.time()
-            wait_for = self.next_allowed - now
-            if wait_for > 0:
-                await asyncio.sleep(wait_for)
-                now = loop.time()
-            self.next_allowed = max(self.next_allowed, now) + interval
+            # Reserve our slot relative to the latest reservation. This means
+            # 16 concurrent calls at 8/sec finish in ~2s instead of ~16s
+            # (the old "hold-lock-while-sleeping" path).
+            scheduled = max(self.next_allowed, now)
+            self.next_allowed = scheduled + interval
+        wait_for = scheduled - loop.time()
+        if wait_for > 0:
+            await asyncio.sleep(wait_for)
 
 
 class ESimAccessAPI:
@@ -1804,6 +1820,21 @@ def register_esim_access_routes(
     ) -> dict[str, Any]:
         auth_user = require_active_subject(db, claims=claims, subject_type="user")
         assert isinstance(auth_user, AppUser)
+        # Snapshot the user fields we'll need AFTER detaching the session,
+        # then release the DB pool slot before the slow provider call. With
+        # the default pool size of 8 and 4 overflow, holding sessions across
+        # a 2-5 s provider round-trip drains capacity fast — every other
+        # request blocks on pool checkout. Reopen lazily for the write.
+        user_snapshot = {
+            "phone": auth_user.phone,
+            "name": auth_user.name,
+            "email": auth_user.email,
+            "status": auth_user.status,
+            "is_loyalty": auth_user.is_loyalty,
+            "notes": auth_user.notes,
+        }
+        auth_user_phone = auth_user.phone
+        db.close()
         provider_response = await provider.order_profiles(payload.provider_request)
         store = SupabaseStore(db)
         resolved_payment_method, resolved_payment_provider = _resolve_payment_method_provider(payload)
@@ -1811,14 +1842,7 @@ def register_esim_access_routes(
         provider_response_payload = provider_response.model_dump(by_alias=True, exclude_none=True)
         try:
             customer_order, order_item = store.save_managed_order(
-                user_data={
-                    "phone": auth_user.phone,
-                    "name": auth_user.name,
-                    "email": auth_user.email,
-                    "status": auth_user.status,
-                    "is_loyalty": auth_user.is_loyalty,
-                    "notes": auth_user.notes,
-                },
+                user_data=user_snapshot,
                 platform_code=payload.platform_code,
                 platform_name=payload.platform_name,
                 order_request=provider_request_payload,
@@ -1876,22 +1900,32 @@ def register_esim_access_routes(
             from supabase_store import ESimProfile as _ESimProfile
             from sqlalchemy import select as _select
             backoffs = (0.0,)
+            order_item_id = order_item.id
+            provider_order_no_snapshot = order_item.provider_order_no
             for attempt_index, delay in enumerate(backoffs):
                 profile_sync_attempts = attempt_index + 1
                 if delay > 0:
                     await _asyncio.sleep(delay)
                 try:
+                    # Release the pool slot during the provider round-trip,
+                    # same pattern as /profiles/{id}/recover.
+                    db.close()
                     provider_sync_response = await provider.query_profiles(
-                        ProfileQueryRequest(order_no=order_item.provider_order_no)
+                        ProfileQueryRequest(order_no=provider_order_no_snapshot)
                     )
                     synced = store.sync_profiles(
                         provider_sync_response.model_dump(by_alias=True, exclude_none=True),
                         platform_code=payload.platform_code,
                         platform_name=payload.platform_name,
-                        actor_phone=auth_user.phone,
+                        actor_phone=auth_user_phone,
                     )
                     profiles_synced = len(synced)
-                    db.refresh(order_item)
+                    # Refetch from a fresh session — the original order_item
+                    # is detached after db.close().
+                    order_item = db.scalar(
+                        _select(OrderItem).where(OrderItem.id == order_item_id)
+                    )
+                    customer_order = order_item.customer_order if order_item is not None else customer_order
                     # Did we actually get activation data for our profile?
                     refreshed_profile = db.scalar(
                         _select(_ESimProfile).where(_ESimProfile.order_item_id == order_item.id)
@@ -1906,12 +1940,18 @@ def register_esim_access_routes(
                             f"{profile_sync_attempts} attempts"
                         )
                 except Exception as exc:  # pragma: no cover - best-effort sync hardening
-                    db.rollback()
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
                     profile_sync_error = str(exc)
-                    db.refresh(customer_order)
-                    db.refresh(order_item)
-                    if payment_attempt is not None:
-                        db.refresh(payment_attempt)
+                    # The original ORM objects are detached after db.close().
+                    # Refetch by primary key from a fresh session.
+                    order_item = db.scalar(
+                        _select(OrderItem).where(OrderItem.id == order_item_id)
+                    )
+                    if order_item is not None:
+                        customer_order = order_item.customer_order
                     # Don't retry on hard errors — provider is unhealthy or we
                     # have a code bug. Bail.
                     break

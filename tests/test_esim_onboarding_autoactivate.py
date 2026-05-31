@@ -234,7 +234,14 @@ class EsimOnboardingAutoActivateTest(unittest.TestCase):
         self.assertEqual(normalize_esim_status("ONBOARDING"), "ACTIVE")
         self.assertEqual(normalize_esim_status("onboarding"), "ACTIVE")
         self.assertEqual(normalize_esim_status("IN_USE"), "ACTIVE")
-        self.assertEqual(normalize_esim_status("ONBOARD"), "PROVIDER_WAITING")
+        # Regression: provider sometimes returns the noun forms "Onboard" /
+        # "Onboarded" interchangeably with the gerund "Onboarding". All three
+        # mean "carrier handshake started / first connection seen" and must
+        # normalize identically. Before the fix, "Onboard" mapped to
+        # PROVIDER_WAITING which left users' working eSIMs stuck waiting.
+        self.assertEqual(normalize_esim_status("Onboard"), "ACTIVE")
+        self.assertEqual(normalize_esim_status("ONBOARD"), "ACTIVE")
+        self.assertEqual(normalize_esim_status("ONBOARDED"), "ACTIVE")
 
     # --- sync_profiles + install-gated side-effects -------------------------
 

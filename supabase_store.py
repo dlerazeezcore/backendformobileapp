@@ -88,13 +88,16 @@ _ESIM_STATUS_ALIASES: dict[str, str] = {
     "NEW": "INACTIVE",
     "INSTALLED": "INACTIVE",      # downloaded to the device but not activated
     "INSTALLATION": "INACTIVE",   # eSIM Access transitional status during install
-    "ONBOARD": PROVIDER_WAITING_STATUS,
-    "ONBOARDED": PROVIDER_WAITING_STATUS,
     "DISABLED": "SUSPENDED",      # provider variant — user/carrier paused the line
     "DELETED": "CANCELLED",       # provider variant for hard-deleted profile
-    # Provider-active states are only allowed to become app-active after the
-    # app has a confirmed install signal. Until then they serialize as
-    # provider_waiting.
+    # Provider-active states (first carrier handshake / data session live)
+    # are only treated as app-active after install is confirmed; the
+    # resolver guards this. eSIM Access uses three spellings interchangeably
+    # for the post-install "carrier sees the device" state — keep them all
+    # mapped to ACTIVE so a provider that returns the noun form "Onboard"
+    # behaves identically to the gerund "Onboarding".
+    "ONBOARD": "ACTIVE",
+    "ONBOARDED": "ACTIVE",
     "ONBOARDING": "ACTIVE",
     "IN_USE": "ACTIVE",
     "ENABLED": "ACTIVE",
@@ -1006,14 +1009,25 @@ def create_database(database_url: str) -> sessionmaker[Session]:
             }
         else:
             if is_supabase_session_pooler:
+                # Session pooler keeps a connection sticky to a transaction.
+                # We must use very few app-side connections to avoid stealing
+                # capacity from Supabase's pool.
                 default_pool_size = 1
                 default_max_overflow = 0
             elif is_supabase_transaction_pooler:
-                default_pool_size = 2
-                default_max_overflow = 0
+                # Transaction pooler multiplexes — many backend connections
+                # safely share few Postgres backends. Previous default was 2
+                # which was MUCH too tight: with the detail-screen recover
+                # poll (one connection ≤500ms) + pull-to-refresh
+                # /usage/sync/my (another) + any admin work, the third
+                # concurrent request blocked on pool checkout-timeout. That
+                # was the recurring "backend froze" symptom. 8 + 4 overflow
+                # gives 12 slots, still well under the pooler's tenant cap.
+                default_pool_size = 8
+                default_max_overflow = 4
             else:
-                default_pool_size = 2
-                default_max_overflow = 1
+                default_pool_size = 4
+                default_max_overflow = 2
             default_pool_timeout = 10 if is_supabase_database else 15
             engine_options = {
                 "pool_size": _read_int_env("DATABASE_POOL_SIZE", default_pool_size, minimum=1),
