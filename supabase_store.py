@@ -88,6 +88,8 @@ _ESIM_STATUS_ALIASES: dict[str, str] = {
     "NEW": "INACTIVE",
     "INSTALLED": "INACTIVE",      # downloaded to the device but not activated
     "INSTALLATION": "INACTIVE",   # eSIM Access transitional status during install
+    "ONBOARD": PROVIDER_WAITING_STATUS,
+    "ONBOARDED": PROVIDER_WAITING_STATUS,
     "DISABLED": "SUSPENDED",      # provider variant — user/carrier paused the line
     "DELETED": "CANCELLED",       # provider variant for hard-deleted profile
     # Provider-active states are only allowed to become app-active after the
@@ -131,6 +133,8 @@ _TERMINAL_ESIM_STATUSES = {"CANCELLED", "EXPIRED", "REVOKED", "REFUNDED"}
 _PROVIDER_INSTALL_SIGNAL_STATUSES = {
     "INSTALLATION",
     "INSTALLED",
+    "ONBOARD",
+    "ONBOARDED",
     "ENABLED",
     "ONBOARDING",
     "IN_USE",
@@ -2694,6 +2698,38 @@ class SupabaseStore:
         value = custom_fields.get("providerEsimStatus") or custom_fields.get("provider_esim_status")
         return str(value) if value is not None else None
 
+    @staticmethod
+    def _provider_install_evidence(payload: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {}
+        fields = {
+            "downloadTime": payload.get("downloadTime") or payload.get("download_time") or payload.get("downloadedTime"),
+            "eid": payload.get("eid") or payload.get("EID"),
+            "deviceType": payload.get("deviceType") or payload.get("device_type"),
+            "deviceBrand": payload.get("deviceBrand") or payload.get("device_brand"),
+            "deviceModel": payload.get("deviceModel") or payload.get("device_model"),
+        }
+        return {key: value for key, value in fields.items() if value not in (None, "")}
+
+    @staticmethod
+    def _provider_downloaded_at(payload: dict[str, Any]) -> datetime | None:
+        evidence = SupabaseStore._provider_install_evidence(payload)
+        value = evidence.get("downloadTime")
+        return parse_provider_datetime(str(value)) if value is not None else None
+
+    def _apply_provider_install_evidence(self, profile: ESimProfile, payload: dict[str, Any]) -> bool:
+        evidence = self._provider_install_evidence(payload)
+        if not evidence:
+            return False
+        if not profile.installed:
+            profile.installed = True
+            profile.installed_at = self._provider_downloaded_at(payload) or utcnow()
+            return True
+        if profile.installed_at is None:
+            profile.installed_at = self._provider_downloaded_at(payload) or utcnow()
+            return True
+        return False
+
     def _resolve_profile_app_status(
         self,
         profile: ESimProfile,
@@ -2905,6 +2941,7 @@ class SupabaseStore:
             profile.qr_code_url = item.get("qrCodeUrl")
             profile.install_url = item.get("shortUrl")
             profile.provider_status = item.get("smdpStatus")
+            self._apply_provider_install_evidence(profile, item)
             profile.app_status = self._resolve_profile_app_status(
                 profile,
                 provider_esim_status=status_after,
@@ -2939,6 +2976,7 @@ class SupabaseStore:
                     "checkoutSnapshot": (order_item.custom_fields or {}).get("checkoutSnapshot"),
                     "providerEsimStatus": status_after,
                     "providerSmdpStatus": profile.provider_status,
+                    "providerInstallEvidence": self._provider_install_evidence(item),
                     "activationCode": profile.activation_code,
                     "qrCodeUrl": profile.qr_code_url,
                     "installUrl": profile.install_url,
@@ -3241,6 +3279,7 @@ class SupabaseStore:
         )
         if profile is not None and (content.get("esimStatus") or content.get("smdpStatus")):
             profile.provider_status = content.get("smdpStatus") or profile.provider_status
+            self._apply_provider_install_evidence(profile, content)
             profile.app_status = self._resolve_profile_app_status(
                 profile,
                 provider_esim_status=content.get("esimStatus"),
@@ -3252,6 +3291,7 @@ class SupabaseStore:
                 {
                     "providerEsimStatus": content.get("esimStatus"),
                     "providerSmdpStatus": profile.provider_status,
+                    "providerInstallEvidence": self._provider_install_evidence(content),
                 },
             )
             profile.expires_at = parse_provider_datetime(content.get("expiredTime")) or profile.expires_at

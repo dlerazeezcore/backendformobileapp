@@ -234,6 +234,7 @@ class EsimOnboardingAutoActivateTest(unittest.TestCase):
         self.assertEqual(normalize_esim_status("ONBOARDING"), "ACTIVE")
         self.assertEqual(normalize_esim_status("onboarding"), "ACTIVE")
         self.assertEqual(normalize_esim_status("IN_USE"), "ACTIVE")
+        self.assertEqual(normalize_esim_status("ONBOARD"), "PROVIDER_WAITING")
 
     # --- sync_profiles + install-gated side-effects -------------------------
 
@@ -298,6 +299,42 @@ class EsimOnboardingAutoActivateTest(unittest.TestCase):
             self.assertIsNotNone(row.expires_at)
             self.assertEqual(row.order_item.item_status, "ACTIVE")
             self.assertEqual(row.order_item.customer_order.order_status, "ACTIVE")
+
+    def test_provider_download_evidence_marks_installed_but_not_active(self) -> None:
+        profile_id = self._seed_profile()
+        with self.session_factory() as session:
+            store = SupabaseStore(session)
+            store.sync_profiles(
+                {
+                    "obj": {
+                        "esimList": [
+                            {
+                                "orderNo": "ORD-ONBOARD-1",
+                                "esimTranNo": "ESIM-ONBOARD-1",
+                                "iccid": "ICCID-ONBOARD-1",
+                                "ac": "LPA:1$smdp.example$AC-CODE",
+                                "smdpStatus": "INSTALLATION",
+                                "esimStatus": "ONBOARD",
+                                "downloadTime": "2026-05-31 21:04:00",
+                                "eid": "89043052010008887024021623912688",
+                                "deviceBrand": "Apple",
+                                "deviceModel": "iPhone 16e",
+                                "totalDuration": 7,
+                            }
+                        ]
+                    }
+                }
+            )
+            session.commit()
+            row = session.get(ESimProfile, profile_id)
+            self.assertEqual(row.app_status, "PROVIDER_WAITING")
+            self.assertTrue(row.installed)
+            self.assertIsNotNone(row.installed_at)
+            self.assertIsNone(row.activated_at)
+            self.assertIsNone(row.expires_at)
+            self.assertEqual(row.order_item.item_status, "PROVIDER_WAITING")
+            self.assertEqual(row.order_item.customer_order.order_status, "PROVIDER_WAITING")
+            self.assertEqual(row.custom_fields["providerInstallEvidence"]["eid"], "89043052010008887024021623912688")
 
     # --- recover endpoint response -----------------------------------------
 

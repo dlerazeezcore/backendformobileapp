@@ -139,7 +139,7 @@ def _canonical_lifecycle_status(
 
     if raw in {"expired", "cancelled", "canceled", "revoked", "refunded", "voided", "closed"}:
         return "expired"
-    if raw in {"provider_waiting", "provider-waiting", "provider waiting"}:
+    if raw in {"provider_waiting", "provider-waiting", "provider waiting", "onboard", "onboarded"}:
         return "provider_waiting"
     if raw in {"booked", "got_resource", "released", "pending_install", "pending", "inactive", "created"} or not raw:
         return "provider_waiting" if installed else "inactive"
@@ -1624,7 +1624,7 @@ def register_esim_access_routes(
                 normalized_status = ""
             if normalized_status in {"booked", "got_resource", "released", "pending_install", "pending"}:
                 normalized_status = "inactive"
-            if normalized_status in {"provider-waiting", "provider waiting", "waiting"}:
+            if normalized_status in {"provider-waiting", "provider waiting", "waiting", "onboard", "onboarded"}:
                 normalized_status = "provider_waiting"
             if normalized_status in {"cancelled", "canceled", "revoked", "refunded", "voided", "closed"}:
                 normalized_status = "expired"
