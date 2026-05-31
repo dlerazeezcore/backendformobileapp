@@ -291,7 +291,55 @@ def _extract_included_countries(package_row: dict[str, Any]) -> list[dict[str, s
     return countries
 
 
-def _augment_package_list_response(provider_payload: dict[str, Any]) -> dict[str, Any]:
+def _is_daily_unlimited_package(item: dict[str, Any]) -> bool:
+    """Decide whether a provider package is a 1-day unlimited plan.
+
+    Product rule (set by the owner): the catalog must not surface 1-day
+    unlimited plans. Multi-day unlimited and all data-capped plans (including
+    1-day capped) stay visible. Top-up packages are exempt — we never filter
+    them here.
+
+    eSIM Access can report duration under several field names depending on
+    endpoint and package variant; check all the ones we've actually seen.
+    A package is "unlimited" when there's no positive totalDataMb/totalVolume.
+    """
+    days_candidates = (
+        item.get("validityDays"),
+        item.get("duration"),
+        item.get("totalDuration"),
+        item.get("periodNum"),
+        item.get("days"),
+    )
+    days: int | None = None
+    for candidate in days_candidates:
+        if candidate is None:
+            continue
+        try:
+            days = int(candidate)
+            break
+        except (TypeError, ValueError):
+            continue
+    if days != 1:
+        return False
+    total_candidates = (
+        item.get("totalDataMb"),
+        item.get("totalVolume"),
+        item.get("totalData"),
+    )
+    for candidate in total_candidates:
+        try:
+            if candidate is not None and int(candidate) > 0:
+                return False
+        except (TypeError, ValueError):
+            continue
+    return True
+
+
+def _augment_package_list_response(
+    provider_payload: dict[str, Any],
+    *,
+    drop_daily_unlimited: bool = False,
+) -> dict[str, Any]:
     payload = dict(provider_payload)
     obj = payload.get("obj")
     if not isinstance(obj, dict):
@@ -302,6 +350,10 @@ def _augment_package_list_response(provider_payload: dict[str, Any]) -> dict[str
     enhanced: list[dict[str, Any]] = []
     for raw_item in package_list:
         item = dict(raw_item) if isinstance(raw_item, dict) else {}
+        if drop_daily_unlimited and _is_daily_unlimited_package(item):
+            # Owner-requested filter: 1-day unlimited plans must not appear in
+            # the catalog (top-up endpoints set drop_daily_unlimited=False).
+            continue
         included = _extract_included_countries(item)
         if included:
             item["includedCountries"] = included
@@ -1705,7 +1757,15 @@ def register_esim_access_routes(
     ) -> dict[str, Any]:
         provider_response = await provider.get_packages(payload)
         raw_payload = provider_response.model_dump(by_alias=True, exclude_none=True)
-        return _augment_package_list_response(raw_payload)
+        # Filter 1-day unlimited from the public catalog only. Top-up queries
+        # (type=TOPUP + iccid) keep every package the provider returns —
+        # otherwise we'd hide top-up SKUs that legitimately have validityDays
+        # = 1 unlimited shape on the provider side.
+        is_topup_query = (payload.type or "").strip().upper() == "TOPUP" or bool(payload.iccid)
+        return _augment_package_list_response(
+            raw_payload,
+            drop_daily_unlimited=not is_topup_query,
+        )
 
     @app.post("/api/v1/esim-access/orders")
     async def create_order(
@@ -2191,11 +2251,25 @@ def register_esim_access_routes(
         )
         db.commit()
         db.refresh(profile)
+        # Return enough state that the frontend can short-circuit its polling
+        # loop without a second round-trip through /usage/sync/my. The detail
+        # screen treats `appStatus == "ACTIVE"` as the signal to navigate to
+        # the home tab — the moment the provider reports ONBOARDING/IN_USE,
+        # the new normalize alias + _apply_active_side_effects has already
+        # flipped this row to ACTIVE.
         return {
             "ok": True,
             "hasActivationCode": bool(profile.activation_code),
             "hasIccid": bool(profile.iccid),
             "appStatus": profile.app_status,
+            "providerStatus": profile.provider_status,
+            "installed": bool(profile.installed),
+            "activatedAt": (
+                profile.activated_at.isoformat() if profile.activated_at is not None else None
+            ),
+            "expiresAt": (
+                profile.expires_at.isoformat() if profile.expires_at is not None else None
+            ),
         }
 
     @app.post(

@@ -326,10 +326,21 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         # the user just installed (they're still INACTIVE in our DB until
         # the provider reports IN_USE).
         if source == "cron":
+            # ACTIVE profiles get a usage refresh. Plus a defensive sweep for
+            # any profile whose provider_status says ONBOARDING/IN_USE (the
+            # first-connection states that should auto-promote to ACTIVE).
+            # The ONBOARDING alias + _apply_active_side_effects already fires
+            # on every webhook/recover, so this is just belt-and-suspenders for
+            # drift / missed webhooks.
             active_rows = db.scalars(
                 _select(ESimProfile)
-                .where(func.upper(ESimProfile.app_status) == "ACTIVE")
                 .where(ESimProfile.iccid.is_not(None))
+                .where(
+                    or_(
+                        func.upper(ESimProfile.app_status) == "ACTIVE",
+                        func.upper(ESimProfile.provider_status).in_(("ONBOARDING", "IN_USE")),
+                    )
+                )
             ).all()
         else:
             # admin/manual: include anything with an ICCID that isn't a hard-dead status

@@ -85,6 +85,17 @@ _ESIM_STATUS_ALIASES: dict[str, str] = {
     "RELEASED": "INACTIVE",       # alias some providers use
     "NEW": "INACTIVE",
     "INSTALLED": "INACTIVE",      # downloaded to the device but not activated
+    "INSTALLATION": "INACTIVE",   # eSIM Access transitional status during install
+    "DISABLED": "SUSPENDED",      # provider variant — user/carrier paused the line
+    "DELETED": "CANCELLED",       # provider variant for hard-deleted profile
+    # eSIM Access charges credit on first connection. ONBOARDING is the
+    # transient state right after the user's device hits the carrier for the
+    # first time — the bundle clock has started and credit has been spent, so
+    # for app UX purposes this counts as ACTIVE. Promoting here also drives
+    # the auto-side-effects in _apply_active_side_effects (installed=true,
+    # activated_at, expires_at) so the frontend's "status===active iff
+    # installed && activated_at" rule resolves on the very next sync.
+    "ONBOARDING": "ACTIVE",
     "IN_USE": "ACTIVE",
     "ENABLED": "ACTIVE",
     "ACTIVE": "ACTIVE",
@@ -2655,6 +2666,69 @@ class SupabaseStore:
         self.session.flush()
         return profile
 
+    def _apply_active_side_effects(
+        self,
+        profile: ESimProfile,
+        *,
+        source: str,
+        actor_phone: str | None = None,
+        platform_code: str | None = None,
+    ) -> bool:
+        """If the profile just normalized to ACTIVE, mirror the user-tapped
+        "activate" side-effects so the frontend's `status === 'active' iff
+        installed && activated_at` rule resolves on the very next read.
+
+        Called from sync_profiles, sync_usage_records, and record_webhook
+        right after `profile.app_status` is assigned. Returns True when
+        side-effects were actually applied (i.e. a state transition happened),
+        so the caller can decide whether to emit an extra lifecycle event.
+
+        Idempotent: safe to call multiple times — only fills in fields that
+        are still None/False.
+        """
+        if (profile.app_status or "").upper() != "ACTIVE":
+            return False
+        # If everything is already in the activated shape, nothing to do.
+        already_active = (
+            profile.installed
+            and profile.activated_at is not None
+            and (
+                profile.expires_at is not None
+                or not profile.validity_days
+            )
+        )
+        if already_active:
+            return False
+        now = utcnow()
+        profile.installed = True
+        if profile.installed_at is None:
+            profile.installed_at = now
+        if profile.activated_at is None:
+            profile.activated_at = now
+        if profile.validity_days and profile.expires_at is None:
+            profile.expires_at = profile.activated_at + timedelta(days=profile.validity_days)
+        order_item = profile.order_item
+        if order_item is not None:
+            order_item.item_status = "ACTIVE"
+            if order_item.customer_order is not None:
+                order_item.customer_order.order_status = "ACTIVE"
+        self.add_event(
+            customer_order=order_item.customer_order if order_item is not None else None,
+            order_item=order_item,
+            profile=profile,
+            service_type="esim",
+            event_type="AUTO_ACTIVATED_FROM_PROVIDER",
+            source=source,
+            actor_type="system",
+            actor_phone=actor_phone,
+            platform_code=platform_code,
+            status_before=None,
+            status_after="ACTIVE",
+            note="Provider reported ONBOARDING/IN_USE — auto-promoted to ACTIVE.",
+            payload={},
+        )
+        return True
+
     def sync_profiles(
         self,
         provider_response: dict[str, Any],
@@ -2812,6 +2886,18 @@ class SupabaseStore:
                 note="Profile synced from provider query",
                 payload=item,
             )
+            # If the provider just told us this profile is ONBOARDING/IN_USE
+            # (both normalize to ACTIVE), flip the install/activate flags so
+            # the user's home tab reflects the new state immediately. This is
+            # the fix for the "stuck on NOT ACTIVATED" symptom — without it,
+            # the provider could report IN_USE for hours and the frontend rule
+            # would still keep the eSIM in the inactive tab.
+            self._apply_active_side_effects(
+                profile,
+                source="provider_sync",
+                actor_phone=actor_phone,
+                platform_code=platform_code,
+            )
             result.append(profile)
         self.session.commit()
         return result
@@ -2906,6 +2992,15 @@ class SupabaseStore:
                 status_after=None if used_data_mb is None else str(used_data_mb),
                 note="Profile usage synced from provider usage query",
                 payload=record,
+            )
+            # Above we already set `profile.app_status = profile.app_status or
+            # "ACTIVE"` when there was non-zero usage; mirror the install/
+            # activate side-effects here too.
+            self._apply_active_side_effects(
+                profile,
+                source="provider_usage_sync",
+                actor_phone=actor_phone,
+                platform_code=None,
             )
             result.append(profile)
         self.session.commit()
@@ -3034,17 +3129,33 @@ class SupabaseStore:
         if order_item is None and profile is not None:
             order_item = profile.order_item
         customer_order = order_item.customer_order if order_item is not None else None
+        normalized_status = (
+            normalize_esim_status(content.get("esimStatus")) if content.get("esimStatus") else None
+        )
         if profile is not None and content.get("esimStatus"):
-            profile.app_status = normalize_esim_status(content["esimStatus"]) or content["esimStatus"]
+            profile.app_status = normalized_status or content["esimStatus"]
             profile.provider_status = content.get("smdpStatus")
             profile.expires_at = parse_provider_datetime(content.get("expiredTime")) or profile.expires_at
             profile.last_provider_sync_at = utcnow()
+        # Use the *normalized* status for item/order tracking so an
+        # ONBOARDING/IN_USE webhook flips the order to ACTIVE consistently.
+        order_status_raw = normalized_status or content.get("orderStatus")
         if order_item is not None and (content.get("esimStatus") or content.get("orderStatus")):
-            order_item.item_status = content.get("esimStatus") or content.get("orderStatus")
+            order_item.item_status = order_status_raw or order_item.item_status
             order_item.provider_status = content.get("smdpStatus")
             order_item.last_provider_sync_at = utcnow()
         if customer_order is not None and (content.get("esimStatus") or content.get("orderStatus")):
-            customer_order.order_status = content.get("esimStatus") or content.get("orderStatus")
+            customer_order.order_status = order_status_raw or customer_order.order_status
+        # Push-driven activation: when the webhook flips us to ACTIVE, also
+        # set installed/activated_at so the frontend's lifecycle rule sees the
+        # eSIM as active without waiting for the next user pull-to-refresh.
+        if profile is not None:
+            self._apply_active_side_effects(
+                profile,
+                source="provider_webhook",
+                actor_phone=None,
+                platform_code="provider_webhook",
+            )
         event = self.add_event(
             customer_order=customer_order,
             order_item=order_item,
