@@ -132,18 +132,20 @@ def _canonical_lifecycle_status(
         )
         if normalized_bundle_expires_at <= now_at:
             return "expired"
-    elif activated_at is not None and expires_at is not None:
+    elif installed and activated_at is not None and expires_at is not None:
         normalized_expires_at = expires_at if expires_at.tzinfo is not None else expires_at.replace(tzinfo=timezone.utc)
         if normalized_expires_at <= now_at:
             return "expired"
 
     if raw in {"expired", "cancelled", "canceled", "revoked", "refunded", "voided", "closed"}:
         return "expired"
+    if raw in {"provider_waiting", "provider-waiting", "provider waiting"}:
+        return "provider_waiting"
     if raw in {"booked", "got_resource", "released", "pending_install", "pending", "inactive", "created"} or not raw:
-        return "inactive"
-    if raw in {"active", "installed", "suspended"}:
-        return "active" if installed and activated_at is not None else "inactive"
-    return "inactive"
+        return "provider_waiting" if installed else "inactive"
+    if raw in {"active", "installed", "suspended", "enabled", "onboarding", "in_use"}:
+        return "active" if installed and activated_at is not None else "provider_waiting"
+    return "provider_waiting" if installed else "inactive"
 
 
 def _format_number_as_string(value: float | int | str | None, fallback: str) -> str:
@@ -527,11 +529,11 @@ def _serialize_profile(row: ESimProfile | ProfileInventoryRow, *, now: datetime)
     # User-facing countdown follows bundle validity window:
     # start only after activation and count validity_days from activated_at.
     bundle_expires_at: datetime | None = None
-    if activated_at is not None and row.validity_days and row.validity_days > 0:
+    if installed_flag and activated_at is not None and row.validity_days and row.validity_days > 0:
         bundle_expires_at = activated_at + timedelta(days=row.validity_days)
     effective_expires_at = bundle_expires_at
     # Fallback for legacy rows that do not carry validity_days.
-    if effective_expires_at is None and activated_at is not None and row.expires_at is not None:
+    if installed_flag and effective_expires_at is None and activated_at is not None and row.expires_at is not None:
         effective_expires_at = row.expires_at if row.expires_at.tzinfo is not None else row.expires_at.replace(tzinfo=timezone.utc)
     if effective_expires_at is not None:
         delta_seconds = (effective_expires_at - now_at).total_seconds()
@@ -578,7 +580,7 @@ def _serialize_profile(row: ESimProfile | ProfileInventoryRow, *, now: datetime)
     is_expired = status_value == "expired"
     can_show_qr = bool(row.qr_code_url) and not is_expired
     can_activate = (
-        status_value == "inactive"
+        status_value in {"inactive", "provider_waiting"}
         and not installed_flag
         and bool(row.activation_code or row.qr_code_url or row.install_url)
     )
@@ -608,6 +610,10 @@ def _serialize_profile(row: ESimProfile | ProfileInventoryRow, *, now: datetime)
         "packageCode": package_code,
         "package_code": package_code,
         "status": status_value,
+        "appStatus": row.app_status,
+        "app_status": row.app_status,
+        "providerStatus": row.provider_status,
+        "provider_status": row.provider_status,
         "isExpired": is_expired,
         "canActivate": can_activate,
         "canTopUp": can_top_up,
@@ -1618,6 +1624,8 @@ def register_esim_access_routes(
                 normalized_status = ""
             if normalized_status in {"booked", "got_resource", "released", "pending_install", "pending"}:
                 normalized_status = "inactive"
+            if normalized_status in {"provider-waiting", "provider waiting", "waiting"}:
+                normalized_status = "provider_waiting"
             if normalized_status in {"cancelled", "canceled", "revoked", "refunded", "voided", "closed"}:
                 normalized_status = "expired"
             if normalized_status:
@@ -1847,31 +1855,15 @@ def register_esim_access_routes(
         profile_sync_error: str | None = None
         profile_sync_attempts = 0
         profile_sync_triggered = bool(order_item.provider_order_no)
-        # Race condition the provider used to put a user into: order_profiles
-        # returns OK with a providerOrderNo, but query_profiles right after may
-        # return empty or a profile with `ac` (activation code) still blank
-        # because the provider hasn't finished materializing it. Result was a
-        # placeholder profile that the user couldn't install — the "I tapped
-        # Activate and nothing happened" bug. Retry with backoff until either
-        # we get a non-empty activation_code or we've burned our budget.
+        # Keep checkout responsive. We create the local order/profile row
+        # first, try one immediate provider reconciliation, then let the
+        # detail-screen recover poll fill activation data as the provider
+        # materializes it.
         if profile_sync_triggered and hasattr(provider, "query_profiles"):
             import asyncio as _asyncio
             from supabase_store import ESimProfile as _ESimProfile
             from sqlalchemy import select as _select
-            # Backoff window extended from 6s to ~31s. The Iraqi-style 1-day
-            # plans the user keeps buying often need 10-20s on the provider's
-            # side before activation_code is materialized. The old 6s budget
-            # left placeholder profiles that the user couldn't install, and the
-            # provider then auto-cancelled them within 24h. Each attempt loop
-            # is also bounded by the route handler's overall request timeout
-            # (~60s), so we still leave ~25s of margin for the SQL writes +
-            # response serialization.
-            # ~86s worst case. The provider sometimes takes 30-60s to materialize
-            # an ICCID + activation code after orderProfile returns. The earlier
-            # 31s window was too short and frequently left users with empty
-            # placeholder profiles. The frontend ALSO polls /profiles/{id}/recover
-            # after checkout, so this is the first line of defense.
-            backoffs = (0.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, 34.0)
+            backoffs = (0.0,)
             for attempt_index, delay in enumerate(backoffs):
                 profile_sync_attempts = attempt_index + 1
                 if delay > 0:
@@ -2252,11 +2244,9 @@ def register_esim_access_routes(
         db.commit()
         db.refresh(profile)
         # Return enough state that the frontend can short-circuit its polling
-        # loop without a second round-trip through /usage/sync/my. The detail
-        # screen treats `appStatus == "ACTIVE"` as the signal to navigate to
-        # the home tab — the moment the provider reports ONBOARDING/IN_USE,
-        # the new normalize alias + _apply_active_side_effects has already
-        # flipped this row to ACTIVE.
+        # loop without a second round-trip through /usage/sync/my. ACTIVE is
+        # only returned after install is confirmed and provider service is
+        # active; otherwise provider-active drift remains PROVIDER_WAITING.
         return {
             "ok": True,
             "hasActivationCode": bool(profile.activation_code),

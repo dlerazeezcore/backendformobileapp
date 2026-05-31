@@ -51,6 +51,8 @@ ESIM_ACCESS_PRICE_UNIT = 10000
 # Consumer IQD prices are rounded to the nearest 250 dinars (half-up).
 IQD_ROUNDING_STEP = 250
 
+PROVIDER_WAITING_STATUS = "PROVIDER_WAITING"
+
 
 def round_to_step(value: int, step: int = IQD_ROUNDING_STEP) -> int:
     if step <= 0:
@@ -88,17 +90,14 @@ _ESIM_STATUS_ALIASES: dict[str, str] = {
     "INSTALLATION": "INACTIVE",   # eSIM Access transitional status during install
     "DISABLED": "SUSPENDED",      # provider variant — user/carrier paused the line
     "DELETED": "CANCELLED",       # provider variant for hard-deleted profile
-    # eSIM Access charges credit on first connection. ONBOARDING is the
-    # transient state right after the user's device hits the carrier for the
-    # first time — the bundle clock has started and credit has been spent, so
-    # for app UX purposes this counts as ACTIVE. Promoting here also drives
-    # the auto-side-effects in _apply_active_side_effects (installed=true,
-    # activated_at, expires_at) so the frontend's "status===active iff
-    # installed && activated_at" rule resolves on the very next sync.
+    # Provider-active states are only allowed to become app-active after the
+    # app has a confirmed install signal. Until then they serialize as
+    # provider_waiting.
     "ONBOARDING": "ACTIVE",
     "IN_USE": "ACTIVE",
     "ENABLED": "ACTIVE",
     "ACTIVE": "ACTIVE",
+    "PROVIDER_WAITING": PROVIDER_WAITING_STATUS,
     "CANCEL": "CANCELLED",
     "CANCELED": "CANCELLED",      # US spelling -> our canonical UK spelling
     "CANCELLED": "CANCELLED",
@@ -126,6 +125,29 @@ def normalize_esim_status(raw: str | None) -> str | None:
     if not key:
         return None
     return _ESIM_STATUS_ALIASES.get(key, key)
+
+
+_TERMINAL_ESIM_STATUSES = {"CANCELLED", "EXPIRED", "REVOKED", "REFUNDED"}
+_PROVIDER_INSTALL_SIGNAL_STATUSES = {
+    "INSTALLATION",
+    "INSTALLED",
+    "ENABLED",
+    "ONBOARDING",
+    "IN_USE",
+    "ACTIVE",
+}
+
+
+def _is_terminal_esim_status(status: str | None) -> bool:
+    return (normalize_esim_status(status) or "").upper() in _TERMINAL_ESIM_STATUSES
+
+
+def _has_provider_active_signal(*statuses: str | None) -> bool:
+    return any((normalize_esim_status(status) or "").upper() == "ACTIVE" for status in statuses)
+
+
+def _has_provider_install_signal(*statuses: str | None) -> bool:
+    return any(str(status or "").strip().upper() in _PROVIDER_INSTALL_SIGNAL_STATUSES for status in statuses)
 
 
 def utcnow() -> datetime:
@@ -2666,6 +2688,55 @@ class SupabaseStore:
         self.session.flush()
         return profile
 
+    @staticmethod
+    def _stored_provider_esim_status(profile: ESimProfile) -> str | None:
+        custom_fields = profile.custom_fields if isinstance(profile.custom_fields, dict) else {}
+        value = custom_fields.get("providerEsimStatus") or custom_fields.get("provider_esim_status")
+        return str(value) if value is not None else None
+
+    def _resolve_profile_app_status(
+        self,
+        profile: ESimProfile,
+        *,
+        provider_esim_status: str | None = None,
+        provider_smdp_status: str | None = None,
+        fallback_status: str | None = None,
+        used_data_mb: int | float | None = None,
+    ) -> str | None:
+        normalized_esim = normalize_esim_status(provider_esim_status)
+        normalized_smdp = normalize_esim_status(provider_smdp_status)
+        normalized_fallback = normalize_esim_status(fallback_status)
+
+        for normalized in (normalized_esim, normalized_fallback, normalized_smdp):
+            if _is_terminal_esim_status(normalized):
+                return normalized
+
+        provider_active = _has_provider_active_signal(
+            provider_esim_status,
+            provider_smdp_status,
+            fallback_status,
+        )
+        if used_data_mb is not None:
+            try:
+                provider_active = provider_active or float(used_data_mb) > 0
+            except (TypeError, ValueError):
+                pass
+
+        if provider_active:
+            return "ACTIVE" if bool(profile.installed) else PROVIDER_WAITING_STATUS
+
+        if (
+            bool(profile.installed)
+            or _has_provider_install_signal(provider_esim_status, provider_smdp_status, fallback_status)
+            or normalized_fallback == PROVIDER_WAITING_STATUS
+        ):
+            return PROVIDER_WAITING_STATUS
+
+        for normalized in (normalized_esim, normalized_fallback, normalized_smdp):
+            if normalized:
+                return normalized
+        return fallback_status
+
     def _apply_active_side_effects(
         self,
         profile: ESimProfile,
@@ -2674,9 +2745,7 @@ class SupabaseStore:
         actor_phone: str | None = None,
         platform_code: str | None = None,
     ) -> bool:
-        """If the profile just normalized to ACTIVE, mirror the user-tapped
-        "activate" side-effects so the frontend's `status === 'active' iff
-        installed && activated_at` rule resolves on the very next read.
+        """Fill activation fields only after install + provider-active agree.
 
         Called from sync_profiles, sync_usage_records, and record_webhook
         right after `profile.app_status` is assigned. Returns True when
@@ -2684,9 +2753,12 @@ class SupabaseStore:
         so the caller can decide whether to emit an extra lifecycle event.
 
         Idempotent: safe to call multiple times — only fills in fields that
-        are still None/False.
+        are still None.
         """
         if (profile.app_status or "").upper() != "ACTIVE":
+            return False
+        if not profile.installed:
+            profile.app_status = PROVIDER_WAITING_STATUS
             return False
         # If everything is already in the activated shape, nothing to do.
         already_active = (
@@ -2700,7 +2772,6 @@ class SupabaseStore:
         if already_active:
             return False
         now = utcnow()
-        profile.installed = True
         if profile.installed_at is None:
             profile.installed_at = now
         if profile.activated_at is None:
@@ -2717,14 +2788,14 @@ class SupabaseStore:
             order_item=order_item,
             profile=profile,
             service_type="esim",
-            event_type="AUTO_ACTIVATED_FROM_PROVIDER",
+            event_type="PROVIDER_ACTIVATED_AFTER_INSTALL",
             source=source,
             actor_type="system",
             actor_phone=actor_phone,
             platform_code=platform_code,
             status_before=None,
             status_after="ACTIVE",
-            note="Provider reported ONBOARDING/IN_USE — auto-promoted to ACTIVE.",
+            note="Provider confirmed active service after install.",
             payload={},
         )
         return True
@@ -2834,7 +2905,13 @@ class SupabaseStore:
             profile.qr_code_url = item.get("qrCodeUrl")
             profile.install_url = item.get("shortUrl")
             profile.provider_status = item.get("smdpStatus")
-            profile.app_status = normalize_esim_status(status_after) or status_after
+            profile.app_status = self._resolve_profile_app_status(
+                profile,
+                provider_esim_status=status_after,
+                provider_smdp_status=profile.provider_status,
+                fallback_status=profile.app_status,
+                used_data_mb=used_data_mb,
+            )
             profile.data_type = None if item.get("dataType") is None else str(item.get("dataType"))
             profile.total_data_mb = total_data_mb
             profile.used_data_mb = used_data_mb
@@ -2843,8 +2920,6 @@ class SupabaseStore:
                 profile_custom_fields=profile.custom_fields,
                 order_item_custom_fields=order_item.custom_fields,
             )
-            if used_data_mb not in (None, 0) and profile.activated_at is None:
-                profile.activated_at = utcnow()
             if expires_at is not None:
                 profile.expires_at = expires_at
             elif profile.activated_at is not None and validity_days and profile.expires_at is None:
@@ -2862,6 +2937,8 @@ class SupabaseStore:
                     "supportTopUpType": support_topup_type,
                     "packageMetadata": self._build_order_item_package_metadata(order_item),
                     "checkoutSnapshot": (order_item.custom_fields or {}).get("checkoutSnapshot"),
+                    "providerEsimStatus": status_after,
+                    "providerSmdpStatus": profile.provider_status,
                     "activationCode": profile.activation_code,
                     "qrCodeUrl": profile.qr_code_url,
                     "installUrl": profile.install_url,
@@ -2886,12 +2963,8 @@ class SupabaseStore:
                 note="Profile synced from provider query",
                 payload=item,
             )
-            # If the provider just told us this profile is ONBOARDING/IN_USE
-            # (both normalize to ACTIVE), flip the install/activate flags so
-            # the user's home tab reflects the new state immediately. This is
-            # the fix for the "stuck on NOT ACTIVATED" symptom — without it,
-            # the provider could report IN_USE for hours and the frontend rule
-            # would still keep the eSIM in the inactive tab.
+            # Provider-active signals only become app-active after the app has
+            # confirmed install. Otherwise they remain PROVIDER_WAITING.
             self._apply_active_side_effects(
                 profile,
                 source="provider_sync",
@@ -2966,11 +3039,19 @@ class SupabaseStore:
                 },
             )
             profile.last_provider_sync_at = parse_provider_datetime(record.get("lastUpdateTime")) or utcnow()
-            if used_data_mb not in (None, 0) and profile.activated_at is None:
-                profile.activated_at = utcnow()
-                profile.app_status = profile.app_status or "ACTIVE"
-            if profile.activated_at is not None and profile.validity_days and profile.expires_at is None:
-                profile.expires_at = profile.activated_at + timedelta(days=profile.validity_days)
+            profile.app_status = self._resolve_profile_app_status(
+                profile,
+                provider_esim_status=self._stored_provider_esim_status(profile),
+                provider_smdp_status=profile.provider_status,
+                fallback_status=profile.app_status,
+                used_data_mb=used_data_mb,
+            )
+            self._apply_active_side_effects(
+                profile,
+                source="provider_usage_sync",
+                actor_phone=actor_phone,
+                platform_code=None,
+            )
             order_item = profile.order_item
             customer_order = order_item.customer_order if order_item is not None else None
             if order_item is not None and profile.app_status:
@@ -2992,15 +3073,6 @@ class SupabaseStore:
                 status_after=None if used_data_mb is None else str(used_data_mb),
                 note="Profile usage synced from provider usage query",
                 payload=record,
-            )
-            # Above we already set `profile.app_status = profile.app_status or
-            # "ACTIVE"` when there was non-zero usage; mirror the install/
-            # activate side-effects here too.
-            self._apply_active_side_effects(
-                profile,
-                source="provider_usage_sync",
-                actor_phone=actor_phone,
-                platform_code=None,
             )
             result.append(profile)
         self.session.commit()
@@ -3045,18 +3117,42 @@ class SupabaseStore:
         now = utcnow()
         if action == "install":
             profile.installed = True
-            profile.installed_at = now
+            profile.installed_at = profile.installed_at or now
+            profile.app_status = self._resolve_profile_app_status(
+                profile,
+                provider_esim_status=self._stored_provider_esim_status(profile),
+                provider_smdp_status=profile.provider_status,
+                fallback_status=profile.app_status,
+            ) or PROVIDER_WAITING_STATUS
+            self._apply_active_side_effects(
+                profile,
+                source="profile_action_install",
+                actor_phone=actor_phone,
+                platform_code=platform_code,
+            )
+            if order_item:
+                order_item.item_status = profile.app_status or order_item.item_status
+            if customer_order and order_item:
+                customer_order.order_status = order_item.item_status or customer_order.order_status
         elif action == "activate":
             profile.installed = True
             profile.installed_at = profile.installed_at or now
-            profile.activated_at = profile.activated_at or now
-            profile.app_status = "ACTIVE"
-            if profile.validity_days and profile.expires_at is None:
-                profile.expires_at = profile.activated_at + timedelta(days=profile.validity_days)
+            profile.app_status = self._resolve_profile_app_status(
+                profile,
+                provider_esim_status=self._stored_provider_esim_status(profile),
+                provider_smdp_status=profile.provider_status,
+                fallback_status=profile.app_status,
+            ) or PROVIDER_WAITING_STATUS
+            self._apply_active_side_effects(
+                profile,
+                source="profile_action_activate",
+                actor_phone=actor_phone,
+                platform_code=platform_code,
+            )
             if order_item:
-                order_item.item_status = "ACTIVE"
-            if customer_order:
-                customer_order.order_status = "ACTIVE"
+                order_item.item_status = profile.app_status or order_item.item_status
+            if customer_order and order_item:
+                customer_order.order_status = order_item.item_status or customer_order.order_status
         elif action == "cancel":
             profile.app_status = "CANCELLED"
             profile.canceled_at = now
@@ -3081,12 +3177,23 @@ class SupabaseStore:
             if customer_order:
                 customer_order.order_status = "SUSPENDED"
         elif action == "unsuspend":
-            profile.app_status = "ACTIVE"
+            profile.app_status = self._resolve_profile_app_status(
+                profile,
+                provider_esim_status=self._stored_provider_esim_status(profile),
+                provider_smdp_status=profile.provider_status,
+                fallback_status="ACTIVE",
+            ) or PROVIDER_WAITING_STATUS
+            self._apply_active_side_effects(
+                profile,
+                source="profile_action_unsuspend",
+                actor_phone=actor_phone,
+                platform_code=platform_code,
+            )
             profile.unsuspended_at = now
             if order_item:
-                order_item.item_status = "ACTIVE"
-            if customer_order:
-                customer_order.order_status = "ACTIVE"
+                order_item.item_status = profile.app_status or order_item.item_status
+            if customer_order and order_item:
+                customer_order.order_status = order_item.item_status or customer_order.order_status
         elif action == "refund":
             profile.app_status = "REFUNDED"
             profile.refunded_at = now
@@ -3132,30 +3239,42 @@ class SupabaseStore:
         normalized_status = (
             normalize_esim_status(content.get("esimStatus")) if content.get("esimStatus") else None
         )
-        if profile is not None and content.get("esimStatus"):
-            profile.app_status = normalized_status or content["esimStatus"]
-            profile.provider_status = content.get("smdpStatus")
+        if profile is not None and (content.get("esimStatus") or content.get("smdpStatus")):
+            profile.provider_status = content.get("smdpStatus") or profile.provider_status
+            profile.app_status = self._resolve_profile_app_status(
+                profile,
+                provider_esim_status=content.get("esimStatus"),
+                provider_smdp_status=profile.provider_status,
+                fallback_status=profile.app_status,
+            )
+            profile.custom_fields = self._merge_json_dict(
+                profile.custom_fields,
+                {
+                    "providerEsimStatus": content.get("esimStatus"),
+                    "providerSmdpStatus": profile.provider_status,
+                },
+            )
             profile.expires_at = parse_provider_datetime(content.get("expiredTime")) or profile.expires_at
             profile.last_provider_sync_at = utcnow()
-        # Use the *normalized* status for item/order tracking so an
-        # ONBOARDING/IN_USE webhook flips the order to ACTIVE consistently.
-        order_status_raw = normalized_status or content.get("orderStatus")
-        if order_item is not None and (content.get("esimStatus") or content.get("orderStatus")):
-            order_item.item_status = order_status_raw or order_item.item_status
-            order_item.provider_status = content.get("smdpStatus")
-            order_item.last_provider_sync_at = utcnow()
-        if customer_order is not None and (content.get("esimStatus") or content.get("orderStatus")):
-            customer_order.order_status = order_status_raw or customer_order.order_status
-        # Push-driven activation: when the webhook flips us to ACTIVE, also
-        # set installed/activated_at so the frontend's lifecycle rule sees the
-        # eSIM as active without waiting for the next user pull-to-refresh.
-        if profile is not None:
             self._apply_active_side_effects(
                 profile,
                 source="provider_webhook",
                 actor_phone=None,
                 platform_code="provider_webhook",
             )
+        # Use the resolved profile status for item/order tracking. Provider
+        # ACTIVE/IN_USE webhooks stay PROVIDER_WAITING until install is known.
+        order_status_raw = (
+            profile.app_status
+            if profile is not None and content.get("esimStatus")
+            else normalized_status or normalize_esim_status(content.get("orderStatus")) or content.get("orderStatus")
+        )
+        if order_item is not None and (content.get("esimStatus") or content.get("orderStatus")):
+            order_item.item_status = order_status_raw or order_item.item_status
+            order_item.provider_status = content.get("smdpStatus")
+            order_item.last_provider_sync_at = utcnow()
+        if customer_order is not None and (content.get("esimStatus") or content.get("orderStatus")):
+            customer_order.order_status = order_status_raw or customer_order.order_status
         event = self.add_event(
             customer_order=customer_order,
             order_item=order_item,

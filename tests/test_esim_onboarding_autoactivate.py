@@ -1,4 +1,4 @@
-"""Tests for the ONBOARDING -> ACTIVE auto-activation contract.
+"""Tests for provider waiting and install-gated eSIM activation.
 
 Covers the three call sites where the provider can tell us the eSIM has
 started its first connection:
@@ -193,7 +193,7 @@ class EsimOnboardingAutoActivateTest(unittest.TestCase):
         )
         return {"Authorization": f"Bearer {token}"}
 
-    def _seed_profile(self) -> int:
+    def _seed_profile(self, *, installed: bool = False) -> int:
         """Insert a fresh profile placeholder and return its id."""
         now = utcnow()
         with self.session_factory() as session:
@@ -220,7 +220,8 @@ class EsimOnboardingAutoActivateTest(unittest.TestCase):
                 order_item_id=item.id,
                 user_id=self.user_id,
                 app_status="INACTIVE",
-                installed=False,
+                installed=installed,
+                installed_at=now if installed else None,
                 validity_days=7,
             )
             session.add(profile)
@@ -234,10 +235,41 @@ class EsimOnboardingAutoActivateTest(unittest.TestCase):
         self.assertEqual(normalize_esim_status("onboarding"), "ACTIVE")
         self.assertEqual(normalize_esim_status("IN_USE"), "ACTIVE")
 
-    # --- sync_profiles + auto side-effects ---------------------------------
+    # --- sync_profiles + install-gated side-effects -------------------------
 
-    def test_sync_profiles_with_onboarding_auto_activates(self) -> None:
+    def test_sync_profiles_with_onboarding_waits_until_install(self) -> None:
         profile_id = self._seed_profile()
+        with self.session_factory() as session:
+            store = SupabaseStore(session)
+            store.sync_profiles(
+                {
+                    "obj": {
+                        "esimList": [
+                            {
+                                "orderNo": "ORD-ONBOARD-1",
+                                "esimTranNo": "ESIM-ONBOARD-1",
+                                "iccid": "ICCID-ONBOARD-1",
+                                "ac": "LPA:1$smdp.example$AC-CODE",
+                                "smdpStatus": "RELEASED",
+                                "esimStatus": "ONBOARDING",
+                                "totalDuration": 7,
+                            }
+                        ]
+                    }
+                }
+            )
+            session.commit()
+            row = session.get(ESimProfile, profile_id)
+            self.assertEqual(row.app_status, "PROVIDER_WAITING")
+            self.assertFalse(row.installed)
+            self.assertIsNone(row.installed_at)
+            self.assertIsNone(row.activated_at)
+            self.assertIsNone(row.expires_at)
+            self.assertEqual(row.order_item.item_status, "PROVIDER_WAITING")
+            self.assertEqual(row.order_item.customer_order.order_status, "PROVIDER_WAITING")
+
+    def test_installed_profile_with_onboarding_becomes_active(self) -> None:
+        profile_id = self._seed_profile(installed=True)
         with self.session_factory() as session:
             store = SupabaseStore(session)
             store.sync_profiles(
@@ -269,7 +301,7 @@ class EsimOnboardingAutoActivateTest(unittest.TestCase):
 
     # --- recover endpoint response -----------------------------------------
 
-    def test_recover_endpoint_returns_active_after_onboarding(self) -> None:
+    def test_recover_endpoint_returns_provider_waiting_until_install(self) -> None:
         profile_id = self._seed_profile()
         response = self.client.post(
             f"/api/v1/esim-access/profiles/{profile_id}/recover",
@@ -278,15 +310,15 @@ class EsimOnboardingAutoActivateTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         body = response.json()
         self.assertTrue(body["ok"])
-        self.assertEqual(body["appStatus"], "ACTIVE")
-        self.assertTrue(body["installed"])
-        self.assertIsNotNone(body["activatedAt"])
+        self.assertEqual(body["appStatus"], "PROVIDER_WAITING")
+        self.assertFalse(body["installed"])
+        self.assertIsNone(body["activatedAt"])
         self.assertTrue(body["hasActivationCode"])
         self.assertTrue(body["hasIccid"])
 
     # --- webhook auto-activation -------------------------------------------
 
-    def test_webhook_with_onboarding_auto_activates(self) -> None:
+    def test_webhook_with_onboarding_waits_until_install(self) -> None:
         profile_id = self._seed_profile()
         # The profile needs an iccid so the webhook can locate it without
         # going through provider lookup.
@@ -312,9 +344,9 @@ class EsimOnboardingAutoActivateTest(unittest.TestCase):
             )
             session.commit()
             row = session.get(ESimProfile, profile_id)
-            self.assertEqual(row.app_status, "ACTIVE")
-            self.assertTrue(row.installed)
-            self.assertIsNotNone(row.activated_at)
+            self.assertEqual(row.app_status, "PROVIDER_WAITING")
+            self.assertFalse(row.installed)
+            self.assertIsNone(row.activated_at)
 
     # --- package filter ----------------------------------------------------
 

@@ -32,10 +32,11 @@ Failure:
 
 ## Lifecycle rules
 
-- `booked`, `got_resource`, `released`, `pending_install`, and `active + installed=false` are returned as `status: "inactive"`.
-- `active` is returned only when `installed=true` and `activatedAt` exists.
+- `booked`, `got_resource`, `released`, and `pending_install` are returned as `status: "inactive"` until there is an install/provider signal.
+- `provider_waiting` is returned when an install signal exists but provider active service is not confirmed, or when the provider reports active/install-like status while `installed=false`.
+- `active` is returned only when `installed=true`, `activatedAt` exists, and provider service is confirmed.
 - `expired`, `cancelled/canceled`, `revoked`, `refunded`, `voided`, `closed`, or elapsed bundle validity are returned as `status: "expired"`.
-- `daysLeft` and `bundleExpiresAt` are derived from `activatedAt + validityDays` (bundle window), not retention expiry.
+- `daysLeft` and `bundleExpiresAt` are derived from `activatedAt + validityDays` (bundle window), not retention expiry, and are not populated for `provider_waiting`.
 
 ## Required profile fields
 
@@ -49,6 +50,8 @@ Each profile row includes both camelCase and snake_case aliases for key lifecycl
 - `countryCode`, `country_code`
 - `countryName`, `country_name`
 - `status`
+- `appStatus`, `app_status`
+- `providerStatus`, `provider_status`
 - `installed`
 - `installedAt`, `installed_at`
 - `activatedAt`, `activated_at`
@@ -99,6 +102,25 @@ Inactive (booked/not installed):
     "checkoutSnapshot": {"providerOrderNo": "ORD-PROVIDER-1001"},
     "packageMetadata": {"packageCode": "US-7D-1GB"}
   }
+}
+```
+
+Provider waiting:
+
+```json
+{
+  "id": 9900,
+  "userId": "22222222-2222-2222-2222-222222222222",
+  "providerOrderNo": "ORD-PROVIDER-8001",
+  "esimTranNo": "ESIM-TRAN-8001",
+  "iccid": "8986000000000008001",
+  "status": "provider_waiting",
+  "appStatus": "PROVIDER_WAITING",
+  "providerStatus": "ENABLED",
+  "installed": false,
+  "activatedAt": null,
+  "bundleExpiresAt": null,
+  "daysLeft": null
 }
 ```
 

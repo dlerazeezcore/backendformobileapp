@@ -147,6 +147,7 @@ class EsimLifecycleProfilesMyTest(unittest.TestCase):
         order_body = order_response.json()
         self.assertTrue(order_body.get("success"))
         self.assertEqual(order_body.get("providerOrderNo"), "ORD-LIFECYCLE-1")
+        self.assertEqual(order_body["database"]["profileSync"]["attempts"], 1)
 
         profiles_response = self.client.get(
             "/api/v1/esim-access/profiles/my",
@@ -202,8 +203,49 @@ class EsimLifecycleProfilesMyTest(unittest.TestCase):
         response = self.client.get("/api/v1/esim-access/profiles/my", headers=self._user_headers())
         self.assertEqual(response.status_code, 200)
         profile = response.json()["data"]["profiles"][0]
-        self.assertEqual(profile["status"], "inactive")
+        self.assertEqual(profile["status"], "provider_waiting")
+        self.assertIsNone(profile["daysLeft"])
         self.assertEqual(profile["supportTopUpType"], 3)
+
+    def test_installed_without_provider_ready_is_provider_waiting_without_countdown(self) -> None:
+        now = utcnow()
+        with self.session_factory() as session:
+            order = CustomerOrder(
+                user_id=self.user_id,
+                order_number="ORD-LIFECYCLE-WAIT",
+                order_status="BOOKED",
+                booked_at=now,
+            )
+            session.add(order)
+            session.flush()
+            item = OrderItem(
+                customer_order_id=order.id,
+                service_type="esim",
+                provider_order_no="ORD-LIFECYCLE-WAIT",
+                item_status="BOOKED",
+                booked_at=now,
+            )
+            session.add(item)
+            session.flush()
+            session.add(
+                ESimProfile(
+                    order_item_id=item.id,
+                    user_id=self.user_id,
+                    app_status="BOOKED",
+                    installed=True,
+                    installed_at=now,
+                    validity_days=7,
+                )
+            )
+            session.commit()
+
+        response = self.client.get("/api/v1/esim-access/profiles/my", headers=self._user_headers())
+        self.assertEqual(response.status_code, 200)
+        profile = response.json()["data"]["profiles"][0]
+        self.assertEqual(profile["status"], "provider_waiting")
+        self.assertTrue(profile["installed"])
+        self.assertIsNone(profile["activatedAt"])
+        self.assertIsNone(profile["daysLeft"])
 
     def test_activate_by_provider_order_no_works_for_recent_purchase_placeholder(self) -> None:
         order_response = self.client.post(
@@ -236,7 +278,8 @@ class EsimLifecycleProfilesMyTest(unittest.TestCase):
         self.assertEqual(activate_response.status_code, 200)
         activated_profile = activate_response.json()["data"]["profile"]
         self.assertTrue(activated_profile["installed"])
-        self.assertEqual(activated_profile["status"], "active")
+        self.assertEqual(activated_profile["status"], "provider_waiting")
+        self.assertIsNone(activated_profile["activatedAt"])
         self.assertEqual(activated_profile["providerOrderNo"], provider_order_no)
 
     def test_bundle_expiry_moves_profile_to_expired(self) -> None:
