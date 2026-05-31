@@ -1614,10 +1614,12 @@ def register_esim_access_routes(
         offset: int,
         status_filter: str | None,
         installed_filter: bool | None,
+        include_terminal: bool = True,
     ) -> dict[str, Any]:
         rows = store.list_profiles_for_user(user_id=user_id)
         now = utcnow()
         serialized = [_serialize_profile(row, now=now) for row in rows]
+        normalized_status: str | None = None
         if status_filter is not None and status_filter.strip():
             normalized_status = status_filter.strip().lower()
             if normalized_status in {"all", "any", "*"}:
@@ -1630,6 +1632,16 @@ def register_esim_access_routes(
                 normalized_status = "expired"
             if normalized_status:
                 serialized = [row for row in serialized if str(row.get("status") or "").strip().lower() == normalized_status]
+        # When the caller didn't ask for a specific lifecycle bucket, hide
+        # terminal profiles (CANCELLED / REVOKED / REFUNDED / EXPIRED) by
+        # default. The "my eSIMs" list was getting bloated with one-day plans
+        # the user already cycled through. Pass `?includeTerminal=true` or
+        # `?status=expired` to surface them again.
+        if not include_terminal and not normalized_status:
+            serialized = [
+                row for row in serialized
+                if str(row.get("status") or "").strip().lower() != "expired"
+            ]
         if installed_filter is not None:
             serialized = [row for row in serialized if bool(row.get("installed")) is installed_filter]
         total = len(serialized)
@@ -2220,14 +2232,23 @@ def register_esim_access_routes(
         )
         if profile is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found")
+        # Snapshot the identifiers we need from the DB row, then release the
+        # connection BEFORE the (potentially slow) provider call. The detail
+        # screen polls this every 4s after Activate — if every poll held a
+        # pool slot across a 1-3 s provider round-trip, the DATABASE_POOL_SIZE=4
+        # pool drains within ~16 s and every other endpoint freezes waiting
+        # for a slot. Followed the same pattern used by _sync_usage_for_esim_tran_nos.
+        profile_iccid = profile.iccid
         order_no: str | None = None
         if profile.order_item_id is not None:
             oi = db.scalar(select(OrderItem).where(OrderItem.id == profile.order_item_id))
             if oi is not None:
                 order_no = oi.provider_order_no
-        # If profile already has iccid, we can sync by iccid (faster + more reliable)
-        if profile.iccid:
-            resp = await provider.query_profiles(ProfileQueryRequest(iccid=profile.iccid))
+        actor_phone_value = str(claims.get("phone") or "")
+        db.close()
+
+        if profile_iccid:
+            resp = await provider.query_profiles(ProfileQueryRequest(iccid=profile_iccid))
         elif order_no:
             resp = await provider.query_profiles(ProfileQueryRequest(order_no=order_no))
         else:
@@ -2235,14 +2256,23 @@ def register_esim_access_routes(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="No iccid or provider_order_no available to recover",
             )
+
+        # Re-acquire a session for the write-back. SQLAlchemy will check out a
+        # fresh connection from the pool transparently.
         SupabaseStore(db).sync_profiles(
             resp.model_dump(by_alias=True, exclude_none=True),
             platform_code="user-recover",
             platform_name="User-initiated recovery",
-            actor_phone=str(claims.get("phone") or ""),
+            actor_phone=actor_phone_value,
         )
         db.commit()
-        db.refresh(profile)
+        # Refetch the post-sync profile state via a fresh scalar (the original
+        # profile object is detached after db.close()).
+        profile = db.scalar(
+            select(ESimProfile).where(ESimProfile.id == profile_id)
+        )
+        if profile is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile disappeared during recover")
         # Return enough state that the frontend can short-circuit its polling
         # loop without a second round-trip through /usage/sync/my. ACTIVE is
         # only returned after install is confirmed and provider service is
@@ -2281,6 +2311,7 @@ def register_esim_access_routes(
         status: str | None = Query(default=None),
         installed: bool | None = Query(default=None),
         user_id: str | None = Query(default=None, alias="userId"),
+        include_terminal: bool = Query(default=False, alias="includeTerminal"),
     ) -> dict[str, Any]:
         actor = require_active_subject(db, claims=claims)
         target_user_id = _resolve_target_user_id(actor=actor, claims=claims, requested_user_id=user_id)
@@ -2317,6 +2348,7 @@ def register_esim_access_routes(
             offset=offset,
             status_filter=status,
             installed_filter=installed,
+            include_terminal=include_terminal,
         )
         return {
             "success": True,
@@ -2478,6 +2510,7 @@ def register_esim_access_routes(
         status: str | None = Query(default=None),
         installed: bool | None = Query(default=None),
         user_id: str | None = Query(default=None, alias="userId"),
+        include_terminal: bool = Query(default=False, alias="includeTerminal"),
     ) -> dict[str, Any]:
         actor = require_active_subject(db, claims=claims)
         target_user_id = _resolve_target_user_id(actor=actor, claims=claims, requested_user_id=user_id)
@@ -2489,6 +2522,7 @@ def register_esim_access_routes(
             offset=offset,
             status_filter=status,
             installed_filter=installed,
+            include_terminal=include_terminal,
         )
         return {
             "success": True,

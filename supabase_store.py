@@ -2789,6 +2789,51 @@ class SupabaseStore:
                 return normalized
         return fallback_status
 
+    def _apply_terminal_side_effects(
+        self,
+        profile: ESimProfile,
+        *,
+        source: str,
+    ) -> bool:
+        """When app_status normalizes to a terminal state, stamp the matching
+        timestamp column so admin/audit queries can rely on canceled_at /
+        refunded_at / revoked_at instead of grepping app_status strings.
+
+        Production rows currently show ``CANCELLED`` profiles with
+        ``canceled_at = NULL`` because the previous webhook/sync path only
+        updated app_status, not the lifecycle timestamps. This back-fills the
+        timestamp on every sync, idempotent.
+        """
+        status = (profile.app_status or "").upper()
+        if status not in _TERMINAL_ESIM_STATUSES:
+            return False
+        now = utcnow()
+        changed = False
+        order_item = profile.order_item
+        customer_order = order_item.customer_order if order_item is not None else None
+        if status == "CANCELLED" and profile.canceled_at is None:
+            profile.canceled_at = now
+            if order_item is not None and order_item.canceled_at is None:
+                order_item.canceled_at = now
+            changed = True
+        elif status == "REVOKED" and profile.revoked_at is None:
+            profile.revoked_at = now
+            if order_item is not None and order_item.revoked_at is None:
+                order_item.revoked_at = now
+            changed = True
+        elif status == "REFUNDED" and profile.refunded_at is None:
+            profile.refunded_at = now
+            if order_item is not None and order_item.refunded_at is None:
+                order_item.refunded_at = now
+            changed = True
+        # Mirror status on order_item / customer_order so admin tooling sees
+        # the same lifecycle in one query.
+        if order_item is not None:
+            order_item.item_status = status
+        if customer_order is not None:
+            customer_order.order_status = status
+        return changed
+
     def _apply_active_side_effects(
         self,
         profile: ESimProfile,
@@ -3004,6 +3049,11 @@ class SupabaseStore:
             order_item.provider_status = profile.provider_status
             order_item.last_provider_sync_at = utcnow()
             order_item.customer_order.order_status = order_item.item_status or order_item.customer_order.order_status
+            # When the provider tells us the profile is terminal (CANCELLED /
+            # REVOKED / REFUNDED / EXPIRED), set the matching timestamp so
+            # admin reports and audit SQL don't see "CANCELLED but canceled_at
+            # IS NULL" drift. We've seen plenty of those rows in production.
+            self._apply_terminal_side_effects(profile, source="provider_sync")
             self.add_event(
                 customer_order=order_item.customer_order,
                 order_item=order_item,
@@ -3326,6 +3376,9 @@ class SupabaseStore:
                 actor_phone=None,
                 platform_code="provider_webhook",
             )
+            # When the webhook reports CANCELLED/REVOKED/REFUNDED, propagate
+            # the matching *_at timestamp + cascade to order_item/customer_order.
+            self._apply_terminal_side_effects(profile, source="provider_webhook")
         # Use the resolved profile status for item/order tracking. Provider
         # ACTIVE/IN_USE webhooks stay PROVIDER_WAITING until install is known.
         order_status_raw = (

@@ -321,13 +321,35 @@ class EsimLifecycleProfilesMyTest(unittest.TestCase):
             )
             session.commit()
 
-        response = self.client.get("/api/v1/esim-access/profiles/my", headers=self._user_headers())
+        # /profiles/my hides terminal (cancelled/expired/refunded/revoked) by
+        # default. Pass includeTerminal=true to surface them for this test.
+        response = self.client.get(
+            "/api/v1/esim-access/profiles/my?includeTerminal=true",
+            headers=self._user_headers(),
+        )
         self.assertEqual(response.status_code, 200)
         profile = response.json()["data"]["profiles"][0]
         self.assertEqual(profile["status"], "expired")
         self.assertEqual(profile["daysLeft"], 0)
         self.assertIsNotNone(profile["bundleExpiresAt"])
         self.assertIsNotNone(profile["expiresAt"])
+
+        # Default response (no includeTerminal flag) hides expired profiles.
+        default_response = self.client.get(
+            "/api/v1/esim-access/profiles/my",
+            headers=self._user_headers(),
+        )
+        self.assertEqual(default_response.status_code, 200)
+        self.assertEqual(default_response.json()["data"]["total"], 0)
+        self.assertEqual(default_response.json()["data"]["profiles"], [])
+
+        # status=expired still surfaces them even without includeTerminal=true.
+        explicit_response = self.client.get(
+            "/api/v1/esim-access/profiles/my?status=expired",
+            headers=self._user_headers(),
+        )
+        self.assertEqual(explicit_response.status_code, 200)
+        self.assertEqual(len(explicit_response.json()["data"]["profiles"]), 1)
 
     def test_deduplicates_profile_and_fallback_rows_while_keeping_other_orders(self) -> None:
         now = utcnow()
