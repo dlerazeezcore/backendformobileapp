@@ -33,8 +33,8 @@ Failure:
 ## Lifecycle rules
 
 - `booked`, `got_resource`, `released`, and `pending_install` are returned as `status: "inactive"` until there is an install/provider signal.
-- `provider_waiting` is returned when an install signal exists but provider active service is not confirmed, or when the provider reports active/install-like status while `installed=false`.
-- `active` is returned only when `installed=true`, `activatedAt` exists, and provider service is confirmed.
+- `provider_waiting` is returned when provider/app data is still catching up and there is no provider installation proof yet.
+- `active` is returned when `installed=true`, `activatedAt` exists, and the provider has confirmed either active service or device installation/download evidence such as `installationTime`, download time, EID, or device model.
 - `expired`, `cancelled/canceled`, `revoked`, `refunded`, `voided`, `closed`, or elapsed bundle validity are returned as `status: "expired"`.
 - `daysLeft` and `bundleExpiresAt` are derived from `activatedAt + validityDays` (bundle window), not retention expiry, and are not populated for `provider_waiting`.
 

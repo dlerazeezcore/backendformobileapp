@@ -300,7 +300,7 @@ class EsimOnboardingAutoActivateTest(unittest.TestCase):
             self.assertEqual(row.order_item.item_status, "ACTIVE")
             self.assertEqual(row.order_item.customer_order.order_status, "ACTIVE")
 
-    def test_provider_download_evidence_marks_installed_but_not_active(self) -> None:
+    def test_provider_download_evidence_activates_installed_profile(self) -> None:
         profile_id = self._seed_profile()
         with self.session_factory() as session:
             store = SupabaseStore(session)
@@ -314,8 +314,8 @@ class EsimOnboardingAutoActivateTest(unittest.TestCase):
                                 "iccid": "ICCID-ONBOARD-1",
                                 "ac": "LPA:1$smdp.example$AC-CODE",
                                 "smdpStatus": "INSTALLATION",
-                                "esimStatus": "ONBOARD",
-                                "downloadTime": "2026-05-31 21:04:00",
+                                "esimStatus": "GOT_RESOURCE",
+                                "installationTime": "2026-05-31T18:32:16+0000",
                                 "eid": "89043052010008887024021623912688",
                                 "deviceBrand": "Apple",
                                 "deviceModel": "iPhone 16e",
@@ -327,14 +327,15 @@ class EsimOnboardingAutoActivateTest(unittest.TestCase):
             )
             session.commit()
             row = session.get(ESimProfile, profile_id)
-            self.assertEqual(row.app_status, "PROVIDER_WAITING")
+            self.assertEqual(row.app_status, "ACTIVE")
             self.assertTrue(row.installed)
             self.assertIsNotNone(row.installed_at)
-            self.assertIsNone(row.activated_at)
-            self.assertIsNone(row.expires_at)
-            self.assertEqual(row.order_item.item_status, "PROVIDER_WAITING")
-            self.assertEqual(row.order_item.customer_order.order_status, "PROVIDER_WAITING")
+            self.assertIsNotNone(row.activated_at)
+            self.assertIsNotNone(row.expires_at)
+            self.assertEqual(row.order_item.item_status, "ACTIVE")
+            self.assertEqual(row.order_item.customer_order.order_status, "ACTIVE")
             self.assertEqual(row.custom_fields["providerInstallEvidence"]["eid"], "89043052010008887024021623912688")
+            self.assertEqual(row.custom_fields["providerInstallEvidence"]["downloadTime"], "2026-05-31T18:32:16+0000")
 
     # --- recover endpoint response -----------------------------------------
 

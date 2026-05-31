@@ -33,12 +33,12 @@ class ProviderWaitingBackfillTest(unittest.TestCase):
         if os.path.exists(self.db_path):
             os.remove(self.db_path)
 
-    def _run_upgrade(self) -> None:
+    def _run_upgrade(self, revision_file: str = "0042_provider_waiting_lifecycle_backfill.py") -> None:
         migration_path = (
             Path(__file__).resolve().parents[1]
             / "alembic"
             / "versions"
-            / "0042_provider_waiting_lifecycle_backfill.py"
+            / revision_file
         )
         spec = importlib.util.spec_from_file_location("provider_waiting_backfill", migration_path)
         assert spec is not None and spec.loader is not None
@@ -118,6 +118,56 @@ class ProviderWaitingBackfillTest(unittest.TestCase):
             self.assertEqual(orphan_profile.user_id, user_id)
             self.assertEqual(orphan_profile.app_status, "BOOKED")
             self.assertFalse(orphan_profile.installed)
+
+    def test_provider_installed_backfill_promotes_waiting_to_active(self) -> None:
+        user_id = str(uuid.uuid4())
+        now = utcnow()
+        with self.Session() as session:
+            session.add(AppUser(id=user_id, phone="+9647700000043", name="Install User", status="active"))
+            session.flush()
+            order = CustomerOrder(user_id=user_id, order_number="ORD-BACKFILL-C", order_status="PROVIDER_WAITING", booked_at=now)
+            session.add(order)
+            session.flush()
+            item = OrderItem(
+                customer_order_id=order.id,
+                service_type="esim",
+                provider_order_no="ORD-BACKFILL-C",
+                item_status="PROVIDER_WAITING",
+                provider_status="INSTALLATION",
+                booked_at=now,
+            )
+            session.add(item)
+            session.flush()
+            order_id = order.id
+            item_id = item.id
+            session.add(
+                ESimProfile(
+                    order_item_id=item.id,
+                    user_id=user_id,
+                    app_status="PROVIDER_WAITING",
+                    provider_status="INSTALLATION",
+                    installed=True,
+                    installed_at=now,
+                    activated_at=None,
+                    validity_days=7,
+                    custom_fields={"providerInstallEvidence": {"eid": "89043052010008887024021623912688"}},
+                )
+            )
+            session.commit()
+
+        self._run_upgrade("0043_activate_provider_installed_profiles.py")
+
+        with self.Session() as session:
+            profile = session.scalar(select(ESimProfile).where(ESimProfile.order_item_id == item_id))
+            item_row = session.get(OrderItem, item_id)
+            order_row = session.get(CustomerOrder, order_id)
+
+            self.assertIsNotNone(profile)
+            self.assertEqual(profile.app_status, "ACTIVE")
+            self.assertTrue(profile.installed)
+            self.assertIsNotNone(profile.activated_at)
+            self.assertEqual(item_row.item_status, "ACTIVE")
+            self.assertEqual(order_row.order_status, "ACTIVE")
 
 
 if __name__ == "__main__":

@@ -2703,7 +2703,13 @@ class SupabaseStore:
         if not isinstance(payload, dict):
             return {}
         fields = {
-            "downloadTime": payload.get("downloadTime") or payload.get("download_time") or payload.get("downloadedTime"),
+            "downloadTime": (
+                payload.get("downloadTime")
+                or payload.get("download_time")
+                or payload.get("downloadedTime")
+                or payload.get("installationTime")
+                or payload.get("installation_time")
+            ),
             "eid": payload.get("eid") or payload.get("EID"),
             "deviceType": payload.get("deviceType") or payload.get("device_type"),
             "deviceBrand": payload.get("deviceBrand") or payload.get("device_brand"),
@@ -2730,6 +2736,12 @@ class SupabaseStore:
             return True
         return False
 
+    @staticmethod
+    def _stored_provider_install_evidence(profile: ESimProfile) -> dict[str, Any]:
+        custom_fields = profile.custom_fields if isinstance(profile.custom_fields, dict) else {}
+        value = custom_fields.get("providerInstallEvidence") or custom_fields.get("provider_install_evidence")
+        return value if isinstance(value, dict) else {}
+
     def _resolve_profile_app_status(
         self,
         profile: ESimProfile,
@@ -2738,6 +2750,7 @@ class SupabaseStore:
         provider_smdp_status: str | None = None,
         fallback_status: str | None = None,
         used_data_mb: int | float | None = None,
+        provider_install_confirmed: bool = False,
     ) -> str | None:
         normalized_esim = normalize_esim_status(provider_esim_status)
         normalized_smdp = normalize_esim_status(provider_smdp_status)
@@ -2760,6 +2773,9 @@ class SupabaseStore:
 
         if provider_active:
             return "ACTIVE" if bool(profile.installed) else PROVIDER_WAITING_STATUS
+
+        if bool(profile.installed) and provider_install_confirmed:
+            return "ACTIVE"
 
         if (
             bool(profile.installed)
@@ -2811,7 +2827,7 @@ class SupabaseStore:
         if profile.installed_at is None:
             profile.installed_at = now
         if profile.activated_at is None:
-            profile.activated_at = now
+            profile.activated_at = profile.installed_at or now
         if profile.validity_days and profile.expires_at is None:
             profile.expires_at = profile.activated_at + timedelta(days=profile.validity_days)
         order_item = profile.order_item
@@ -2941,6 +2957,7 @@ class SupabaseStore:
             profile.qr_code_url = item.get("qrCodeUrl")
             profile.install_url = item.get("shortUrl")
             profile.provider_status = item.get("smdpStatus")
+            install_evidence = self._provider_install_evidence(item)
             self._apply_provider_install_evidence(profile, item)
             profile.app_status = self._resolve_profile_app_status(
                 profile,
@@ -2948,6 +2965,7 @@ class SupabaseStore:
                 provider_smdp_status=profile.provider_status,
                 fallback_status=profile.app_status,
                 used_data_mb=used_data_mb,
+                provider_install_confirmed=bool(install_evidence),
             )
             profile.data_type = None if item.get("dataType") is None else str(item.get("dataType"))
             profile.total_data_mb = total_data_mb
@@ -2976,7 +2994,7 @@ class SupabaseStore:
                     "checkoutSnapshot": (order_item.custom_fields or {}).get("checkoutSnapshot"),
                     "providerEsimStatus": status_after,
                     "providerSmdpStatus": profile.provider_status,
-                    "providerInstallEvidence": self._provider_install_evidence(item),
+                    "providerInstallEvidence": install_evidence,
                     "activationCode": profile.activation_code,
                     "qrCodeUrl": profile.qr_code_url,
                     "installUrl": profile.install_url,
@@ -3002,7 +3020,8 @@ class SupabaseStore:
                 payload=item,
             )
             # Provider-active signals only become app-active after the app has
-            # confirmed install. Otherwise they remain PROVIDER_WAITING.
+            # confirmed install. Provider install/download evidence also
+            # starts the app lifecycle immediately.
             self._apply_active_side_effects(
                 profile,
                 source="provider_sync",
@@ -3161,6 +3180,7 @@ class SupabaseStore:
                 provider_esim_status=self._stored_provider_esim_status(profile),
                 provider_smdp_status=profile.provider_status,
                 fallback_status=profile.app_status,
+                provider_install_confirmed=bool(self._stored_provider_install_evidence(profile)),
             ) or PROVIDER_WAITING_STATUS
             self._apply_active_side_effects(
                 profile,
@@ -3180,6 +3200,7 @@ class SupabaseStore:
                 provider_esim_status=self._stored_provider_esim_status(profile),
                 provider_smdp_status=profile.provider_status,
                 fallback_status=profile.app_status,
+                provider_install_confirmed=bool(self._stored_provider_install_evidence(profile)),
             ) or PROVIDER_WAITING_STATUS
             self._apply_active_side_effects(
                 profile,
@@ -3220,6 +3241,7 @@ class SupabaseStore:
                 provider_esim_status=self._stored_provider_esim_status(profile),
                 provider_smdp_status=profile.provider_status,
                 fallback_status="ACTIVE",
+                provider_install_confirmed=bool(self._stored_provider_install_evidence(profile)),
             ) or PROVIDER_WAITING_STATUS
             self._apply_active_side_effects(
                 profile,
@@ -3279,19 +3301,21 @@ class SupabaseStore:
         )
         if profile is not None and (content.get("esimStatus") or content.get("smdpStatus")):
             profile.provider_status = content.get("smdpStatus") or profile.provider_status
+            install_evidence = self._provider_install_evidence(content)
             self._apply_provider_install_evidence(profile, content)
             profile.app_status = self._resolve_profile_app_status(
                 profile,
                 provider_esim_status=content.get("esimStatus"),
                 provider_smdp_status=profile.provider_status,
                 fallback_status=profile.app_status,
+                provider_install_confirmed=bool(install_evidence),
             )
             profile.custom_fields = self._merge_json_dict(
                 profile.custom_fields,
                 {
                     "providerEsimStatus": content.get("esimStatus"),
                     "providerSmdpStatus": profile.provider_status,
-                    "providerInstallEvidence": self._provider_install_evidence(content),
+                    "providerInstallEvidence": install_evidence,
                 },
             )
             profile.expires_at = parse_provider_datetime(content.get("expiredTime")) or profile.expires_at
