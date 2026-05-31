@@ -320,11 +320,24 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         from sqlalchemy import or_, select as _select, func
         from datetime import timedelta
 
-        active_rows = db.scalars(
-            _select(ESimProfile)
-            .where(func.upper(ESimProfile.app_status) == "ACTIVE")
-            .where(ESimProfile.iccid.is_not(None))
-        ).all()
+        # Cron mode: only refresh profiles that are already ACTIVE (cheap,
+        # for GB usage updates). Admin mode: also include INACTIVE+iccid'd
+        # profiles, so the "Refresh from provider" button picks up profiles
+        # the user just installed (they're still INACTIVE in our DB until
+        # the provider reports IN_USE).
+        if source == "cron":
+            active_rows = db.scalars(
+                _select(ESimProfile)
+                .where(func.upper(ESimProfile.app_status) == "ACTIVE")
+                .where(ESimProfile.iccid.is_not(None))
+            ).all()
+        else:
+            # admin/manual: include anything with an ICCID that isn't a hard-dead status
+            active_rows = db.scalars(
+                _select(ESimProfile)
+                .where(ESimProfile.iccid.is_not(None))
+                .where(~func.upper(ESimProfile.app_status).in_(("CANCELLED", "REVOKED", "REFUNDED", "EXPIRED")))
+            ).all()
         broken_rows = db.scalars(
             _select(ESimProfile)
             .where(ESimProfile.iccid.is_(None))
