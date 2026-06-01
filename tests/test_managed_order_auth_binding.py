@@ -45,6 +45,8 @@ class ManagedOrderAuthBindingTest(unittest.TestCase):
         self.db_path = temp_db.name
         self.user_id = str(uuid.uuid4())
         self.user_phone = "+9647701230001"
+        self.loyalty_user_id = str(uuid.uuid4())
+        self.loyalty_user_phone = "+9647701230002"
         os.environ["AUTH_SECRET_KEY"] = "test-auth-secret"
         os.environ["ESIM_ACCESS_ACCESS_CODE"] = "test-code"
         os.environ["ESIM_ACCESS_SECRET_KEY"] = "test-secret"
@@ -65,6 +67,16 @@ class ManagedOrderAuthBindingTest(unittest.TestCase):
                     name="Token User",
                     email="token-user@example.com",
                     status="active",
+                )
+            )
+            session.add(
+                AppUser(
+                    id=self.loyalty_user_id,
+                    phone=self.loyalty_user_phone,
+                    name="Loyalty User",
+                    email="loyalty-user@example.com",
+                    status="active",
+                    is_loyalty=True,
                 )
             )
             session.commit()
@@ -95,6 +107,16 @@ class ManagedOrderAuthBindingTest(unittest.TestCase):
         token = create_access_token(
             subject_id=self.user_id,
             phone=self.user_phone,
+            subject_type="user",
+            secret_key="test-auth-secret",
+            ttl_seconds=3600,
+        )
+        return {"Authorization": f"Bearer {token}"}
+
+    def _loyalty_auth_header(self) -> dict[str, str]:
+        token = create_access_token(
+            subject_id=self.loyalty_user_id,
+            phone=self.loyalty_user_phone,
             subject_type="user",
             secret_key="test-auth-secret",
             ttl_seconds=3600,
@@ -147,16 +169,16 @@ class ManagedOrderAuthBindingTest(unittest.TestCase):
     def test_managed_order_loyalty_creates_payment_attempt_and_order_payment_fields(self) -> None:
         response = self.client.post(
             "/api/v1/esim-access/orders/managed",
-            headers=self._user_auth_header(),
+            headers=self._loyalty_auth_header(),
             json={
                 "providerRequest": {
                     "transactionId": "APP-ORDER-LOYALTY-1",
                     "packageInfoList": [{"packageCode": "PKG-LOYALTY-1", "count": 1, "price": 900}],
                 },
                 "user": {
-                    "phone": self.user_phone,
-                    "name": "Token User",
-                    "email": "token-user@example.com",
+                    "phone": self.loyalty_user_phone,
+                    "name": "Loyalty User",
+                    "email": "loyalty-user@example.com",
                 },
                 "platformCode": "mobile_app",
                 "currencyCode": "IQD",
@@ -193,6 +215,40 @@ class ManagedOrderAuthBindingTest(unittest.TestCase):
             self.assertIsNotNone(item)
             assert item is not None
             self.assertEqual(item.payment_method, "loyalty")
+
+    def test_managed_order_loyalty_rejected_for_non_loyalty_user(self) -> None:
+        # A normal (non-loyalty) account must NOT be able to comp a purchase via
+        # paymentMethod=loyalty, even if the client sends it. The guard rejects
+        # with 403 before any provider order is placed, and no order/payment row
+        # is created.
+        response = self.client.post(
+            "/api/v1/esim-access/orders/managed",
+            headers=self._user_auth_header(),
+            json={
+                "providerRequest": {
+                    "transactionId": "APP-ORDER-LOYALTY-DENY-1",
+                    "packageInfoList": [{"packageCode": "PKG-LOYALTY-2", "count": 1, "price": 900}],
+                },
+                "user": {
+                    "phone": self.user_phone,
+                    "name": "Token User",
+                    "email": "token-user@example.com",
+                },
+                "platformCode": "mobile_app",
+                "currencyCode": "IQD",
+                "providerCurrencyCode": "IQD",
+                "customFields": {
+                    "paymentMethod": "loyalty",
+                    "paymentStatus": "approved",
+                },
+            },
+        )
+        self.assertEqual(response.status_code, 403)
+        with self.session_factory() as session:
+            orders = session.scalars(
+                select(CustomerOrder).where(CustomerOrder.user_id == self.user_id)
+            ).all()
+            self.assertEqual(orders, [])
 
 
 if __name__ == "__main__":

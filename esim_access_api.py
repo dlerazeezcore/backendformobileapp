@@ -1837,6 +1837,16 @@ def register_esim_access_routes(
     ) -> dict[str, Any]:
         auth_user = require_active_subject(db, claims=claims, subject_type="user")
         assert isinstance(auth_user, AppUser)
+        # Loyalty is a comped payment method reserved for loyalty (VIP/staff)
+        # accounts. Enforce server-side — the UI hides it for normal users, but
+        # we must not rely on the client. Reject BEFORE the provider order call
+        # so a tampered request can never spend provider credit for free.
+        requested_method, _ = _resolve_payment_method_provider(payload)
+        if requested_method == "loyalty" and not bool(auth_user.is_loyalty):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Loyalty checkout is not available for this account.",
+            )
         # Snapshot the user fields we'll need AFTER detaching the session,
         # then release the DB pool slot before the slow provider call. With
         # the default pool size of 8 and 4 overflow, holding sessions across
