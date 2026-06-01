@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
@@ -2456,9 +2456,17 @@ def register_esim_access_routes(
 
     @app.get("/api/v1/esim-access/exchange-rates/current")
     def get_current_exchange_rate_settings(
+        response: Response,
         db: Session = Depends(get_db),
     ) -> dict[str, Any]:
         nonlocal exchange_rate_settings_cache, exchange_rate_settings_retry_after
+        # The rate + markup change at most a few times a day. Let proxies/CDN
+        # and the client reuse the response for 5 min (with a 10 min
+        # stale-while-revalidate grace) so app-open pricing renders instantly
+        # and we shed repeat traffic off the DB. This is a GET, so HTTP caching
+        # actually applies (unlike the POST catalog endpoints, which rely on
+        # the in-process provider cache instead).
+        response.headers["Cache-Control"] = "public, max-age=300, stale-while-revalidate=600"
         if monotonic() < exchange_rate_settings_retry_after:
             fallback_settings = exchange_rate_settings_cache or _default_exchange_rate_settings()
             return {
