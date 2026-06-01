@@ -273,7 +273,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
 
         For each ACTIVE profile, calls provider.query_profiles by ICCID (the
         most reliable lookup), then sync_profiles to apply. Returns summary.
-        Designed to be called every 30min by Koyeb's cron scheduler.
+        Designed to be called hourly by the GitHub Action cron scheduler.
         """
         from supabase_store import ESimProfile
         from esim_access_api import ProfileQueryRequest
@@ -332,8 +332,8 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
             # The ONBOARDING alias + _apply_active_side_effects already fires
             # on every webhook/recover, so this is just belt-and-suspenders for
             # drift / missed webhooks.
-            active_rows = db.scalars(
-                _select(ESimProfile)
+            active_iccids = db.scalars(
+                _select(ESimProfile.iccid)
                 .where(ESimProfile.iccid.is_not(None))
                 .where(
                     or_(
@@ -344,28 +344,44 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
             ).all()
         else:
             # admin/manual: include anything with an ICCID that isn't a hard-dead status
-            active_rows = db.scalars(
-                _select(ESimProfile)
+            active_iccids = db.scalars(
+                _select(ESimProfile.iccid)
                 .where(ESimProfile.iccid.is_not(None))
                 .where(~func.upper(ESimProfile.app_status).in_(("CANCELLED", "REVOKED", "REFUNDED", "EXPIRED")))
             ).all()
-        broken_rows = db.scalars(
-            _select(ESimProfile)
+        # Snapshot the broken-placeholder (profile_id, order_no) pairs up front
+        # so we don't keep a row reference alive across provider IO.
+        broken_pairs = db.execute(
+            _select(ESimProfile.id, OrderItem.provider_order_no)
+            .join(OrderItem, ESimProfile.order_item_id == OrderItem.id)
             .where(ESimProfile.iccid.is_(None))
             .where(or_(ESimProfile.activation_code.is_(None), ESimProfile.activation_code == ""))
             .where(ESimProfile.created_at >= (utcnow() - timedelta(days=7)))
+            .where(OrderItem.provider_order_no.is_not(None))
         ).all()
 
+        # CRITICAL (freeze fix): release the pooled DB connection BEFORE the
+        # provider IO loop. Previously this function held one connection for
+        # the entire duration of N sequential provider round-trips (each
+        # 1-3 s). With N active profiles that pinned a slot for N*2s+, and
+        # when the hourly cron overlapped a user's pull-to-refresh the pool
+        # starved and the whole backend appeared frozen. Now each iteration
+        # closes the session before calling the provider; sync_profiles
+        # transparently checks a fresh connection back out for the short write.
+        db.close()
+
+        active_iccids = [i for i in active_iccids if i]
         store = SupabaseStore(db)
         attempted = 0
         synced = 0
         recovered = 0
         errors: list[dict[str, Any]] = []
 
-        for r in active_rows:
+        for iccid in active_iccids:
             attempted += 1
             try:
-                resp = await provider.query_profiles(ProfileQueryRequest(iccid=r.iccid))
+                db.close()  # drop the slot during the provider round-trip
+                resp = await provider.query_profiles(ProfileQueryRequest(iccid=iccid))
                 applied = store.sync_profiles(
                     resp.model_dump(by_alias=True, exclude_none=True),
                     platform_code=f"{source}-refresh",
@@ -375,18 +391,14 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
                 if applied:
                     synced += 1
             except Exception as exc:  # pragma: no cover - resilience
-                errors.append({"profileId": r.id, "iccid": r.iccid, "error": str(exc)[:200]})
+                errors.append({"iccid": iccid, "error": str(exc)[:200]})
 
-        for r in broken_rows:
+        for profile_id, order_no in broken_pairs:
             attempted += 1
-            order_no: str | None = None
-            if r.order_item_id is not None:
-                oi = db.scalar(_select(OrderItem).where(OrderItem.id == r.order_item_id))
-                if oi is not None:
-                    order_no = oi.provider_order_no
             if not order_no:
                 continue
             try:
+                db.close()
                 resp = await provider.query_profiles(ProfileQueryRequest(order_no=order_no))
                 applied = store.sync_profiles(
                     resp.model_dump(by_alias=True, exclude_none=True),
@@ -394,15 +406,14 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
                     platform_name=f"Broken-placeholder recovery ({source})",
                     actor_phone=None,
                 )
-                db.refresh(r)
-                if r.activation_code:
+                refreshed = db.scalar(_select(ESimProfile).where(ESimProfile.id == profile_id))
+                if refreshed is not None and refreshed.activation_code:
                     recovered += 1
                 elif applied:
                     synced += 1
             except Exception as exc:  # pragma: no cover - resilience
-                errors.append({"profileId": r.id, "orderNo": order_no, "error": str(exc)[:200]})
+                errors.append({"profileId": profile_id, "orderNo": order_no, "error": str(exc)[:200]})
 
-        db.commit()
         return {
             "attempted": attempted,
             "activeRefreshed": synced,

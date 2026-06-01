@@ -1,7 +1,7 @@
 name: Refresh eSIM usage (cron)
 
 # Calls the backend's POST /api/v1/internal/cron/refresh-active-usage every
-# 30 minutes. The endpoint iterates every ACTIVE eSIM profile, queries the
+# hour. The endpoint iterates every ACTIVE eSIM profile, queries the
 # provider for fresh usage (used MB / total MB / expires_at), and updates
 # the row. This keeps the home tab's "remaining GB / days left" accurate
 # without users having to pull-to-refresh.
@@ -13,10 +13,10 @@ name: Refresh eSIM usage (cron)
 
 on:
   schedule:
-    # Every 30 minutes. GitHub cron is UTC; the underlying job is timezone-
+    # Hourly, on the hour. GitHub cron is UTC; the underlying job is timezone-
     # agnostic anyway (just refreshes data from the provider).
-    - cron: "*/30 * * * *"
-  # Manual trigger for smoke-testing without waiting for the next 30-min slot.
+    - cron: "0 * * * *"
+  # Manual trigger for smoke-testing without waiting for the next hourly slot.
   workflow_dispatch:
 
 permissions:

@@ -736,7 +736,14 @@ def _serialize_admin_order(order: CustomerOrder, *, now: datetime) -> dict[str, 
         if view is not None:
             out["dataGb"] = view.get("totalDataGb")
             out["validityDays"] = view.get("validityDays")
-            out["unlimited"] = not view.get("totalDataMb")
+            # Positive-evidence only: a missing totalDataMb on a freshly-booked
+            # placeholder means "not synced yet", NOT "unlimited". Only call it
+            # unlimited once the profile has progressed past the initial sync
+            # (active/expired) and the provider still reports no data cap.
+            status_value = str(view.get("status") or "").lower()
+            out["unlimited"] = (
+                not view.get("totalDataMb") and status_value in {"active", "expired"}
+            )
         else:
             out["dataGb"] = None
             out["validityDays"] = None
@@ -1557,7 +1564,7 @@ def register_esim_access_routes(
 ) -> None:
     usage_sync_interval_seconds = ESimAccessAPI._read_float_env(
         "ESIM_USAGE_SYNC_INTERVAL_SECONDS",
-        7200.0,
+        3600.0,  # hourly — matches the GitHub Action cron cadence.
         minimum=300.0,
     )
     usage_sync_batch_size = ESimAccessAPI._read_int_env("ESIM_USAGE_SYNC_BATCH_SIZE", 50, minimum=1)
