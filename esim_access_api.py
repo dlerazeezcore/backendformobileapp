@@ -1113,16 +1113,26 @@ class ESimAccessAPI:
         access_code: str,
         secret_key: str,
         base_url: str = "https://api.esimaccess.com",
-        timeout: float = 30.0,
+        timeout: float = 15.0,
         rate_limit_per_second: float = 8.0,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.access_code = access_code
         self.secret_key = secret_key
         self.rate_limiter = AsyncRateLimiter(rate_limit_per_second)
+        # Tight connect timeout so an unreachable provider fails fast instead
+        # of pinning a request thread (and its DB session, if any) for 30 s.
+        # Read budget stays generous enough for the /package/list endpoint to
+        # return its ~200 KB JSON.
+        client_timeout = httpx.Timeout(
+            connect=5.0,
+            read=timeout,
+            write=10.0,
+            pool=5.0,
+        )
         self.client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
-            timeout=timeout,
+            timeout=client_timeout,
             transport=transport,
             headers={"Accept": "application/json"},
         )
@@ -2313,6 +2323,28 @@ def register_esim_access_routes(
         )
         if profile is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile disappeared during recover")
+        # Bonus: when the profile already has an esim_tran_no, do a quick
+        # follow-up usage_check so this single endpoint also pulls fresh CDR
+        # data. The provider's query_profiles "orderUsage" field can lag the
+        # cellular session by minutes; usage_check hits the live counter.
+        # Best-effort — failures don't abort the response.
+        esim_tran_no = profile.esim_tran_no
+        if esim_tran_no:
+            try:
+                db.close()
+                usage_resp = await provider.usage_check(
+                    UsageCheckRequest(esimTranNoList=[esim_tran_no])
+                )
+                SupabaseStore(db).sync_usage_records(
+                    usage_resp.model_dump(by_alias=True, exclude_none=True),
+                    actor_phone=actor_phone_value,
+                )
+                db.commit()
+                profile = db.scalar(
+                    select(ESimProfile).where(ESimProfile.id == profile_id)
+                )
+            except Exception as exc:  # pragma: no cover - best-effort
+                LOGGER.warning("recover usage_check failed: %s", str(exc)[:200])
         # Return enough state that the frontend can short-circuit its polling
         # loop without a second round-trip through /usage/sync/my. ACTIVE is
         # only returned after install is confirmed and provider service is
