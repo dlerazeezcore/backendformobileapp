@@ -70,28 +70,28 @@ Release checklist for every backend change:
 
 Main runtime files:
 
-- [app.py](/Users/laveencompany/Desktop/backendformobileapp/app.py): FastAPI bootstrap file that wires all services together
-- [config.py](/Users/laveencompany/Desktop/backendformobileapp/config.py): environment settings
-- [dependencies.py](/Users/laveencompany/Desktop/backendformobileapp/dependencies.py): shared DB/provider access helpers for FastAPI
-- [admin.py](/Users/laveencompany/Desktop/backendformobileapp/admin.py): admin operational, pricing, and reporting routes
-- [users.py](/Users/laveencompany/Desktop/backendformobileapp/users.py): B2C user and admin-user payloads and API routes
-- [auth.py](/Users/laveencompany/Desktop/backendformobileapp/auth.py): login endpoints, password hashing helpers, and bearer-token helpers
-- [esim_access_api.py](/Users/laveencompany/Desktop/backendformobileapp/esim_access_api.py): all eSIM Access code, including provider client, request/response models, and eSIM routes
-- [fib_payment_api.py](/Users/laveencompany/Desktop/backendformobileapp/fib_payment_api.py): FIB payment client, models, webhook receiver route, and payment routes
-- [push_notification.py](/Users/laveencompany/Desktop/backendformobileapp/push_notification.py): push provider service, device registration routes, and admin send/list routes
-- [supabase_store.py](/Users/laveencompany/Desktop/backendformobileapp/supabase_store.py): SQLAlchemy models, persistence logic, pricing engine, sync logic
+- [app.py](app.py): FastAPI bootstrap file that wires all services together
+- [config.py](config.py): environment settings
+- [dependencies.py](dependencies.py): shared DB/provider access helpers for FastAPI
+- [admin.py](admin.py): admin operational, pricing, and reporting routes
+- [users.py](users.py): B2C user and admin-user payloads and API routes
+- [auth.py](auth.py): login endpoints, password hashing helpers, and bearer-token helpers
+- [esim_access_api.py](esim_access_api.py): all eSIM Access code, including provider client, request/response models, and eSIM routes
+- [fib_payment_api.py](fib_payment_api.py): FIB payment client, models, webhook receiver route, and payment routes
+- [push_notification.py](push_notification.py): push provider service, device registration routes, and admin send/list routes
+- [supabase_store.py](supabase_store.py): SQLAlchemy models, persistence logic, pricing engine, sync logic
 
 Database migration files:
 
-- [alembic.ini](/Users/laveencompany/Desktop/backendformobileapp/alembic.ini)
-- [alembic/env.py](/Users/laveencompany/Desktop/backendformobileapp/alembic/env.py)
-- [alembic/versions](/Users/laveencompany/Desktop/backendformobileapp/alembic/versions/0001_baseline_app_users.py)
+- [alembic.ini](alembic.ini)
+- [alembic/env.py](alembic/env.py)
+- [alembic/versions](alembic/versions/0001_baseline_app_users.py)
 
 Project support files:
 
-- [requirements.txt](/Users/laveencompany/Desktop/backendformobileapp/requirements.txt)
-- [README.md](/Users/laveencompany/Desktop/backendformobileapp/README.md)
-- [.gitignore](/Users/laveencompany/Desktop/backendformobileapp/.gitignore)
+- [requirements.txt](requirements.txt)
+- [README.md](README.md)
+- [.gitignore](.gitignore)
 
 This structure is already minimal and appropriate for this phase. I do not recommend splitting it further until the backend grows beyond what this layout can reasonably hold.
 
@@ -419,7 +419,7 @@ Notes:
 - push notifications require either `FIREBASE_SERVICE_ACCOUNT_FILE` or `FIREBASE_SERVICE_ACCOUNT_JSON`
 - keep only one Firebase credential source set in production to avoid ambiguity
 - `PUSH_NOTIFICATION_DEFAULT_CHANNEL_ID` controls Android notification channel fallback (default `general`)
-- FIB runtime defaults are hardcoded in [app.py](/Users/laveencompany/Desktop/backendformobileapp/app.py):
+- FIB runtime defaults are hardcoded in [app.py](app.py):
   - `FIB_PAYMENT_BASE_URL = "https://fib.prod.fib.iq"`
   - `FIB_PAYMENT_TIMEOUT_SECONDS = 30`
   - `FIB_PAYMENT_RATE_LIMIT_PER_SECOND = 8`
@@ -1163,7 +1163,7 @@ Receive webhook events from provider:
 
 Push delivery is implemented in:
 
-- [push_notification.py](/Users/laveencompany/Desktop/backendformobileapp/push_notification.py)
+- [push_notification.py](push_notification.py)
 
 Persistence is implemented in:
 
@@ -1382,7 +1382,7 @@ Returns:
 
 This backend includes a dedicated FIB integration module:
 
-- [fib_payment_api.py](/Users/laveencompany/Desktop/backendformobileapp/fib_payment_api.py)
+- [fib_payment_api.py](fib_payment_api.py)
 
 The backend uses FIB OAuth2 `client_credentials` internally and caches bearer tokens automatically. Frontend clients do not need to call FIB auth directly.
 
@@ -1391,7 +1391,7 @@ The backend uses FIB OAuth2 `client_credentials` internally and caches bearer to
 - stage: `https://fib.stage.fib.iq`
 - production: `https://fib.prod.fib.iq`
 
-Current backend default target is hardcoded to production in [app.py](/Users/laveencompany/Desktop/backendformobileapp/app.py) as `FIB_PAYMENT_BASE_URL`.
+Current backend default target is hardcoded to production in [app.py](app.py) as `FIB_PAYMENT_BASE_URL`.
 
 ### Canonical routes and aliases
 
@@ -1828,13 +1828,13 @@ Long-term direction:
 
 Files that matter for deployment:
 
-- [app.py](/Users/laveencompany/Desktop/backendformobileapp/app.py)
-- [esim_access_api.py](/Users/laveencompany/Desktop/backendformobileapp/esim_access_api.py)
-- [supabase_store.py](/Users/laveencompany/Desktop/backendformobileapp/supabase_store.py)
-- [requirements.txt](/Users/laveencompany/Desktop/backendformobileapp/requirements.txt)
-- [alembic.ini](/Users/laveencompany/Desktop/backendformobileapp/alembic.ini)
-- [alembic](/Users/laveencompany/Desktop/backendformobileapp/alembic/env.py)
-- [README.md](/Users/laveencompany/Desktop/backendformobileapp/README.md)
+- [app.py](app.py)
+- [esim_access_api.py](esim_access_api.py)
+- [supabase_store.py](supabase_store.py)
+- [requirements.txt](requirements.txt)
+- [alembic.ini](alembic.ini)
+- [alembic](alembic/env.py)
+- [README.md](README.md)
 
 Do not deploy:
 
