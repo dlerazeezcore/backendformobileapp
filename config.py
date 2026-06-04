@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     twilio_account_sid: str | None = Field(default=None, alias="TWILIO_ACCOUNT_SID")
     twilio_auth_token: str | None = Field(default=None, alias="TWILIO_AUTH_TOKEN")
     twilio_verify_service_sid: str | None = Field(default=None, alias="TWILIO_VERIFY_SERVICE_SID")
+    wings_auth_token: str | None = Field(default=None, alias="WINGS_AUTH_TOKEN")
+    wings_base_url: str = Field(default="https://wings.laveen-air.com/RIAM_main/rest/api", alias="WINGS_BASE_URL")
+    wings_search_url: str | None = Field(default=None, alias="WINGS_SEARCH_URL")
+    wings_request_timeout_seconds: float = Field(default=60.0, alias="WINGS_REQUEST_TIMEOUT_SECONDS")
 
     @model_validator(mode="after")
     def validate_production_secrets(self) -> "Settings":

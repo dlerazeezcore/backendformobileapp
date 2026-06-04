@@ -6,11 +6,13 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-# Hardcoded live Eurowings/WINGS config copied from the provided single-file API.
-WINGS_BASE_URL = "https://wings.laveen-air.com/RIAM_main/rest/api"
-WINGS_AUTH_TOKEN = "Q0QwN0ExMDkxRkNCRjRDRjJGOUZFRjgwNzdEQzI1OTM="
-WINGS_SEARCH_URL = f"{WINGS_BASE_URL}/AirLowFareSearch"
-REQUEST_TIMEOUT_SECONDS = 60.0
+from config import get_settings
+
+
+def _wings_search_url() -> str:
+    """Search endpoint: explicit override, else derived from the configured base URL."""
+    settings = get_settings()
+    return settings.wings_search_url or f"{settings.wings_base_url}/AirLowFareSearch"
 
 
 class WingsPax(BaseModel):
@@ -126,12 +128,19 @@ def _only_basic_smart_biz(*provider_responses: dict[str, Any]) -> dict[str, Any]
 
 
 async def _post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
+    settings = get_settings()
+    token = settings.wings_auth_token
+    if not token:
+        raise HTTPException(
+            status_code=503,
+            detail={"provider": "wings", "error": "WINGS_AUTH_TOKEN is not configured"},
+        )
     headers = {
-        "Authorization": WINGS_AUTH_TOKEN,
+        "Authorization": token,
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+    async with httpx.AsyncClient(timeout=settings.wings_request_timeout_seconds) as client:
         resp = await client.post(url, headers=headers, json=payload)
     try:
         body = resp.json()
@@ -148,21 +157,23 @@ async def _post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
 def register_wings_routes(app: FastAPI) -> None:
     @app.get("/api/v1/wings/health")
     async def wings_health() -> dict[str, Any]:
+        settings = get_settings()
         return {
             "ok": True,
             "service": "wings-availability",
-            "base_url": WINGS_BASE_URL,
-            "search_url": WINGS_SEARCH_URL,
-            "token_hardcoded": True,
+            "base_url": settings.wings_base_url,
+            "search_url": _wings_search_url(),
+            "token_configured": bool(settings.wings_auth_token),
             "availability_only": True,
         }
 
     @app.post("/api/v1/wings/availability/raw")
     async def wings_availability_raw(req: WingsAvailabilityRequest) -> dict[str, Any]:
+        search_url = _wings_search_url()
         payload_economy = _build_search_payload(req, ["Economy"])
         payload_business = _build_search_payload(req, ["Business"])
-        resp_economy = await _post_json(WINGS_SEARCH_URL, payload_economy)
-        resp_business = await _post_json(WINGS_SEARCH_URL, payload_business)
+        resp_economy = await _post_json(search_url, payload_economy)
+        resp_business = await _post_json(search_url, payload_business)
         provider_response = _only_basic_smart_biz(resp_economy, resp_business)
 
         return {
