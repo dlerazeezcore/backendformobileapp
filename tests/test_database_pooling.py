@@ -32,41 +32,47 @@ class DatabasePoolingTest(unittest.TestCase):
         ):
             os.environ.pop(name, None)
 
-    def test_postgres_pool_defaults_are_conservative_for_supabase_pooler(self) -> None:
+    def test_postgres_pool_defaults_for_direct_connection(self) -> None:
+        # Direct (non-pooler) Postgres uses a moderate pool. Defaults are set in
+        # create_database() in supabase_store.py (see its pool-sizing comment).
         session_factory = create_database("postgresql://user:password@example.com:5432/postgres")
         engine = session_factory.kw["bind"]
         try:
             self.assertIsInstance(engine.pool, QueuePool)
-            self.assertEqual(engine.pool.size(), 2)
-            self.assertEqual(engine.pool._max_overflow, 1)
+            self.assertEqual(engine.pool.size(), 4)
+            self.assertEqual(engine.pool._max_overflow, 2)
             self.assertEqual(engine.pool._timeout, 15)
             self.assertEqual(engine.pool._recycle, 180)
             self.assertTrue(engine.pool._pre_ping)
         finally:
             engine.dispose()
 
-    def test_supabase_transaction_pooler_url_uses_small_queue_pool_in_auto_mode(self) -> None:
+    def test_supabase_transaction_pooler_url_uses_multiplexing_pool_in_auto_mode(self) -> None:
+        # Transaction pooler multiplexes, so the app runs a wider pool (8 + 4
+        # overflow) to avoid checkout-timeout stalls. See create_database().
         session_factory = create_database(
             "postgresql://user:password@aws-1-ap-southeast-2.pooler.supabase.com:6543/postgres"
         )
         engine = session_factory.kw["bind"]
         try:
             self.assertIsInstance(engine.pool, QueuePool)
-            self.assertEqual(engine.pool.size(), 2)
-            self.assertEqual(engine.pool._max_overflow, 0)
+            self.assertEqual(engine.pool.size(), 8)
+            self.assertEqual(engine.pool._max_overflow, 4)
             self.assertEqual(engine.pool._timeout, 10)
         finally:
             engine.dispose()
 
-    def test_supabase_session_pooler_url_is_normalized_and_uses_small_queue_pool_in_auto_mode(self) -> None:
+    def test_supabase_session_pooler_url_is_normalized_and_uses_multiplexing_pool_in_auto_mode(self) -> None:
+        # In auto mode a :5432 pooler URL is normalized to transaction mode
+        # (:6543), so it takes the wider transaction-pooler pool (8 + 4).
         session_factory = create_database(
             "postgresql://user:password@aws-1-ap-southeast-2.pooler.supabase.com:5432/postgres"
         )
         engine = session_factory.kw["bind"]
         try:
             self.assertIsInstance(engine.pool, QueuePool)
-            self.assertEqual(engine.pool.size(), 2)
-            self.assertEqual(engine.pool._max_overflow, 0)
+            self.assertEqual(engine.pool.size(), 8)
+            self.assertEqual(engine.pool._max_overflow, 4)
             self.assertEqual(engine.pool._timeout, 10)
             self.assertEqual(engine.url.port, 6543)
         finally:
@@ -79,8 +85,8 @@ class DatabasePoolingTest(unittest.TestCase):
         engine = session_factory.kw["bind"]
         try:
             self.assertIsInstance(engine.pool, QueuePool)
-            self.assertEqual(engine.pool.size(), 2)
-            self.assertEqual(engine.pool._max_overflow, 0)
+            self.assertEqual(engine.pool.size(), 8)
+            self.assertEqual(engine.pool._max_overflow, 4)
             self.assertEqual(engine.pool._timeout, 10)
             self.assertEqual(engine.url.port, 6543)
         finally:

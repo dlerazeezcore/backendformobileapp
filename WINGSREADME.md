@@ -1,13 +1,12 @@
 # WINGS Availability Only
 
-This backend now includes only the Eurowings/WINGS availability API from:
+This backend includes only the Eurowings/WINGS availability API (ported from a
+prior single-file prototype).
 
-- `/Users/laveencompany/Projects/The Backend/backend/wings_single_file_hardcoded.py`
+What it provides:
 
-What was brought in:
-
-- hardcoded WINGS live base URL
-- hardcoded WINGS auth token
+- WINGS live base URL (configurable via env)
+- WINGS auth token (configurable via env)
 - availability request models
 - search payload builder
 - provider call logic
@@ -26,14 +25,18 @@ What was intentionally not brought in:
 - `GET /api/v1/wings/health`
 - `POST /api/v1/wings/availability/raw`
 
-## Hardcoded provider config
+## Provider config (environment variables)
 
-These values are currently hardcoded in [wings_api.py](/Users/laveencompany/Desktop/backendformobileapp/wings_api.py):
+Defined in [config.py](config.py) and read by [wings_api.py](wings_api.py) via
+`get_settings()`. Set these in `.env` (see [.env.example](.env.example)):
 
-- `WINGS_BASE_URL = "https://wings.laveen-air.com/RIAM_main/rest/api"`
-- `WINGS_SEARCH_URL = "https://wings.laveen-air.com/RIAM_main/rest/api/AirLowFareSearch"`
-- `REQUEST_TIMEOUT_SECONDS = 60.0`
-- `WINGS_AUTH_TOKEN` is hardcoded in the file
+- `WINGS_AUTH_TOKEN` — **required** for the WINGS endpoints; they return HTTP 503 when unset.
+- `WINGS_BASE_URL` — defaults to `https://wings.laveen-air.com/RIAM_main/rest/api`.
+- `WINGS_SEARCH_URL` — optional override; derived from `WINGS_BASE_URL` when blank.
+- `WINGS_REQUEST_TIMEOUT_SECONDS` — defaults to `60`.
+
+> The token was previously hardcoded in `wings_api.py`. It has been moved to env
+> config; any token that was ever committed must be treated as compromised and rotated.
 
 ## Availability request body
 
@@ -132,16 +135,16 @@ Example:
   "service": "wings-availability",
   "base_url": "https://wings.laveen-air.com/RIAM_main/rest/api",
   "search_url": "https://wings.laveen-air.com/RIAM_main/rest/api/AirLowFareSearch",
-  "token_hardcoded": true,
+  "token_configured": true,
   "availability_only": true
 }
 ```
 
-## Files changed
+## Files
 
-- [wings_api.py](/Users/laveencompany/Desktop/backendformobileapp/wings_api.py)
-- [app.py](/Users/laveencompany/Desktop/backendformobileapp/app.py)
-- [WINGSREADME.md](/Users/laveencompany/Desktop/backendformobileapp/WINGSREADME.md)
+- [wings_api.py](wings_api.py) — models, payload builder, provider calls, filtering, routes
+- [app.py](app.py) — registers the WINGS routes
+- [config.py](config.py) — WINGS env settings
 
 ## Run locally
 
@@ -175,9 +178,8 @@ curl -X POST http://127.0.0.1:8000/api/v1/wings/availability/raw \
 
 ## Important notes
 
-- this is hardcoded live-provider access
+- live-provider access; the token is configured via env (`WINGS_AUTH_TOKEN`)
 - no database is used for WINGS availability
 - no booking route was added
-- no environment-variable refactor was done
-- no auth wrapper was added around these WINGS routes
-- this is availability only, exactly as requested
+- no auth wrapper is applied around these WINGS routes
+- availability only

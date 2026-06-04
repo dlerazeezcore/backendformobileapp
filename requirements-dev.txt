@@ -1,0 +1,5 @@
+# Test/dev dependencies (not installed in production).
+# Installs runtime deps too, so CI can use a single `pip install -r requirements-dev.txt`.
+-r requirements.txt
+pytest>=8,<10
+pytest-subtests>=0.12,<1.0
