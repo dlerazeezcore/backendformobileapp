@@ -23,23 +23,11 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from auth import get_token_claims, require_active_subject
-from config import get_settings
+from config import get_settings, read_bool_env as _read_bool_env, read_float_env, read_int_env
 from supabase_store import AdminUser, AppUser, CustomerOrder, ESimProfile, OrderItem, PaymentAttempt, ProfileInventoryRow, SupabaseStore, utcnow
 from users import UserPayload
 
 LOGGER = logging.getLogger("uvicorn.error")
-
-
-def _read_bool_env(name: str, default: bool) -> bool:
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return default
-    normalized = raw_value.strip().lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    return default
 
 
 class ESimAccessError(Exception):
@@ -1154,27 +1142,10 @@ class ESimAccessAPI:
     async def close(self) -> None:
         await self.client.aclose()
 
-    @staticmethod
-    def _read_float_env(name: str, default: float, *, minimum: float = 0.0) -> float:
-        raw_value = os.getenv(name)
-        if raw_value is None or raw_value.strip() == "":
-            return default
-        try:
-            parsed = float(raw_value)
-        except ValueError:
-            return default
-        return max(parsed, minimum)
-
-    @staticmethod
-    def _read_int_env(name: str, default: int, *, minimum: int = 0) -> int:
-        raw_value = os.getenv(name)
-        if raw_value is None or raw_value.strip() == "":
-            return default
-        try:
-            parsed = int(raw_value)
-        except ValueError:
-            return default
-        return max(parsed, minimum)
+    # Thin delegations to the centralized readers in config.py (kept as static
+    # methods so existing self./ESimAccessAPI. call sites stay unchanged).
+    _read_float_env = staticmethod(read_float_env)
+    _read_int_env = staticmethod(read_int_env)
 
     @staticmethod
     def _package_cache_key(request: PackageQueryRequest) -> str:

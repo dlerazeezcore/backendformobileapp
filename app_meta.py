@@ -12,13 +12,13 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from auth import get_token_claims, require_active_subject
-from supabase_store import AdminUser, AppReleaseInfo, utcnow
+from supabase_store import AdminUser, AppReleaseInfo, SupabaseStore, utcnow
 
 
 class _Model(BaseModel):
@@ -79,6 +79,23 @@ def register_app_meta_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         row = _get_or_create(db)
         db.commit()
         return _serialize(row)
+
+    @app.get("/api/v1/currencies")
+    async def get_currencies(response: Response, db: Session = Depends(get_db)) -> dict[str, Any]:
+        """Universal currency set for the app: pure FX rates (IQD per 1 unit) for
+        every enabled display currency + the IQD settlement base. `esimPricing`
+        carries the (service-scoped) global eSIM markup the client uses to compute
+        eSIM display prices. FX is universal; markup is eSIM-only (and future
+        per-country/class via pricing_rules)."""
+        store = SupabaseStore(db)
+        currencies = store.get_display_currencies()
+        markup_percent = store.get_global_esim_markup_percent()
+        response.headers["Cache-Control"] = "public, max-age=300, stale-while-revalidate=600"
+        return {
+            "baseCurrency": "IQD",
+            "currencies": currencies,
+            "esimPricing": {"markupPercent": markup_percent},
+        }
 
     @app.put("/api/v1/admin/app/version-info")
     async def update_version_info(

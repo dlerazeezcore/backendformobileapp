@@ -30,6 +30,8 @@ from config import (
     DEFAULT_ESIM_ACCESS_TIMEOUT_SECONDS,
     Settings,
     get_settings,
+    read_bool_env as _read_bool_env,
+    read_float_env as _read_float_env,
 )
 from dependencies import get_db, get_fib_provider, get_provider, get_push_provider, get_twilio_provider
 from esim_access_api import (
@@ -66,13 +68,10 @@ DEFAULT_CORS_ALLOWED_ORIGINS = [
 CORS_ALLOWED_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 CORS_ALLOWED_HEADERS = ["*"]
 DEFAULT_CORS_ALLOW_ORIGIN_REGEX = r".*"
-FIB_PAYMENT_BASE_URL = "https://fib.prod.fib.iq"
+# Connection-tuning constants stay here; URLs/endpoints live in config.py (env-overridable).
 FIB_PAYMENT_TIMEOUT_SECONDS = 30.0
 FIB_PAYMENT_RATE_LIMIT_PER_SECOND = 8.0
-FIB_PAYMENT_STATUS_CALLBACK_URL = "https://mean-lettie-corevia-0bd7cc91.koyeb.app/api/v1/payments/fib/webhook"
-FIB_PAYMENT_REDIRECT_URI = "tulip://payment/result"
 PUSH_NOTIFICATION_DEFAULT_CHANNEL_ID = "general"
-TWILIO_VERIFY_BASE_URL = "https://verify.twilio.com"
 TWILIO_VERIFY_TIMEOUT_SECONDS = 20.0
 TWILIO_VERIFY_RATE_LIMIT_PER_SECOND = 5.0
 # Optional hardcoded fallback when env var is not set.
@@ -84,29 +83,6 @@ def _split_env_csv(value: str | None) -> list[str]:
     if value is None:
         return []
     return [item.strip() for item in value.split(",") if item.strip()]
-
-
-def _read_bool_env(name: str, default: bool) -> bool:
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return default
-    normalized = raw_value.strip().lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    return default
-
-
-def _read_float_env(name: str, default: float, *, minimum: float = 0.0) -> float:
-    raw_value = os.getenv(name)
-    if raw_value is None or raw_value.strip() == "":
-        return default
-    try:
-        parsed = float(raw_value)
-    except ValueError:
-        return default
-    return max(parsed, minimum)
 
 
 def _get_cors_allowed_origins() -> list[str]:
@@ -222,11 +198,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.fib_payment_api = FIBPaymentAPI(
                 client_id=cfg.fib_payment_client_id,
                 client_secret=cfg.fib_payment_client_secret,
-                base_url=FIB_PAYMENT_BASE_URL,
+                base_url=cfg.fib_payment_base_url,
                 timeout=FIB_PAYMENT_TIMEOUT_SECONDS,
                 rate_limit_per_second=FIB_PAYMENT_RATE_LIMIT_PER_SECOND,
-                default_status_callback_url=FIB_PAYMENT_STATUS_CALLBACK_URL,
-                default_redirect_uri=FIB_PAYMENT_REDIRECT_URI,
+                default_status_callback_url=cfg.fib_payment_status_callback_url,
+                default_redirect_uri=cfg.fib_payment_redirect_uri,
                 webhook_secret=fib_webhook_secret,
             )
         elif cfg.fib_payment_client_id and cfg.fib_payment_client_secret:
@@ -245,7 +221,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 account_sid=cfg.twilio_account_sid,
                 auth_token=cfg.twilio_auth_token,
                 verify_service_sid=cfg.twilio_verify_service_sid,
-                base_url=TWILIO_VERIFY_BASE_URL,
+                base_url=cfg.twilio_verify_base_url,
                 timeout=TWILIO_VERIFY_TIMEOUT_SECONDS,
                 rate_limit_per_second=TWILIO_VERIFY_RATE_LIMIT_PER_SECOND,
             )

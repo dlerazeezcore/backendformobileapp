@@ -18,7 +18,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from config import get_settings
+from config import get_settings, read_float_env as _read_float_env
 from phone_utils import normalize_phone, phone_lookup_candidates
 from supabase_store import AdminUser, AppUser, utcnow
 from twilio_whatsapp import TwilioWhatsAppVerifyAPI
@@ -115,17 +115,6 @@ def _api_error(status_code: int, code: str, message: str) -> HTTPException:
             "message": message,
         },
     )
-
-
-def _read_float_env(name: str, default: float, *, minimum: float = 0.0) -> float:
-    raw_value = os.getenv(name)
-    if raw_value is None or raw_value.strip() == "":
-        return default
-    try:
-        parsed = float(raw_value)
-    except ValueError:
-        return default
-    return max(parsed, minimum)
 
 
 async def _run_login_db_worker(worker: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -849,6 +838,10 @@ def register_auth_routes(
 
         return _issue_user_session(user_row)
 
+    # The unprefixed `/auth/*` paths are intentional back-compat aliases for older
+    # app builds that called the API without the `/api/v1` prefix. New clients use
+    # the `/api/v1/...` form; both map to the same handler. Keep both until those
+    # legacy builds are retired.
     @app.get("/api/v1/auth/me")
     @app.get("/auth/me")
     async def auth_me(

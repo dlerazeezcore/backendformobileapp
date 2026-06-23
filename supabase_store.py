@@ -31,9 +31,11 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, joinedload, mapped_column, relationship, sessionmaker
 from sqlalchemy.pool import NullPool
 
+from config import read_bool_env as _read_bool_env, read_int_env as _read_int_env
 from phone_utils import normalize_phone, phone_lookup_candidates
 
 # JSONB on Postgres (binary, indexable, deduped keys); plain JSON elsewhere (e.g. SQLite tests).
@@ -255,6 +257,16 @@ def _usage_unit_from_hint(unit_hint: str | None, *, total_raw: int | None, used_
         return "gb"
     if "mb" in normalized or "mib" in normalized:
         return "mb"
+    if normalized:
+        # The provider sent an explicit unit we don't recognize. We still fall
+        # back to the size heuristic below (so usage isn't lost), but surface it
+        # so a provider unit-format change is visible instead of silently guessed.
+        LOGGER.warning(
+            "esim.usage_unit_unrecognized unit_hint=%r total_raw=%s used_raw=%s",
+            unit_hint,
+            total_raw,
+            used_raw,
+        )
 
     candidates = [value for value in (total_raw, used_raw) if value is not None]
     if not candidates:
@@ -318,17 +330,6 @@ def normalize_database_url(database_url: str) -> str:
     return parsed._replace(netloc=f"{parsed.netloc}:6543").geturl()
 
 
-def _read_int_env(name: str, default: int, *, minimum: int = 0) -> int:
-    raw_value = os.getenv(name)
-    if raw_value is None or raw_value.strip() == "":
-        return default
-    try:
-        parsed = int(raw_value)
-    except ValueError:
-        return default
-    return max(parsed, minimum)
-
-
 def _build_postgres_options(*, is_supabase_database: bool, for_migrations: bool = False) -> str:
     options = ["-c timezone=Asia/Baghdad"]
     if for_migrations:
@@ -360,18 +361,6 @@ def _build_postgres_options(*, is_supabase_database: bool, for_migrations: bool 
     if idle_transaction_timeout > 0:
         options.append(f"-c idle_in_transaction_session_timeout={idle_transaction_timeout}")
     return " ".join(options)
-
-
-def _read_bool_env(name: str, default: bool) -> bool:
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return default
-    normalized = raw_value.strip().lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    return default
 
 
 def _read_pool_class_env(default: str = "auto") -> str:
@@ -615,6 +604,51 @@ class AppReleaseInfo(TimeMixin, Base):
     release_notes_en: Mapped[str | None] = mapped_column(Text)
     release_notes_ar: Mapped[str | None] = mapped_column(Text)
     release_notes_ku: Mapped[str | None] = mapped_column(Text)
+
+
+# Display metadata for known currencies. The exchange_rates rows own the *rate*
+# (IQD per 1 unit — universal currency conversion); per-currency presentation
+# (symbol / decimals / position / flag / enabled) can be overridden per row via
+# custom_fields, else these sensible defaults apply. Markup is NOT here — it is a
+# service-scoped pricing concern (pricing_rules), not a currency concern.
+CURRENCY_DISPLAY_DEFAULTS: dict[str, dict[str, Any]] = {
+    "IQD": {"symbol": "IQD", "name": "Iraqi Dinar", "decimals": 0, "position": "suffix", "flag": "IQ"},
+    "USD": {"symbol": "$", "name": "US Dollar", "decimals": 2, "position": "prefix", "flag": "US"},
+    "EUR": {"symbol": "€", "name": "Euro", "decimals": 2, "position": "prefix", "flag": "EU"},
+    "GBP": {"symbol": "£", "name": "British Pound", "decimals": 2, "position": "prefix", "flag": "GB"},
+    "AED": {"symbol": "AED", "name": "UAE Dirham", "decimals": 2, "position": "suffix", "flag": "AE"},
+    "TRY": {"symbol": "₺", "name": "Turkish Lira", "decimals": 2, "position": "prefix", "flag": "TR"},
+}
+
+
+def build_currency_meta(code: str, *, rate: float, custom_fields: dict[str, Any] | None = None) -> dict[str, Any]:
+    """One currency entry for the public /currencies contract: pure `rate`
+    (IQD per 1 unit) + presentation metadata (custom_fields override defaults)."""
+    code = (code or "").upper()
+    custom = custom_fields or {}
+    base = CURRENCY_DISPLAY_DEFAULTS.get(
+        code, {"symbol": code, "name": code, "decimals": 2, "position": "prefix", "flag": code[:2]}
+    )
+    try:
+        decimals = max(int(custom.get("decimals", base["decimals"])), 0)
+    except (TypeError, ValueError):
+        decimals = base["decimals"]
+    enabled = custom.get("enabled", custom.get("enable", True))
+    if isinstance(enabled, str):
+        enabled = enabled.strip().lower() not in {"0", "false", "no", "off", ""}
+    position = str(custom.get("position") or base["position"])
+    if position not in {"prefix", "suffix"}:
+        position = base["position"]
+    return {
+        "code": code,
+        "rate": float(rate),
+        "symbol": str(custom.get("symbol") or base["symbol"]),
+        "name": str(custom.get("name") or base["name"]),
+        "decimals": decimals,
+        "position": position,
+        "flag": str(custom.get("flag") or base["flag"]),
+        "enabled": bool(enabled),
+    }
 
 
 class ExchangeRate(TimeMixin, Base):
@@ -2460,12 +2494,9 @@ class SupabaseStore:
         _ = platform_name
         provider_obj = provider_response.get("obj") or {}
         package_info = (order_request.get("packageInfoList") or [{}])[0]
+        txn_id = provider_obj.get("transactionId") or order_request.get("transactionId")
         item = self.session.scalar(
-            select(OrderItem).where(
-                OrderItem.provider_transaction_id == (
-                    provider_obj.get("transactionId") or order_request.get("transactionId")
-                )
-            )
+            select(OrderItem).where(OrderItem.provider_transaction_id == txn_id)
         )
         order = item.customer_order if item is not None else None
         if order is None:
@@ -2656,7 +2687,24 @@ class SupabaseStore:
             },
         )
         if auto_commit:
-            self.session.commit()
+            try:
+                self.session.commit()
+            except IntegrityError:
+                # A concurrent call inserted the same provider_transaction_id first
+                # and the unique constraint (uq_order_items_provider_transaction_id)
+                # rejected our duplicate. No data is corrupted — recover idempotently
+                # by returning the row the winning transaction committed.
+                self.session.rollback()
+                existing = (
+                    self.session.scalar(
+                        select(OrderItem).where(OrderItem.provider_transaction_id == txn_id)
+                    )
+                    if txn_id
+                    else None
+                )
+                if existing is None:
+                    raise
+                return existing.customer_order, existing
             self.session.refresh(order)
             self.session.refresh(item)
         else:
@@ -3372,6 +3420,24 @@ class SupabaseStore:
         return profile
 
     def record_webhook(self, payload: dict[str, Any]) -> ESimLifecycleEvent:
+        # Idempotency: eSIM Access retries webhook deliveries, and each carries a
+        # stable ``notifyId``. If we've already recorded that event, return the
+        # original lifecycle row WITHOUT re-applying status/side-effects — a replay
+        # must not double-transition a profile (mirrors the FIB webhook dedup in
+        # fib_payment_api.py). The lookup is on the stored payload's notifyId; if
+        # this audit table grows large, add a functional index on
+        # ((payload->>'notifyId')) where source = 'provider_webhook'.
+        notify_id = payload.get("notifyId")
+        if notify_id:
+            existing_event = self.session.scalar(
+                select(ESimLifecycleEvent)
+                .where(ESimLifecycleEvent.source == "provider_webhook")
+                .where(ESimLifecycleEvent.payload["notifyId"].as_string() == str(notify_id))
+                .order_by(ESimLifecycleEvent.id.asc())
+                .limit(1)
+            )
+            if existing_event is not None:
+                return existing_event
         content = payload.get("content") or {}
         profile = None
         order_item = None
@@ -3707,6 +3773,53 @@ class SupabaseStore:
 
     def get_current_exchange_rate_settings(self) -> ExchangeRate | None:
         return self.get_active_exchange_rate(base_currency="USD", quote_currency="IQD")
+
+    def get_global_esim_markup_percent(self, at_time: datetime | None = None) -> float:
+        """Effective global eSIM markup %. Prefers a global eSIM pricing rule (the
+        service-scoped engine — ready for future per-country/class/service rules);
+        falls back to the legacy markup on the active USD->IQD exchange row during
+        the transition so nothing breaks before the rule is seeded."""
+        rule = self.get_best_pricing_rule(
+            service_type="esim",
+            package_code=None,
+            country_code=None,
+            provider_code=None,
+            at_time=at_time,
+        )
+        if rule is not None and (rule.adjustment_type or "percent") == "percent":
+            try:
+                return max(float(rule.adjustment_value), 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+        return self._markup_percent_from_exchange(
+            self.get_active_exchange_rate(base_currency="USD", quote_currency="IQD", at_time=at_time)
+        )
+
+    def get_display_currencies(self, at_time: datetime | None = None) -> list[dict[str, Any]]:
+        """Universal currency set for display/conversion: every active CODE->IQD
+        rate (pure `rate` = IQD per 1 unit) plus the IQD settlement base (rate 1).
+        Presentation metadata comes from each row's custom_fields with defaults."""
+        now = at_time or utcnow()
+        rows = self.session.scalars(
+            select(ExchangeRate)
+            .where(
+                ExchangeRate.quote_currency == "IQD",
+                ExchangeRate.active.is_(True),
+                ExchangeRate.effective_at <= now,
+                or_(ExchangeRate.expires_at.is_(None), ExchangeRate.expires_at > now),
+            )
+            .order_by(ExchangeRate.effective_at.desc(), ExchangeRate.id.desc())
+        ).all()
+        newest_by_code: dict[str, ExchangeRate] = {}
+        for row in rows:
+            code = (row.base_currency or "").upper()
+            if code and code != "IQD" and code not in newest_by_code:
+                newest_by_code[code] = row
+        currencies: list[dict[str, Any]] = [build_currency_meta("IQD", rate=1.0)]
+        for code in sorted(newest_by_code):
+            row = newest_by_code[code]
+            currencies.append(build_currency_meta(code, rate=float(row.rate), custom_fields=row.custom_fields or {}))
+        return currencies
 
     def list_profiles_for_user(
         self,
