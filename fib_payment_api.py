@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import uuid
 from time import time
 from typing import Any, Callable
@@ -17,6 +18,9 @@ from sqlalchemy.orm import Session
 
 from auth import get_token_claims, require_active_subject
 from supabase_store import AdminUser, AppUser, PaymentAttempt, SupabaseStore, parse_provider_datetime
+
+
+logger = logging.getLogger(__name__)
 
 
 class FIBPaymentError(Exception):
@@ -761,25 +765,31 @@ def _map_fib_exception(exc: Exception) -> JSONResponse:
         else:
             error_code = exc.error_code or "FIB_PROVIDER_REJECTED"
             message = "Payment request was rejected by provider."
+        # Log provider-supplied detail server-side only; never leak it to clients.
+        logger.warning(
+            "FIB provider error (status=%s, errorCode=%s): providerMessage=%r providerPayload=%r",
+            status_code,
+            error_code,
+            exc.error_message,
+            exc.payload,
+        )
         return _error_response(
             status_code=status_code,
             error_code=error_code,
             message=message,
-            provider_message=exc.error_message,
-            details={"providerPayload": exc.payload or {}},
         )
     if isinstance(exc, FIBPaymentHTTPError):
+        logger.warning("FIB upstream HTTP error: %s", exc)
         return _error_response(
             status_code=502,
             error_code="FIB_UPSTREAM_UNAVAILABLE",
             message="Unable to reach payment provider.",
-            provider_message=str(exc),
         )
+    logger.exception("Unexpected FIB payment error")
     return _error_response(
         status_code=500,
         error_code="INTERNAL_ERROR",
         message="Payment request failed unexpectedly.",
-        provider_message=str(exc),
     )
 
 

@@ -711,96 +711,130 @@ def register_push_notification_routes(
         if payload.send_to_all_active and not audience:
             audience = "all"
 
-        audience_tokens: list[str] = []
-        audience_user_ids: list[str] = []
-        recipient_scope = "direct_tokens"
-        if audience:
-            audience_tokens, audience_user_ids = store.list_push_tokens_for_audience(
-                audience=audience,
-                limit=20000,
-            )
-            recipient_scope = f"audience:{audience}"
+        def _resolve_audience_and_tokens() -> dict[str, Any]:
+            audience_tokens: list[str] = []
+            audience_user_ids: list[str] = []
+            recipient_scope = "direct_tokens"
+            if audience:
+                audience_tokens, audience_user_ids = store.list_push_tokens_for_audience(
+                    audience=audience,
+                    limit=20000,
+                )
+                recipient_scope = f"audience:{audience}"
 
-        store_tokens: list[str] = []
-        if requested_user_ids:
-            recipient_scope = "users"
-            store_tokens.extend(store.list_push_tokens(user_ids=requested_user_ids, active_only=True))
-        if requested_user_ids and audience:
-            recipient_scope = "mixed"
-        if requested_user_ids and direct_tokens:
-            recipient_scope = "mixed"
-        if direct_tokens and audience:
-            recipient_scope = "mixed"
+            store_tokens: list[str] = []
+            if requested_user_ids:
+                recipient_scope = "users"
+                store_tokens.extend(store.list_push_tokens(user_ids=requested_user_ids, active_only=True))
+            if requested_user_ids and audience:
+                recipient_scope = "mixed"
+            if requested_user_ids and direct_tokens:
+                recipient_scope = "mixed"
+            if direct_tokens and audience:
+                recipient_scope = "mixed"
 
-        logger.info(
-            "push.send.pre_resolution payload_audience=%s payload_send_to_all_active=%s payload_user_ids=%s normalized_user_ids=%s tokens_count=%s recipient_scope=%s",
-            payload.audience,
-            payload.send_to_all_active,
-            payload.user_ids,
-            requested_user_ids,
-            len(direct_tokens),
-            recipient_scope,
-        )
-
-        deduped_tokens = PushNotificationService._normalize_tokens(
-            [*direct_tokens, *audience_tokens, *store_tokens]
-        )
-        merged_target_user_ids = PushNotificationService._normalize_tokens(
-            [*audience_user_ids, *requested_user_ids]
-        )
-        requested_user_ids_count = len(requested_user_ids)
-        audience_user_ids_count = len(audience_user_ids)
-        store_tokens_count = len(store_tokens)
-        deduped_tokens_count = len(deduped_tokens)
-        merged_target_user_ids_count = len(merged_target_user_ids)
-        deduped_token_summary = store.summarize_push_tokens(tokens=deduped_tokens)
-        debug_payload = {
-            "payload.audience": payload.audience,
-            "payload.send_to_all_active": payload.send_to_all_active,
-            "payload.user_ids": payload.user_ids,
-            "recipient_scope": recipient_scope,
-            "requested_user_ids_count": requested_user_ids_count,
-            "audience_user_ids_count": audience_user_ids_count,
-            "store_tokens_count": store_tokens_count,
-            "deduped_tokens_count": deduped_tokens_count,
-            "matched_user_ids": merged_target_user_ids,
-            "recipientScope": recipient_scope,
-            "requestedAudience": audience or None,
-            "requestedUserIdsCount": requested_user_ids_count,
-            "matchedAudienceUserIdsCount": audience_user_ids_count,
-            "matchedDirectUserTokensCount": store_tokens_count,
-            "totalDedupedTokens": deduped_tokens_count,
-            "matchedTokenPlatforms": deduped_token_summary["platformCounts"],
-            "matchedTokenOwners": deduped_token_summary["ownerCounts"],
-            "matchedTokenPrefixes": deduped_token_summary["tokenPrefixes"],
-        }
-        logger.info(
-            "push.send.post_resolution requested_user_ids_count=%s audience_user_ids_count=%s store_tokens_count=%s deduped_tokens_count=%s merged_target_user_ids_count=%s",
-            requested_user_ids_count,
-            audience_user_ids_count,
-            store_tokens_count,
-            deduped_tokens_count,
-            merged_target_user_ids_count,
-        )
-        if is_app_update:
-            token_platform_counts = store.count_push_tokens_by_platform(tokens=deduped_tokens)
             logger.info(
-                "push.app_update.resolution audience=%s ios_tokens=%s android_tokens=%s web_tokens=%s final_tokens=%s payload_keys=%s",
-                audience or None,
-                token_platform_counts.get("ios", 0),
-                token_platform_counts.get("android", 0),
-                token_platform_counts.get("web", 0),
-                deduped_tokens_count,
-                sorted(str(key) for key in normalized_data.keys()),
+                "push.send.pre_resolution payload_audience=%s payload_send_to_all_active=%s payload_user_ids=%s normalized_user_ids=%s tokens_count=%s recipient_scope=%s",
+                payload.audience,
+                payload.send_to_all_active,
+                payload.user_ids,
+                requested_user_ids,
+                len(direct_tokens),
+                recipient_scope,
             )
-        logger.info(
-            "push.send.token_summary recipient_scope=%s owners=%s platforms=%s",
-            recipient_scope,
-            deduped_token_summary["ownerCounts"],
-            deduped_token_summary["platformCounts"],
-        )
+
+            deduped_tokens = PushNotificationService._normalize_tokens(
+                [*direct_tokens, *audience_tokens, *store_tokens]
+            )
+            merged_target_user_ids = PushNotificationService._normalize_tokens(
+                [*audience_user_ids, *requested_user_ids]
+            )
+            requested_user_ids_count = len(requested_user_ids)
+            audience_user_ids_count = len(audience_user_ids)
+            store_tokens_count = len(store_tokens)
+            deduped_tokens_count = len(deduped_tokens)
+            merged_target_user_ids_count = len(merged_target_user_ids)
+            deduped_token_summary = store.summarize_push_tokens(tokens=deduped_tokens)
+            debug_payload = {
+                "payload.audience": payload.audience,
+                "payload.send_to_all_active": payload.send_to_all_active,
+                "payload.user_ids": payload.user_ids,
+                "recipient_scope": recipient_scope,
+                "requested_user_ids_count": requested_user_ids_count,
+                "audience_user_ids_count": audience_user_ids_count,
+                "store_tokens_count": store_tokens_count,
+                "deduped_tokens_count": deduped_tokens_count,
+                "matched_user_ids": merged_target_user_ids,
+                "recipientScope": recipient_scope,
+                "requestedAudience": audience or None,
+                "requestedUserIdsCount": requested_user_ids_count,
+                "matchedAudienceUserIdsCount": audience_user_ids_count,
+                "matchedDirectUserTokensCount": store_tokens_count,
+                "totalDedupedTokens": deduped_tokens_count,
+                "matchedTokenPlatforms": deduped_token_summary["platformCounts"],
+                "matchedTokenOwners": deduped_token_summary["ownerCounts"],
+                "matchedTokenPrefixes": deduped_token_summary["tokenPrefixes"],
+            }
+            logger.info(
+                "push.send.post_resolution requested_user_ids_count=%s audience_user_ids_count=%s store_tokens_count=%s deduped_tokens_count=%s merged_target_user_ids_count=%s",
+                requested_user_ids_count,
+                audience_user_ids_count,
+                store_tokens_count,
+                deduped_tokens_count,
+                merged_target_user_ids_count,
+            )
+            if is_app_update:
+                token_platform_counts = store.count_push_tokens_by_platform(tokens=deduped_tokens)
+                logger.info(
+                    "push.app_update.resolution audience=%s ios_tokens=%s android_tokens=%s web_tokens=%s final_tokens=%s payload_keys=%s",
+                    audience or None,
+                    token_platform_counts.get("ios", 0),
+                    token_platform_counts.get("android", 0),
+                    token_platform_counts.get("web", 0),
+                    deduped_tokens_count,
+                    sorted(str(key) for key in normalized_data.keys()),
+                )
+            logger.info(
+                "push.send.token_summary recipient_scope=%s owners=%s platforms=%s",
+                recipient_scope,
+                deduped_token_summary["ownerCounts"],
+                deduped_token_summary["platformCounts"],
+            )
+            return {
+                "audience_tokens": audience_tokens,
+                "audience_user_ids": audience_user_ids,
+                "recipient_scope": recipient_scope,
+                "store_tokens": store_tokens,
+                "deduped_tokens": deduped_tokens,
+                "merged_target_user_ids": merged_target_user_ids,
+                "requested_user_ids_count": requested_user_ids_count,
+                "audience_user_ids_count": audience_user_ids_count,
+                "store_tokens_count": store_tokens_count,
+                "deduped_tokens_count": deduped_tokens_count,
+                "debug_payload": debug_payload,
+            }
+
+        resolution = await asyncio.to_thread(_resolve_audience_and_tokens)
+        audience_tokens = resolution["audience_tokens"]
+        audience_user_ids = resolution["audience_user_ids"]
+        recipient_scope = resolution["recipient_scope"]
+        store_tokens = resolution["store_tokens"]
+        deduped_tokens = resolution["deduped_tokens"]
+        merged_target_user_ids = resolution["merged_target_user_ids"]
+        requested_user_ids_count = resolution["requested_user_ids_count"]
+        audience_user_ids_count = resolution["audience_user_ids_count"]
+        store_tokens_count = resolution["store_tokens_count"]
+        deduped_tokens_count = resolution["deduped_tokens_count"]
+        debug_payload = resolution["debug_payload"]
 
         if not deduped_tokens:
+            def _count_active_tokens() -> dict[str, int]:
+                return {
+                    "user": store.count_active_push_tokens(subject_type="user"),
+                    "admin": store.count_active_push_tokens(subject_type="admin"),
+                }
+
+            active_token_counts = await asyncio.to_thread(_count_active_tokens)
             return JSONResponse(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 content={
@@ -814,48 +848,55 @@ def register_push_notification_routes(
                     "matchedAudienceTokensCount": len(audience_tokens),
                     "matchedDirectUserTokensCount": store_tokens_count,
                     "totalDedupedTokens": deduped_tokens_count,
-                    "activeUserTokens": store.count_active_push_tokens(subject_type="user"),
-                    "activeAdminTokens": store.count_active_push_tokens(subject_type="admin"),
+                    "activeUserTokens": active_token_counts["user"],
+                    "activeAdminTokens": active_token_counts["admin"],
                     "eligibleTokensForRequestedAudience": deduped_tokens_count,
                     "data": {"debug": debug_payload},
                 },
             )
 
-        notification = store.create_push_notification(
-            recipient_scope=recipient_scope,
-            title=payload.title,
-            body=payload.body,
-            provider="firebase_fcm",
-            channel_id=payload.channel_id or provider.default_channel_id,
-            image_url=payload.image,
-            sent_by_admin_id=admin_user.id,
-            target_user_ids=merged_target_user_ids,
-            data_payload=normalized_data,
-            provider_response={
-                "requestedTokens": len(deduped_tokens),
-                "audience": audience or None,
-                "requestedUserIds": requested_user_ids,
-                "audienceUserIdsCount": audience_user_ids_count,
-            },
-            status="queued",
-        )
-        db.flush()
-
-        if payload.dry_run:
-            store.finalize_push_notification(
-                row=notification,
-                status="dry_run",
-                success_count=len(deduped_tokens),
-                failure_count=0,
-                invalid_tokens=[],
+        def _create_notification() -> Any:
+            row = store.create_push_notification(
+                recipient_scope=recipient_scope,
+                title=payload.title,
+                body=payload.body,
+                provider="firebase_fcm",
+                channel_id=payload.channel_id or provider.default_channel_id,
+                image_url=payload.image,
+                sent_by_admin_id=admin_user.id,
+                target_user_ids=merged_target_user_ids,
+                data_payload=normalized_data,
                 provider_response={
-                    "dryRun": True,
                     "requestedTokens": len(deduped_tokens),
                     "audience": audience or None,
+                    "requestedUserIds": requested_user_ids,
+                    "audienceUserIdsCount": audience_user_ids_count,
                 },
+                status="queued",
             )
-            db.commit()
-            db.refresh(notification)
+            db.flush()
+            return row
+
+        notification = await asyncio.to_thread(_create_notification)
+
+        if payload.dry_run:
+            def _finalize_dry_run() -> None:
+                store.finalize_push_notification(
+                    row=notification,
+                    status="dry_run",
+                    success_count=len(deduped_tokens),
+                    failure_count=0,
+                    invalid_tokens=[],
+                    provider_response={
+                        "dryRun": True,
+                        "requestedTokens": len(deduped_tokens),
+                        "audience": audience or None,
+                    },
+                )
+                db.commit()
+                db.refresh(notification)
+
+            await asyncio.to_thread(_finalize_dry_run)
             return {
                 "notification": _serialize_push_notification(notification),
                 "delivery": {"requestedTokens": len(deduped_tokens), "dryRun": True},
@@ -863,12 +904,15 @@ def register_push_notification_routes(
             }
 
         if not provider.is_configured():
-            store.finalize_push_notification(
-                row=notification,
-                status="failed",
-                error_message="Firebase push provider is not configured.",
-            )
-            db.commit()
+            def _finalize_not_configured() -> None:
+                store.finalize_push_notification(
+                    row=notification,
+                    status="failed",
+                    error_message="Firebase push provider is not configured.",
+                )
+                db.commit()
+
+            await asyncio.to_thread(_finalize_not_configured)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Push notification provider is not configured on this deployment.",
@@ -890,12 +934,15 @@ def register_push_notification_routes(
                     per_language_counts,
                 )
         except Exception as exc:
-            store.finalize_push_notification(
-                row=notification,
-                status="failed",
-                error_message=str(exc),
-            )
-            db.commit()
+            def _finalize_failed() -> None:
+                store.finalize_push_notification(
+                    row=notification,
+                    status="failed",
+                    error_message=str(exc),
+                )
+                db.commit()
+
+            await asyncio.to_thread(_finalize_failed)
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail=f"Push provider request failed: {exc}",
@@ -903,7 +950,9 @@ def register_push_notification_routes(
 
         invalid_tokens = PushNotificationService._normalize_tokens(result.get("invalidTokens", []))
         if is_app_update:
-            invalid_platform_counts = store.count_push_tokens_by_platform(tokens=invalid_tokens)
+            invalid_platform_counts = await asyncio.to_thread(
+                store.count_push_tokens_by_platform, tokens=invalid_tokens
+            )
             logger.info(
                 "push.app_update.delivery success_count=%s failure_count=%s invalid_ios=%s invalid_android=%s invalid_web=%s invalid_total=%s",
                 int(result.get("successCount", 0)),
@@ -922,7 +971,7 @@ def register_push_notification_routes(
                 failure_reasons,
             )
         if invalid_tokens:
-            store.deactivate_push_devices_by_tokens(invalid_tokens)
+            await asyncio.to_thread(store.deactivate_push_devices_by_tokens, invalid_tokens)
 
         success_count = int(result.get("successCount", 0))
         failure_count = int(result.get("failureCount", 0))
@@ -940,17 +989,20 @@ def register_push_notification_routes(
         if per_language_counts:
             provider_response_audit["perLanguageCounts"] = per_language_counts
             provider_response_audit["localized"] = True
-        store.finalize_push_notification(
-            row=notification,
-            status=delivery_status,
-            success_count=success_count,
-            failure_count=failure_count,
-            invalid_tokens=invalid_tokens,
-            provider_response=provider_response_audit,
-            sent_at=utcnow(),
-        )
-        db.commit()
-        db.refresh(notification)
+        def _finalize_sent() -> None:
+            store.finalize_push_notification(
+                row=notification,
+                status=delivery_status,
+                success_count=success_count,
+                failure_count=failure_count,
+                invalid_tokens=invalid_tokens,
+                provider_response=provider_response_audit,
+                sent_at=utcnow(),
+            )
+            db.commit()
+            db.refresh(notification)
+
+        await asyncio.to_thread(_finalize_sent)
         delivery_summary: dict[str, Any] = {
             "requestedTokens": len(deduped_tokens),
             "successCount": success_count,

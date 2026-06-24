@@ -1528,6 +1528,24 @@ def _require_valid_esim_webhook_secret(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid eSIM Access webhook secret.")
 
 
+async def stop_periodic_usage_sync_worker(app: FastAPI) -> None:
+    """Cancel and await the background eSIM usage-sync task, if running.
+
+    Invoked from app.py's lifespan shutdown (replaces the deprecated
+    @app.on_event("shutdown") handler).
+    """
+    task = getattr(app.state, "esim_usage_sync_task", None)
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    finally:
+        app.state.esim_usage_sync_task = None
+
+
 def register_esim_access_routes(
     app: FastAPI,
     get_db: Callable[..., Any],
@@ -1768,18 +1786,6 @@ def register_esim_access_routes(
             usage_sync_batch_size,
         )
 
-    @app.on_event("shutdown")
-    async def _stop_periodic_usage_sync_worker() -> None:
-        task = getattr(app.state, "esim_usage_sync_task", None)
-        if task is None:
-            return
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        finally:
-            app.state.esim_usage_sync_task = None
 
     @app.post("/api/v1/esim-access/packages/query")
     async def query_packages(

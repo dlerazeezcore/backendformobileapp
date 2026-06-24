@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from config import get_settings, read_float_env as _read_float_env
 from phone_utils import normalize_phone, phone_lookup_candidates
+from rate_limit import enforce_rate_limit
 from supabase_store import AdminUser, AppUser, utcnow
 from twilio_whatsapp import TwilioWhatsAppVerifyAPI
 
@@ -584,12 +585,19 @@ def register_auth_routes(
             detail="Twilio OTP service is not configured on this deployment.",
         )
 
+    def _client_ip(request: Request) -> str:
+        client = request.client
+        return client.host if client and client.host else "unknown"
+
     @app.post("/api/v1/auth/user/otp/request")
     async def request_user_otp(
         payload: OTPRequestPayload,
+        request: Request,
         provider: TwilioWhatsAppVerifyAPI = Depends(get_twilio_provider),
     ) -> dict[str, Any]:
         normalized_phone = _normalize_and_validate_signup_phone(payload.phone)
+        enforce_rate_limit(f"otp:phone:{normalized_phone}", max_events=5, window_seconds=600)
+        enforce_rate_limit(f"otp:ip:{_client_ip(request)}", max_events=30, window_seconds=3600)
         channel = _normalize_otp_channel(payload.channel or "sms", field_name="channel") or "sms"
         _log_phone_lookup("auth.user.otp.request", payload.phone, normalized_phone)
         result = await provider.start_verification(phone=normalized_phone, channel=channel)
@@ -669,10 +677,13 @@ def register_auth_routes(
     @app.post("/api/v1/auth/user/password/reset")
     async def reset_user_password_with_otp(
         payload: OTPPasswordResetPayload,
+        request: Request,
         db: Session = Depends(get_db),
         provider: TwilioWhatsAppVerifyAPI = Depends(get_twilio_provider),
     ) -> dict[str, Any]:
         normalized_phone = _normalize_and_validate_signup_phone(payload.phone)
+        enforce_rate_limit(f"pwreset:phone:{normalized_phone}", max_events=5, window_seconds=600)
+        enforce_rate_limit(f"pwreset:ip:{_client_ip(request)}", max_events=30, window_seconds=3600)
         requested_channel = _normalize_otp_channel(payload.otp_channel, field_name="otpChannel")
         _log_phone_lookup("auth.user.password.reset", payload.phone, normalized_phone)
 
@@ -711,7 +722,8 @@ def register_auth_routes(
         return await asyncio.to_thread(_persist_work)
 
     @app.post("/api/v1/auth/admin/login")
-    def admin_login(payload: LoginPayload, db: Session = Depends(get_db)) -> dict[str, Any]:
+    def admin_login(payload: LoginPayload, request: Request, db: Session = Depends(get_db)) -> dict[str, Any]:
+        enforce_rate_limit(f"login:ip:{_client_ip(request)}", max_events=15, window_seconds=300)
         if payload.password is None:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="password is required")
         if payload.email and not payload.phone:
@@ -730,6 +742,7 @@ def register_auth_routes(
         request: Request,
         provider: TwilioWhatsAppVerifyAPI | None = Depends(_get_optional_twilio_provider),
     ) -> dict[str, Any]:
+        enforce_rate_limit(f"login:ip:{_client_ip(request)}", max_events=15, window_seconds=300)
         session_factory = request.app.state.db_session_factory
         # Email is the password-only alternative identifier (phone stays default).
         if payload.email and not payload.phone:
