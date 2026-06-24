@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from functools import lru_cache
@@ -566,7 +567,7 @@ def register_push_notification_routes(
     get_push_provider: Callable[..., PushNotificationService],
     get_db: Callable[..., Any],
 ) -> None:
-    async def _require_user_actor(
+    def _require_user_actor(
         claims: dict[str, Any] = Depends(get_token_claims),
         db: Session = Depends(get_db),
     ) -> AppUser:
@@ -590,7 +591,7 @@ def register_push_notification_routes(
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unsupported auth subject type")
         return subject_type, row
 
-    async def _require_admin_sender(
+    def _require_admin_sender(
         claims: dict[str, Any] = Depends(get_token_claims),
         db: Session = Depends(get_db),
     ) -> AdminUser:
@@ -601,7 +602,7 @@ def register_push_notification_routes(
         return row
 
     @app.post("/api/v1/push-notifications/devices/register")
-    async def register_push_device(
+    def register_push_device(
         payload: RegisterPushDevicePayload,
         db: Session = Depends(get_db),
         authorization: str | None = Header(default=None),
@@ -635,7 +636,7 @@ def register_push_notification_routes(
         return {"device": _serialize_push_device(row)}
 
     @app.post("/api/v1/push-notifications/devices/unregister")
-    async def unregister_push_device(
+    def unregister_push_device(
         payload: UnregisterPushDevicePayload,
         db: Session = Depends(get_db),
         authorization: str | None = Header(default=None),
@@ -663,7 +664,7 @@ def register_push_notification_routes(
         return {"updated": affected}
 
     @app.get("/api/v1/push-notifications/devices")
-    async def list_my_push_devices(
+    def list_my_push_devices(
         active_only: bool = Query(default=True, alias="activeOnly"),
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
@@ -874,7 +875,8 @@ def register_push_notification_routes(
             )
 
         try:
-            result, per_language_counts = _send_with_optional_localization(
+            result, per_language_counts = await asyncio.to_thread(
+                _send_with_optional_localization,
                 provider=provider,
                 tokens=deduped_tokens,
                 payload=payload,
@@ -1061,7 +1063,7 @@ def register_push_notification_routes(
         )
 
     @app.get("/api/v1/admin/push-notifications")
-    async def list_push_notifications(
+    def list_push_notifications(
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
         db: Session = Depends(get_db),
@@ -1074,7 +1076,7 @@ def register_push_notification_routes(
         }
 
     @app.get("/api/v1/admin/push-notifications/summary")
-    async def get_push_notifications_summary(
+    def get_push_notifications_summary(
         provider: PushNotificationService = Depends(get_push_provider),
         db: Session = Depends(get_db),
         _: AdminUser = Depends(_require_admin_sender),
@@ -1093,7 +1095,7 @@ def register_push_notification_routes(
         }
 
     @app.get("/api/v1/admin/push-notifications/diagnostics")
-    async def get_push_notifications_diagnostics(
+    def get_push_notifications_diagnostics(
         db: Session = Depends(get_db),
         _: AdminUser = Depends(_require_admin_sender),
     ) -> dict[str, Any]:

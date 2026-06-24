@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from typing import Any, Callable
 
@@ -78,7 +79,7 @@ def _serialize_traveler(row: AppUserTraveler) -> dict[str, Any]:
 
 
 def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
-    async def _require_admin_actor(
+    def _require_admin_actor(
         claims: dict[str, Any] = Depends(get_token_claims),
         db: Session = Depends(get_db),
     ) -> AdminUser:
@@ -86,7 +87,7 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         assert isinstance(row, AdminUser)
         return row
 
-    async def _require_active_actor(
+    def _require_active_actor(
         claims: dict[str, Any] = Depends(get_token_claims),
         db: Session = Depends(get_db),
     ) -> AdminUser | AppUser:
@@ -94,7 +95,7 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         assert isinstance(row, (AdminUser, AppUser))
         return row
 
-    async def _require_user_actor(
+    def _require_user_actor(
         claims: dict[str, Any] = Depends(get_token_claims),
         db: Session = Depends(get_db),
     ) -> AppUser:
@@ -103,7 +104,7 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return row
 
     @app.get("/api/v1/travelers/my")
-    async def list_my_travelers(
+    def list_my_travelers(
         db: Session = Depends(get_db),
         actor: AppUser = Depends(_require_user_actor),
     ) -> dict[str, Any]:
@@ -111,7 +112,7 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return {"success": True, "data": {"travelers": [_serialize_traveler(r) for r in rows]}}
 
     @app.post("/api/v1/travelers/my")
-    async def create_my_traveler(
+    def create_my_traveler(
         payload: TravelerPayload,
         db: Session = Depends(get_db),
         actor: AppUser = Depends(_require_user_actor),
@@ -125,7 +126,7 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return {"success": True, "data": {"traveler": _serialize_traveler(row)}}
 
     @app.patch("/api/v1/travelers/my/{traveler_id}")
-    async def update_my_traveler(
+    def update_my_traveler(
         traveler_id: int,
         payload: TravelerUpdatePayload,
         db: Session = Depends(get_db),
@@ -139,7 +140,7 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return {"success": True, "data": {"traveler": _serialize_traveler(updated)}}
 
     @app.delete("/api/v1/travelers/my/{traveler_id}")
-    async def delete_my_traveler(
+    def delete_my_traveler(
         traveler_id: int,
         db: Session = Depends(get_db),
         actor: AppUser = Depends(_require_user_actor),
@@ -165,7 +166,7 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         }
 
     @app.post("/api/v1/admin/users")
-    async def save_user(
+    def save_user(
         payload: UserPayload,
         db: Session = Depends(get_db),
         actor: AdminUser | AppUser = Depends(_require_active_actor),
@@ -206,7 +207,7 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return {"user": {"id": user.id, "phone": user.phone, "name": user.name, "status": user.status}}
 
     @app.get("/api/v1/admin/users")
-    async def list_users(
+    def list_users(
         db: Session = Depends(get_db),
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
@@ -274,7 +275,7 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return {"users": normalized_rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
 
     @app.patch("/api/v1/admin/users/{user_id}")
-    async def admin_update_user(
+    def admin_update_user(
         user_id: str,
         payload: AdminUserUpdatePayload,
         db: Session = Depends(get_db),
@@ -315,7 +316,7 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
 
     @app.delete("/api/v1/admin/users/{user_id}")
     @app.delete("/admin/users/{user_id}")
-    async def delete_user_by_id(
+    def delete_user_by_id(
         user_id: str,
         db: Session = Depends(get_db),
         _: AdminUser = Depends(_require_admin_actor),
@@ -329,7 +330,7 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
 
     @app.delete("/api/v1/admin/users")
     @app.delete("/admin/users")
-    async def delete_user_by_lookup(
+    def delete_user_by_lookup(
         user_id: str | None = Query(default=None, alias="userId"),
         phone: str | None = Query(default=None),
         db: Session = Depends(get_db),
@@ -352,7 +353,7 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return payload
 
     @app.post("/api/v1/admin/admin-users")
-    async def save_admin_user(
+    def save_admin_user(
         payload: AdminUserPayload,
         db: Session = Depends(get_db),
         _: AdminUser = Depends(_require_admin_actor),
@@ -375,7 +376,7 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         }
 
     @app.get("/api/v1/admin/admin-users")
-    async def list_admin_users(
+    def list_admin_users(
         db: Session = Depends(get_db),
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),

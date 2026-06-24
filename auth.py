@@ -620,47 +620,50 @@ def register_auth_routes(
             verification_sid=payload.verification_sid,
         )
 
-        user_row = _lookup_user_by_phone(db, normalized_phone)
-        if user_row is None:
-            existing_admin = _lookup_admin_by_phone(db, normalized_phone)
-            if existing_admin is not None:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="This phone is already used by an admin account.",
+        def _work() -> dict[str, Any]:
+            user_row = _lookup_user_by_phone(db, normalized_phone)
+            if user_row is None:
+                existing_admin = _lookup_admin_by_phone(db, normalized_phone)
+                if existing_admin is not None:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="This phone is already used by an admin account.",
+                    )
+                normalized_name = str(payload.name or "").strip()
+                if len(normalized_name) < 2:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                        detail="Name must be at least 2 characters for first-time signup.",
+                    )
+                user_row = AppUser(
+                    phone=normalized_phone,
+                    name=normalized_name,
+                    status="active",
+                    password_hash=None,
+                    last_login_at=utcnow(),
                 )
-            normalized_name = str(payload.name or "").strip()
-            if len(normalized_name) < 2:
+                db.add(user_row)
+                try:
+                    db.commit()
+                except IntegrityError as exc:
+                    db.rollback()
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="User account already exists for this phone. Please try again.",
+                    ) from exc
+                db.refresh(user_row)
+                return _issue_user_session(user_row)
+
+            if not _is_row_active(user_row):
                 raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                    detail="Name must be at least 2 characters for first-time signup.",
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="User account exists but is not active. Please contact support.",
                 )
-            user_row = AppUser(
-                phone=normalized_phone,
-                name=normalized_name,
-                status="active",
-                password_hash=None,
-                last_login_at=utcnow(),
-            )
-            db.add(user_row)
-            try:
-                db.commit()
-            except IntegrityError as exc:
-                db.rollback()
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="User account already exists for this phone. Please try again.",
-                ) from exc
-            db.refresh(user_row)
+            user_row.last_login_at = utcnow()
+            db.commit()
             return _issue_user_session(user_row)
 
-        if not _is_row_active(user_row):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="User account exists but is not active. Please contact support.",
-            )
-        user_row.last_login_at = utcnow()
-        db.commit()
-        return _issue_user_session(user_row)
+        return await asyncio.to_thread(_work)
 
     @app.post("/api/v1/auth/user/password/forgot/reset")
     @app.post("/api/v1/auth/user/password/reset")
@@ -673,17 +676,21 @@ def register_auth_routes(
         requested_channel = _normalize_otp_channel(payload.otp_channel, field_name="otpChannel")
         _log_phone_lookup("auth.user.password.reset", payload.phone, normalized_phone)
 
-        user_row = _lookup_user_by_phone(db, normalized_phone)
-        if user_row is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User account not found. Please sign up first.",
-            )
-        if not _is_row_active(user_row):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="User account exists but is not active. Please contact support.",
-            )
+        def _lookup_work() -> AppUser:
+            user_row = _lookup_user_by_phone(db, normalized_phone)
+            if user_row is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="User account not found. Please sign up first.",
+                )
+            if not _is_row_active(user_row):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="User account exists but is not active. Please contact support.",
+                )
+            return user_row
+
+        user_row = await asyncio.to_thread(_lookup_work)
 
         await _verify_twilio_user_otp(
             provider=provider,
@@ -692,12 +699,16 @@ def register_auth_routes(
             expected_channel=requested_channel,
             verification_sid=payload.verification_sid,
         )
-        user_row.password_hash = hash_password(payload.new_password)
-        user_row.updated_at = utcnow()
-        user_row.last_login_at = utcnow()
-        db.commit()
-        db.refresh(user_row)
-        return _issue_subject_session(user_row, subject_type="user")
+
+        def _persist_work() -> dict[str, Any]:
+            user_row.password_hash = hash_password(payload.new_password)
+            user_row.updated_at = utcnow()
+            user_row.last_login_at = utcnow()
+            db.commit()
+            db.refresh(user_row)
+            return _issue_subject_session(user_row, subject_type="user")
+
+        return await asyncio.to_thread(_persist_work)
 
     @app.post("/api/v1/auth/admin/login")
     def admin_login(payload: LoginPayload, db: Session = Depends(get_db)) -> dict[str, Any]:
@@ -783,24 +794,27 @@ def register_auth_routes(
                 detail="Name must be at least 2 characters.",
             )
 
-        existing_user = _lookup_user_by_phone(db, normalized_phone)
-        if existing_user is not None:
-            if _is_row_active(existing_user):
+        def _lookup_work() -> None:
+            existing_user = _lookup_user_by_phone(db, normalized_phone)
+            if existing_user is not None:
+                if _is_row_active(existing_user):
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="User account already exists for this phone. Please log in.",
+                    )
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
-                    detail="User account already exists for this phone. Please log in.",
+                    detail="User account exists but is not active. Please contact support.",
                 )
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="User account exists but is not active. Please contact support.",
-            )
 
-        existing_admin = _lookup_admin_by_phone(db, normalized_phone)
-        if existing_admin is not None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="This phone is already used by an admin account.",
-            )
+            existing_admin = _lookup_admin_by_phone(db, normalized_phone)
+            if existing_admin is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="This phone is already used by an admin account.",
+                )
+
+        await asyncio.to_thread(_lookup_work)
 
         if payload.otp_code:
             required_provider = _require_twilio_provider(provider)
@@ -818,25 +832,28 @@ def register_auth_routes(
                 detail="password or otpCode is required",
             )
 
-        user_row = AppUser(
-            phone=normalized_phone,
-            name=normalized_name,
-            status="active",
-            password_hash=hash_password(payload.password) if payload.password else None,
-            last_login_at=utcnow(),
-        )
-        db.add(user_row)
-        try:
-            db.commit()
-        except IntegrityError as exc:
-            db.rollback()
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="User account already exists for this phone. Please log in.",
-            ) from exc
-        db.refresh(user_row)
+        def _persist_work() -> dict[str, Any]:
+            user_row = AppUser(
+                phone=normalized_phone,
+                name=normalized_name,
+                status="active",
+                password_hash=hash_password(payload.password) if payload.password else None,
+                last_login_at=utcnow(),
+            )
+            db.add(user_row)
+            try:
+                db.commit()
+            except IntegrityError as exc:
+                db.rollback()
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="User account already exists for this phone. Please log in.",
+                ) from exc
+            db.refresh(user_row)
 
-        return _issue_user_session(user_row)
+            return _issue_user_session(user_row)
+
+        return await asyncio.to_thread(_persist_work)
 
     # The unprefixed `/auth/*` paths are intentional back-compat aliases for older
     # app builds that called the API without the `/api/v1` prefix. New clients use
@@ -844,7 +861,7 @@ def register_auth_routes(
     # legacy builds are retired.
     @app.get("/api/v1/auth/me")
     @app.get("/auth/me")
-    async def auth_me(
+    def auth_me(
         token: str = Depends(require_bearer_token),
         db: Session = Depends(get_db),
     ) -> dict[str, Any]:
@@ -892,7 +909,7 @@ def register_auth_routes(
 
     @app.patch("/api/v1/auth/me")
     @app.patch("/auth/me")
-    async def update_auth_me(
+    def update_auth_me(
         payload: AuthMeUpdatePayload,
         claims: dict[str, Any] = Depends(get_token_claims),
         db: Session = Depends(get_db),
@@ -995,7 +1012,7 @@ def register_auth_routes(
     @app.delete("/auth/me")
     @app.post("/api/v1/auth/user/delete")
     @app.post("/auth/user/delete")
-    async def delete_authenticated_user(
+    def delete_authenticated_user(
         claims: dict[str, Any] = Depends(get_token_claims),
         db: Session = Depends(get_db),
     ) -> dict[str, Any]:

@@ -10,6 +10,7 @@ seeded by Alembic migration 0040.
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Callable
 
 from fastapi import Depends, FastAPI, HTTPException, Response, status
@@ -75,13 +76,13 @@ def register_app_meta_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return row
 
     @app.get("/api/v1/app/version-info")
-    async def get_version_info(db: Session = Depends(get_db)) -> dict[str, Any]:
+    def get_version_info(db: Session = Depends(get_db)) -> dict[str, Any]:
         row = _get_or_create(db)
         db.commit()
         return _serialize(row)
 
     @app.get("/api/v1/currencies")
-    async def get_currencies(response: Response, db: Session = Depends(get_db)) -> dict[str, Any]:
+    def get_currencies(response: Response, db: Session = Depends(get_db)) -> dict[str, Any]:
         """Universal currency set for the app: pure FX rates (IQD per 1 unit) for
         every enabled display currency + the IQD settlement base. `esimPricing`
         carries the (service-scoped) global eSIM markup the client uses to compute
@@ -98,7 +99,7 @@ def register_app_meta_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         }
 
     @app.put("/api/v1/admin/app/version-info")
-    async def update_version_info(
+    def update_version_info(
         payload: AppVersionInfoUpdatePayload,
         db: Session = Depends(get_db),
         _: AdminUser = Depends(_require_admin_actor),

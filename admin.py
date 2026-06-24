@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 import logging
 import os
@@ -119,7 +120,7 @@ class FeaturedLocationPayload(BaseModel):
 
 
 def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
-    async def _require_admin_actor(
+    def _require_admin_actor(
         claims: dict[str, Any] = Depends(get_token_claims),
         db: Session = Depends(get_db),
     ) -> AdminUser:
@@ -127,7 +128,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         assert isinstance(row, AdminUser)
         return row
 
-    async def _require_owner_or_super(
+    def _require_owner_or_super(
         claims: dict[str, Any] = Depends(get_token_claims),
         db: Session = Depends(get_db),
     ) -> AdminUser:
@@ -158,7 +159,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         }
 
     @app.get("/api/v1/admin/admin-users")
-    async def list_admin_users(
+    def list_admin_users(
         phone: str | None = None,
         db: Session = Depends(get_db),
         _: AdminUser = Depends(_require_owner_or_super),
@@ -171,7 +172,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return {"admins": [_serialize_admin_user(r) for r in rows]}
 
     @app.get("/api/v1/admin/users/{user_id}/push-devices")
-    async def list_user_push_devices(
+    def list_user_push_devices(
         user_id: str,
         db: Session = Depends(get_db),
         _: AdminUser = Depends(_require_admin_actor),
@@ -211,7 +212,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         }
 
     @app.post("/api/v1/admin/users/{user_id}/push-devices/purge-stale")
-    async def purge_stale_user_devices(
+    def purge_stale_user_devices(
         user_id: str,
         db: Session = Depends(get_db),
         _: AdminUser = Depends(_require_admin_actor),
@@ -237,7 +238,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return {"userId": user_id, "deactivated": deactivated, "count": len(deactivated)}
 
     @app.post("/api/v1/admin/profiles/normalize-statuses")
-    async def normalize_existing_statuses(
+    def normalize_existing_statuses(
         db: Session = Depends(get_db),
         _: AdminUser = Depends(_require_admin_actor),
     ) -> dict[str, Any]:
@@ -325,50 +326,54 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         # profiles, so the "Refresh from provider" button picks up profiles
         # the user just installed (they're still INACTIVE in our DB until
         # the provider reports IN_USE).
-        if source == "cron":
-            # ACTIVE profiles get a usage refresh. Plus a defensive sweep for
-            # any profile whose provider_status says ONBOARDING/IN_USE (the
-            # first-connection states that should auto-promote to ACTIVE).
-            # The ONBOARDING alias + _apply_active_side_effects already fires
-            # on every webhook/recover, so this is just belt-and-suspenders for
-            # drift / missed webhooks.
-            active_iccids = db.scalars(
-                _select(ESimProfile.iccid)
-                .where(ESimProfile.iccid.is_not(None))
-                .where(
-                    or_(
-                        func.upper(ESimProfile.app_status) == "ACTIVE",
-                        func.upper(ESimProfile.provider_status).in_(("ONBOARDING", "IN_USE")),
+        def _load_refresh_targets() -> tuple[list[Any], list[Any]]:
+            if source == "cron":
+                # ACTIVE profiles get a usage refresh. Plus a defensive sweep for
+                # any profile whose provider_status says ONBOARDING/IN_USE (the
+                # first-connection states that should auto-promote to ACTIVE).
+                # The ONBOARDING alias + _apply_active_side_effects already fires
+                # on every webhook/recover, so this is just belt-and-suspenders for
+                # drift / missed webhooks.
+                active_iccids = db.scalars(
+                    _select(ESimProfile.iccid)
+                    .where(ESimProfile.iccid.is_not(None))
+                    .where(
+                        or_(
+                            func.upper(ESimProfile.app_status) == "ACTIVE",
+                            func.upper(ESimProfile.provider_status).in_(("ONBOARDING", "IN_USE")),
+                        )
                     )
-                )
+                ).all()
+            else:
+                # admin/manual: include anything with an ICCID that isn't a hard-dead status
+                active_iccids = db.scalars(
+                    _select(ESimProfile.iccid)
+                    .where(ESimProfile.iccid.is_not(None))
+                    .where(~func.upper(ESimProfile.app_status).in_(("CANCELLED", "REVOKED", "REFUNDED", "EXPIRED")))
+                ).all()
+            # Snapshot the broken-placeholder (profile_id, order_no) pairs up front
+            # so we don't keep a row reference alive across provider IO.
+            broken_pairs = db.execute(
+                _select(ESimProfile.id, OrderItem.provider_order_no)
+                .join(OrderItem, ESimProfile.order_item_id == OrderItem.id)
+                .where(ESimProfile.iccid.is_(None))
+                .where(or_(ESimProfile.activation_code.is_(None), ESimProfile.activation_code == ""))
+                .where(ESimProfile.created_at >= (utcnow() - timedelta(days=7)))
+                .where(OrderItem.provider_order_no.is_not(None))
             ).all()
-        else:
-            # admin/manual: include anything with an ICCID that isn't a hard-dead status
-            active_iccids = db.scalars(
-                _select(ESimProfile.iccid)
-                .where(ESimProfile.iccid.is_not(None))
-                .where(~func.upper(ESimProfile.app_status).in_(("CANCELLED", "REVOKED", "REFUNDED", "EXPIRED")))
-            ).all()
-        # Snapshot the broken-placeholder (profile_id, order_no) pairs up front
-        # so we don't keep a row reference alive across provider IO.
-        broken_pairs = db.execute(
-            _select(ESimProfile.id, OrderItem.provider_order_no)
-            .join(OrderItem, ESimProfile.order_item_id == OrderItem.id)
-            .where(ESimProfile.iccid.is_(None))
-            .where(or_(ESimProfile.activation_code.is_(None), ESimProfile.activation_code == ""))
-            .where(ESimProfile.created_at >= (utcnow() - timedelta(days=7)))
-            .where(OrderItem.provider_order_no.is_not(None))
-        ).all()
 
-        # CRITICAL (freeze fix): release the pooled DB connection BEFORE the
-        # provider IO loop. Previously this function held one connection for
-        # the entire duration of N sequential provider round-trips (each
-        # 1-3 s). With N active profiles that pinned a slot for N*2s+, and
-        # when the hourly cron overlapped a user's pull-to-refresh the pool
-        # starved and the whole backend appeared frozen. Now each iteration
-        # closes the session before calling the provider; sync_profiles
-        # transparently checks a fresh connection back out for the short write.
-        db.close()
+            # CRITICAL (freeze fix): release the pooled DB connection BEFORE the
+            # provider IO loop. Previously this function held one connection for
+            # the entire duration of N sequential provider round-trips (each
+            # 1-3 s). With N active profiles that pinned a slot for N*2s+, and
+            # when the hourly cron overlapped a user's pull-to-refresh the pool
+            # starved and the whole backend appeared frozen. Now each iteration
+            # closes the session before calling the provider; sync_profiles
+            # transparently checks a fresh connection back out for the short write.
+            db.close()
+            return active_iccids, broken_pairs
+
+        active_iccids, broken_pairs = await asyncio.to_thread(_load_refresh_targets)
 
         active_iccids = [i for i in active_iccids if i]
         store = SupabaseStore(db)
@@ -382,12 +387,16 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
             try:
                 db.close()  # drop the slot during the provider round-trip
                 resp = await provider.query_profiles(ProfileQueryRequest(iccid=iccid))
-                applied = store.sync_profiles(
-                    resp.model_dump(by_alias=True, exclude_none=True),
-                    platform_code=f"{source}-refresh",
-                    platform_name=f"Active usage refresh ({source})",
-                    actor_phone=None,
-                )
+
+                def _apply_active() -> Any:
+                    return store.sync_profiles(
+                        resp.model_dump(by_alias=True, exclude_none=True),
+                        platform_code=f"{source}-refresh",
+                        platform_name=f"Active usage refresh ({source})",
+                        actor_phone=None,
+                    )
+
+                applied = await asyncio.to_thread(_apply_active)
                 if applied:
                     synced += 1
             except Exception as exc:  # pragma: no cover - resilience
@@ -400,13 +409,18 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
             try:
                 db.close()
                 resp = await provider.query_profiles(ProfileQueryRequest(order_no=order_no))
-                applied = store.sync_profiles(
-                    resp.model_dump(by_alias=True, exclude_none=True),
-                    platform_code=f"{source}-recover",
-                    platform_name=f"Broken-placeholder recovery ({source})",
-                    actor_phone=None,
-                )
-                refreshed = db.scalar(_select(ESimProfile).where(ESimProfile.id == profile_id))
+
+                def _apply_recover() -> tuple[Any, Any]:
+                    applied = store.sync_profiles(
+                        resp.model_dump(by_alias=True, exclude_none=True),
+                        platform_code=f"{source}-recover",
+                        platform_name=f"Broken-placeholder recovery ({source})",
+                        actor_phone=None,
+                    )
+                    refreshed = db.scalar(_select(ESimProfile).where(ESimProfile.id == profile_id))
+                    return applied, refreshed
+
+                applied, refreshed = await asyncio.to_thread(_apply_recover)
                 if refreshed is not None and refreshed.activation_code:
                     recovered += 1
                 elif applied:
@@ -437,7 +451,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return await _perform_active_usage_refresh(db=db, provider=provider, source="admin")
 
     @app.get("/api/v1/admin/profiles/audit")
-    async def audit_esim_profiles(
+    def audit_esim_profiles(
         db: Session = Depends(get_db),
         _: AdminUser = Depends(_require_admin_actor),
     ) -> dict[str, Any]:
@@ -581,37 +595,47 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         from supabase_store import CustomerOrder, ESimProfile, OrderItem
         from esim_access_api import ProfileQueryRequest
         from sqlalchemy import select as _select
-        profile = db.scalar(_select(ESimProfile).where(ESimProfile.id == profile_id))
-        if profile is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found")
-        # Resolve providerOrderNo from the profile first, then fall back to the
-        # most recent OrderItem for this user. OrderItem links to user via the
-        # parent CustomerOrder (no direct OrderItem.user_id column).
-        order_no = getattr(profile, "provider_order_no", None)
-        if not order_no:
-            order_item = db.scalar(
-                _select(OrderItem)
-                .join(CustomerOrder, CustomerOrder.id == OrderItem.customer_order_id)
-                .where(CustomerOrder.user_id == profile.user_id)
-                .where(OrderItem.provider_order_no.is_not(None))
-                .order_by(OrderItem.created_at.desc())
-                .limit(1)
-            )
-            if order_item is None:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="No provider_order_no available to query the provider with",
+
+        def _resolve_profile_and_order_no() -> tuple[ESimProfile, Any]:
+            profile = db.scalar(_select(ESimProfile).where(ESimProfile.id == profile_id))
+            if profile is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found")
+            # Resolve providerOrderNo from the profile first, then fall back to the
+            # most recent OrderItem for this user. OrderItem links to user via the
+            # parent CustomerOrder (no direct OrderItem.user_id column).
+            order_no = getattr(profile, "provider_order_no", None)
+            if not order_no:
+                order_item = db.scalar(
+                    _select(OrderItem)
+                    .join(CustomerOrder, CustomerOrder.id == OrderItem.customer_order_id)
+                    .where(CustomerOrder.user_id == profile.user_id)
+                    .where(OrderItem.provider_order_no.is_not(None))
+                    .order_by(OrderItem.created_at.desc())
+                    .limit(1)
                 )
-            order_no = order_item.provider_order_no
+                if order_item is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="No provider_order_no available to query the provider with",
+                    )
+                order_no = order_item.provider_order_no
+            return profile, order_no
+
+        profile, order_no = await asyncio.to_thread(_resolve_profile_and_order_no)
         response = await provider.query_profiles(ProfileQueryRequest(order_no=order_no))
-        synced = SupabaseStore(db).sync_profiles(
-            response.model_dump(by_alias=True, exclude_none=True),
-            platform_code="admin-resync",
-            platform_name="Admin manual resync",
-            actor_phone=None,
-        )
-        db.commit()
-        db.refresh(profile)
+
+        def _apply_resync() -> Any:
+            synced = SupabaseStore(db).sync_profiles(
+                response.model_dump(by_alias=True, exclude_none=True),
+                platform_code="admin-resync",
+                platform_name="Admin manual resync",
+                actor_phone=None,
+            )
+            db.commit()
+            db.refresh(profile)
+            return synced
+
+        synced = await asyncio.to_thread(_apply_resync)
         return {
             "profileId": profile.id,
             "orderNo": order_no,
@@ -625,7 +649,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         }
 
     @app.get("/api/v1/admin/users/{user_id}/profiles-raw")
-    async def list_user_profiles_raw(
+    def list_user_profiles_raw(
         user_id: str,
         db: Session = Depends(get_db),
         _: AdminUser = Depends(_require_admin_actor),
@@ -674,7 +698,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         }
 
     @app.delete("/api/v1/admin/admin-users/{admin_id}")
-    async def delete_admin_user(
+    def delete_admin_user(
         admin_id: str,
         db: Session = Depends(get_db),
         actor: AdminUser = Depends(_require_owner_or_super),
@@ -693,7 +717,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return {"deleted": admin_id}
 
     @app.post("/api/v1/admin/profiles/refund")
-    async def refund_profile(
+    def refund_profile(
         payload: RefundPayload,
         db: Session = Depends(get_db),
         _: AdminUser = Depends(_require_admin_actor),
@@ -711,7 +735,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return {"database": {"profileId": profile.id if profile else None}}
 
     @app.post("/api/v1/admin/profiles/install")
-    async def install_profile(
+    def install_profile(
         payload: ProfileStatePayload,
         db: Session = Depends(get_db),
         _: AdminUser = Depends(_require_admin_actor),
@@ -728,7 +752,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return {"database": {"profileId": profile.id if profile else None}}
 
     @app.post("/api/v1/admin/profiles/activate")
-    async def activate_profile(
+    def activate_profile(
         payload: ProfileStatePayload,
         db: Session = Depends(get_db),
         _: AdminUser = Depends(_require_admin_actor),
@@ -746,7 +770,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
 
     @app.post("/api/v1/admin/pricing-rules")
     @app.post("/api/v1/admin/prices")
-    async def save_pricing_rule(
+    def save_pricing_rule(
         payload: PricingRulePayload,
         db: Session = Depends(get_db),
         _: AdminUser = Depends(_require_admin_actor),
@@ -756,7 +780,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
 
     @app.get("/api/v1/admin/pricing-rules")
     @app.get("/api/v1/admin/prices")
-    async def list_pricing_rules(
+    def list_pricing_rules(
         db: Session = Depends(get_db),
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
@@ -766,7 +790,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return {"pricingRules": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
 
     @app.post("/api/v1/admin/discount-rules")
-    async def save_discount_rule(
+    def save_discount_rule(
         payload: DiscountRulePayload,
         db: Session = Depends(get_db),
         _: AdminUser = Depends(_require_admin_actor),
@@ -775,7 +799,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return {"discountRule": {"id": row.id}}
 
     @app.get("/api/v1/admin/discount-rules")
-    async def list_discount_rules(
+    def list_discount_rules(
         db: Session = Depends(get_db),
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
@@ -785,7 +809,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return {"discountRules": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
 
     @app.post("/api/v1/admin/featured-locations")
-    async def save_featured_location(
+    def save_featured_location(
         payload: FeaturedLocationPayload,
         db: Session = Depends(get_db),
         _: AdminUser = Depends(_require_admin_actor),
@@ -797,7 +821,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return {"location": {"id": row.id}}
 
     @app.get("/api/v1/admin/featured-locations")
-    async def list_featured_locations(
+    def list_featured_locations(
         db: Session = Depends(get_db),
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
@@ -807,7 +831,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return {"locations": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
 
     @app.delete("/api/v1/admin/featured-locations/{location_id}")
-    async def delete_featured_location(
+    def delete_featured_location(
         location_id: int,
         db: Session = Depends(get_db),
         _: AdminUser = Depends(_require_admin_actor),
@@ -865,7 +889,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return {"success": True, "data": {"locations": locations, "cacheStatus": "fresh"}}
 
     @app.post("/api/v1/admin/exchange-rates")
-    async def save_exchange_rate(
+    def save_exchange_rate(
         payload: ExchangeRatePayload,
         db: Session = Depends(get_db),
         _: AdminUser = Depends(_require_admin_actor),
@@ -874,7 +898,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return {"exchangeRate": {"id": row.id}}
 
     @app.get("/api/v1/admin/exchange-rates")
-    async def list_exchange_rates(
+    def list_exchange_rates(
         db: Session = Depends(get_db),
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
@@ -884,7 +908,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return {"exchangeRates": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
 
     @app.get("/api/v1/admin/orders")
-    async def list_orders(
+    def list_orders(
         db: Session = Depends(get_db),
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
@@ -894,7 +918,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return {"orders": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
 
     @app.get("/api/v1/admin/order-items")
-    async def list_order_items(
+    def list_order_items(
         db: Session = Depends(get_db),
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
@@ -904,7 +928,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return {"orderItems": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
 
     @app.get("/api/v1/admin/profiles")
-    async def list_profiles(
+    def list_profiles(
         db: Session = Depends(get_db),
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
@@ -914,7 +938,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return {"profiles": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
 
     @app.get("/api/v1/admin/lifecycle-events")
-    async def list_lifecycle_events(
+    def list_lifecycle_events(
         db: Session = Depends(get_db),
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
@@ -924,7 +948,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return {"events": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
 
     @app.get("/api/v1/admin/payment-attempts")
-    async def list_payment_attempts(
+    def list_payment_attempts(
         db: Session = Depends(get_db),
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
@@ -934,7 +958,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         return {"paymentAttempts": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
 
     @app.get("/api/v1/admin/payment-provider-events")
-    async def list_payment_provider_events(
+    def list_payment_provider_events(
         db: Session = Depends(get_db),
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
