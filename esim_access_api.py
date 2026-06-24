@@ -1528,6 +1528,24 @@ def _require_valid_esim_webhook_secret(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid eSIM Access webhook secret.")
 
 
+async def stop_periodic_usage_sync_worker(app: FastAPI) -> None:
+    """Cancel and await the background eSIM usage-sync task, if running.
+
+    Invoked from app.py's lifespan shutdown (replaces the deprecated
+    @app.on_event("shutdown") handler).
+    """
+    task = getattr(app.state, "esim_usage_sync_task", None)
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    finally:
+        app.state.esim_usage_sync_task = None
+
+
 def register_esim_access_routes(
     app: FastAPI,
     get_db: Callable[..., Any],
@@ -1581,7 +1599,10 @@ def register_esim_access_routes(
             "updatedAt": _to_utc_z(exchange.updated_at),
         }
 
-    async def _require_admin_actor(
+    # Plain `def` dependencies: the only work is synchronous DB lookup via
+    # require_active_subject (no awaits), so FastAPI runs them in a worker
+    # thread instead of blocking the event loop.
+    def _require_admin_actor(
         claims: dict[str, Any] = Depends(get_token_claims),
         db: Session = Depends(get_db),
     ) -> AdminUser:
@@ -1589,7 +1610,7 @@ def register_esim_access_routes(
         assert isinstance(row, AdminUser)
         return row
 
-    async def _require_active_actor(
+    def _require_active_actor(
         claims: dict[str, Any] = Depends(get_token_claims),
         db: Session = Depends(get_db),
     ) -> AppUser | AdminUser:
@@ -1687,10 +1708,14 @@ def register_esim_access_routes(
             provider_payload = provider_response.model_dump(by_alias=True, exclude_none=True)
             usage_records = ((provider_payload.get("obj") or {}).get("esimUsageList") or [])
             usage_records_received += len(usage_records)
-            synced_profiles = SupabaseStore(db).sync_usage_records(provider_payload, actor_phone=actor_phone)
-            for profile in synced_profiles:
-                if profile.id is not None:
-                    synced_profile_ids.add(int(profile.id))
+            # Offload the synchronous DB write to a worker thread so it does not
+            # block the event loop while inside the batch loop.
+            def _sync_usage_batch() -> list[int]:
+                synced_profiles = SupabaseStore(db).sync_usage_records(provider_payload, actor_phone=actor_phone)
+                return [int(profile.id) for profile in synced_profiles if profile.id is not None]
+
+            for profile_id in await asyncio.to_thread(_sync_usage_batch):
+                synced_profile_ids.add(profile_id)
         return {
             "esimTranNosRequested": len(unique_esim_tran_nos),
             "providerCalls": provider_calls,
@@ -1761,18 +1786,6 @@ def register_esim_access_routes(
             usage_sync_batch_size,
         )
 
-    @app.on_event("shutdown")
-    async def _stop_periodic_usage_sync_worker() -> None:
-        task = getattr(app.state, "esim_usage_sync_task", None)
-        if task is None:
-            return
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        finally:
-            app.state.esim_usage_sync_task = None
 
     @app.post("/api/v1/esim-access/packages/query")
     async def query_packages(
@@ -1806,85 +1819,99 @@ def register_esim_access_routes(
         db: Session = Depends(get_db),
         claims: dict[str, Any] = Depends(get_token_claims),
     ) -> dict[str, Any]:
-        auth_user = require_active_subject(db, claims=claims, subject_type="user")
-        assert isinstance(auth_user, AppUser)
-        # Loyalty is a comped payment method reserved for loyalty (VIP/staff)
-        # accounts. Enforce server-side — the UI hides it for normal users, but
-        # we must not rely on the client. Reject BEFORE the provider order call
-        # so a tampered request can never spend provider credit for free.
-        requested_method, _ = _resolve_payment_method_provider(payload)
-        if requested_method == "loyalty" and not bool(auth_user.is_loyalty):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Loyalty checkout is not available for this account.",
-            )
-        # Snapshot the user fields we'll need AFTER detaching the session,
-        # then release the DB pool slot before the slow provider call. With
-        # the default pool size of 8 and 4 overflow, holding sessions across
-        # a 2-5 s provider round-trip drains capacity fast — every other
-        # request blocks on pool checkout. Reopen lazily for the write.
-        user_snapshot = {
-            "phone": auth_user.phone,
-            "name": auth_user.name,
-            "email": auth_user.email,
-            "status": auth_user.status,
-            "is_loyalty": auth_user.is_loyalty,
-            "notes": auth_user.notes,
-        }
-        auth_user_phone = auth_user.phone
-        db.close()
+        # Synchronous auth + snapshot + session release: offload to a worker
+        # thread so the blocking DB read does not run on the event loop.
+        def _prepare_managed_order() -> tuple[dict[str, Any], str]:
+            auth_user = require_active_subject(db, claims=claims, subject_type="user")
+            assert isinstance(auth_user, AppUser)
+            # Loyalty is a comped payment method reserved for loyalty (VIP/staff)
+            # accounts. Enforce server-side — the UI hides it for normal users, but
+            # we must not rely on the client. Reject BEFORE the provider order call
+            # so a tampered request can never spend provider credit for free.
+            requested_method, _ = _resolve_payment_method_provider(payload)
+            if requested_method == "loyalty" and not bool(auth_user.is_loyalty):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Loyalty checkout is not available for this account.",
+                )
+            # Snapshot the user fields we'll need AFTER detaching the session,
+            # then release the DB pool slot before the slow provider call. With
+            # the default pool size of 8 and 4 overflow, holding sessions across
+            # a 2-5 s provider round-trip drains capacity fast — every other
+            # request blocks on pool checkout. Reopen lazily for the write.
+            user_snapshot = {
+                "phone": auth_user.phone,
+                "name": auth_user.name,
+                "email": auth_user.email,
+                "status": auth_user.status,
+                "is_loyalty": auth_user.is_loyalty,
+                "notes": auth_user.notes,
+            }
+            auth_user_phone = auth_user.phone
+            db.close()
+            return user_snapshot, auth_user_phone
+
+        user_snapshot, auth_user_phone = await asyncio.to_thread(_prepare_managed_order)
         provider_response = await provider.order_profiles(payload.provider_request)
-        store = SupabaseStore(db)
         resolved_payment_method, resolved_payment_provider = _resolve_payment_method_provider(payload)
         provider_request_payload = payload.provider_request.model_dump(by_alias=True, exclude_none=True)
         provider_response_payload = provider_response.model_dump(by_alias=True, exclude_none=True)
-        try:
-            customer_order, order_item = store.save_managed_order(
-                user_data=user_snapshot,
-                platform_code=payload.platform_code,
-                platform_name=payload.platform_name,
-                order_request=provider_request_payload,
-                provider_response=provider_response_payload,
-                currency_code=payload.currency_code,
-                provider_currency_code=payload.provider_currency_code,
-                exchange_rate=payload.exchange_rate,
-                sale_price_minor=payload.sale_price_minor,
-                provider_price_minor=payload.provider_price_minor,
-                country_code=payload.country_code,
-                country_name=payload.country_name,
-                package_code=payload.package_code,
-                package_slug=payload.package_slug,
-                package_name=payload.package_name,
-                payment_method=resolved_payment_method,
-                payment_provider=resolved_payment_provider,
-                custom_fields=payload.custom_fields,
-                auto_commit=False,
-            )
-            payment_attempt = _resolve_or_create_payment_for_managed_order(
-                store=store,
-                payload=payload,
-                customer_order_id=customer_order.id,
-                order_item_id=order_item.id,
-                user_id=customer_order.user_id,
-                service_type=order_item.service_type,
-                amount_minor=order_item.sale_price_minor or customer_order.total_minor or 0,
-                currency_code=customer_order.currency_code or "IQD",
-                provider_request_payload=provider_request_payload,
-                provider_response_payload=provider_response_payload,
-            )
+
+        # Persist the managed order + payment attempt. This is a contiguous block
+        # of synchronous SQLAlchemy work (including the commit/rollback) so it is
+        # offloaded wholesale to a worker thread to keep the event loop free.
+        def _persist_managed_order() -> tuple[Any, Any, Any, Any]:
+            store = SupabaseStore(db)
+            try:
+                customer_order, order_item = store.save_managed_order(
+                    user_data=user_snapshot,
+                    platform_code=payload.platform_code,
+                    platform_name=payload.platform_name,
+                    order_request=provider_request_payload,
+                    provider_response=provider_response_payload,
+                    currency_code=payload.currency_code,
+                    provider_currency_code=payload.provider_currency_code,
+                    exchange_rate=payload.exchange_rate,
+                    sale_price_minor=payload.sale_price_minor,
+                    provider_price_minor=payload.provider_price_minor,
+                    country_code=payload.country_code,
+                    country_name=payload.country_name,
+                    package_code=payload.package_code,
+                    package_slug=payload.package_slug,
+                    package_name=payload.package_name,
+                    payment_method=resolved_payment_method,
+                    payment_provider=resolved_payment_provider,
+                    custom_fields=payload.custom_fields,
+                    auto_commit=False,
+                )
+                payment_attempt = _resolve_or_create_payment_for_managed_order(
+                    store=store,
+                    payload=payload,
+                    customer_order_id=customer_order.id,
+                    order_item_id=order_item.id,
+                    user_id=customer_order.user_id,
+                    service_type=order_item.service_type,
+                    amount_minor=order_item.sale_price_minor or customer_order.total_minor or 0,
+                    currency_code=customer_order.currency_code or "IQD",
+                    provider_request_payload=provider_request_payload,
+                    provider_response_payload=provider_response_payload,
+                )
+                if payment_attempt is not None:
+                    order_item.payment_method = payment_attempt.payment_method
+                    order_item.payment_provider = payment_attempt.provider
+                    customer_order.payment_method = payment_attempt.payment_method
+                    customer_order.payment_provider = payment_attempt.provider
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+            db.refresh(customer_order)
+            db.refresh(order_item)
             if payment_attempt is not None:
-                order_item.payment_method = payment_attempt.payment_method
-                order_item.payment_provider = payment_attempt.provider
-                customer_order.payment_method = payment_attempt.payment_method
-                customer_order.payment_provider = payment_attempt.provider
-            db.commit()
-        except Exception:
-            db.rollback()
-            raise
-        db.refresh(customer_order)
-        db.refresh(order_item)
-        if payment_attempt is not None:
-            db.refresh(payment_attempt)
+                db.refresh(payment_attempt)
+            return store, customer_order, order_item, payment_attempt
+
+        store, customer_order, order_item, payment_attempt = await asyncio.to_thread(_persist_managed_order)
         profiles_synced = 0
         profile_sync_error: str | None = None
         profile_sync_attempts = 0
@@ -1911,45 +1938,78 @@ def register_esim_access_routes(
                     provider_sync_response = await provider.query_profiles(
                         ProfileQueryRequest(order_no=provider_order_no_snapshot)
                     )
-                    synced = store.sync_profiles(
-                        provider_sync_response.model_dump(by_alias=True, exclude_none=True),
-                        platform_code=payload.platform_code,
-                        platform_name=payload.platform_name,
-                        actor_phone=auth_user_phone,
-                    )
-                    profiles_synced = len(synced)
-                    # Refetch from a fresh session — the original order_item
-                    # is detached after db.close().
-                    order_item = db.scalar(
-                        _select(OrderItem).where(OrderItem.id == order_item_id)
-                    )
-                    customer_order = order_item.customer_order if order_item is not None else customer_order
-                    # Did we actually get activation data for our profile?
-                    refreshed_profile = db.scalar(
-                        _select(_ESimProfile).where(_ESimProfile.order_item_id == order_item.id)
-                    )
-                    if refreshed_profile and refreshed_profile.activation_code:
-                        profile_sync_error = None
-                        break
-                    if attempt_index == len(backoffs) - 1:
-                        # Final attempt and we still have nothing — record it.
-                        profile_sync_error = (
-                            "Provider returned no activation data after "
-                            f"{profile_sync_attempts} attempts"
+
+                    # Contiguous synchronous DB section: sync + refetch. Offload
+                    # to a worker thread so it does not block the event loop.
+                    def _reconcile_synced_profiles() -> tuple[int, Any, Any, str | None, bool]:
+                        synced = store.sync_profiles(
+                            provider_sync_response.model_dump(by_alias=True, exclude_none=True),
+                            platform_code=payload.platform_code,
+                            platform_name=payload.platform_name,
+                            actor_phone=auth_user_phone,
                         )
+                        synced_count = len(synced)
+                        # Refetch from a fresh session — the original order_item
+                        # is detached after db.close().
+                        refetched_order_item = db.scalar(
+                            _select(OrderItem).where(OrderItem.id == order_item_id)
+                        )
+                        refetched_customer_order = (
+                            refetched_order_item.customer_order
+                            if refetched_order_item is not None
+                            else customer_order
+                        )
+                        # Did we actually get activation data for our profile?
+                        refreshed_profile = db.scalar(
+                            _select(_ESimProfile).where(_ESimProfile.order_item_id == refetched_order_item.id)
+                        )
+                        local_error: str | None = profile_sync_error
+                        should_break = False
+                        if refreshed_profile and refreshed_profile.activation_code:
+                            local_error = None
+                            should_break = True
+                        elif attempt_index == len(backoffs) - 1:
+                            # Final attempt and we still have nothing — record it.
+                            local_error = (
+                                "Provider returned no activation data after "
+                                f"{profile_sync_attempts} attempts"
+                            )
+                        return (
+                            synced_count,
+                            refetched_order_item,
+                            refetched_customer_order,
+                            local_error,
+                            should_break,
+                        )
+
+                    (
+                        profiles_synced,
+                        order_item,
+                        customer_order,
+                        profile_sync_error,
+                        _should_break,
+                    ) = await asyncio.to_thread(_reconcile_synced_profiles)
+                    if _should_break:
+                        break
                 except Exception as exc:  # pragma: no cover - best-effort sync hardening
-                    try:
-                        db.rollback()
-                    except Exception:
-                        pass
+                    # Synchronous rollback + refetch — offload to a worker thread.
+                    def _recover_from_sync_error() -> tuple[Any, Any]:
+                        try:
+                            db.rollback()
+                        except Exception:
+                            pass
+                        # The original ORM objects are detached after db.close().
+                        # Refetch by primary key from a fresh session.
+                        recovered_order_item = db.scalar(
+                            _select(OrderItem).where(OrderItem.id == order_item_id)
+                        )
+                        recovered_customer_order = customer_order
+                        if recovered_order_item is not None:
+                            recovered_customer_order = recovered_order_item.customer_order
+                        return recovered_order_item, recovered_customer_order
+
                     profile_sync_error = str(exc)
-                    # The original ORM objects are detached after db.close().
-                    # Refetch by primary key from a fresh session.
-                    order_item = db.scalar(
-                        _select(OrderItem).where(OrderItem.id == order_item_id)
-                    )
-                    if order_item is not None:
-                        customer_order = order_item.customer_order
+                    order_item, customer_order = await asyncio.to_thread(_recover_from_sync_error)
                     # Don't retry on hard errors — provider is unhealthy or we
                     # have a code bug. Bail.
                     break
@@ -2016,16 +2076,21 @@ def register_esim_access_routes(
         _: AdminUser = Depends(_require_admin_actor),
     ) -> dict[str, Any]:
         provider_response = await provider.query_profiles(payload.provider_request)
-        store = SupabaseStore(db)
-        profiles = store.sync_profiles(
-            provider_response.model_dump(by_alias=True, exclude_none=True),
-            platform_code=payload.platform_code,
-            platform_name=payload.platform_name,
-            actor_phone=payload.actor_phone,
-        )
+
+        def _sync_profiles_work() -> int:
+            store = SupabaseStore(db)
+            profiles = store.sync_profiles(
+                provider_response.model_dump(by_alias=True, exclude_none=True),
+                platform_code=payload.platform_code,
+                platform_name=payload.platform_name,
+                actor_phone=payload.actor_phone,
+            )
+            return len(profiles)
+
+        profiles_synced = await asyncio.to_thread(_sync_profiles_work)
         return {
             "provider": provider_response.model_dump(by_alias=True, exclude_none=True),
-            "database": {"profilesSynced": len(profiles)},
+            "database": {"profilesSynced": profiles_synced},
         }
 
     @app.post("/api/v1/esim-access/profiles/cancel")
@@ -2044,15 +2109,19 @@ def register_esim_access_routes(
         _: AdminUser = Depends(_require_admin_actor),
     ) -> dict[str, Any]:
         provider_response = await provider.cancel_profile(payload.provider_request)
-        profile = SupabaseStore(db).apply_profile_action(
-            action="cancel",
-            identifier_key="esim_tran_no",
-            identifier_value=payload.provider_request.esim_tran_no,
-            platform_code=payload.context.platform_code,
-            actor_phone=payload.context.actor_phone,
-            note=payload.context.note,
-            payload=provider_response.model_dump(by_alias=True, exclude_none=True),
-        )
+
+        def _apply_cancel() -> Any:
+            return SupabaseStore(db).apply_profile_action(
+                action="cancel",
+                identifier_key="esim_tran_no",
+                identifier_value=payload.provider_request.esim_tran_no,
+                platform_code=payload.context.platform_code,
+                actor_phone=payload.context.actor_phone,
+                note=payload.context.note,
+                payload=provider_response.model_dump(by_alias=True, exclude_none=True),
+            )
+
+        profile = await asyncio.to_thread(_apply_cancel)
         return {"provider": provider_response.model_dump(by_alias=True, exclude_none=True), "database": {"profileId": profile.id if profile else None}}
 
     @app.post("/api/v1/esim-access/profiles/suspend")
@@ -2071,15 +2140,19 @@ def register_esim_access_routes(
         _: AdminUser = Depends(_require_admin_actor),
     ) -> dict[str, Any]:
         provider_response = await provider.suspend_profile(payload.provider_request)
-        profile = SupabaseStore(db).apply_profile_action(
-            action="suspend",
-            identifier_key="iccid",
-            identifier_value=payload.provider_request.iccid,
-            platform_code=payload.context.platform_code,
-            actor_phone=payload.context.actor_phone,
-            note=payload.context.note,
-            payload=provider_response.model_dump(by_alias=True, exclude_none=True),
-        )
+
+        def _apply_suspend() -> Any:
+            return SupabaseStore(db).apply_profile_action(
+                action="suspend",
+                identifier_key="iccid",
+                identifier_value=payload.provider_request.iccid,
+                platform_code=payload.context.platform_code,
+                actor_phone=payload.context.actor_phone,
+                note=payload.context.note,
+                payload=provider_response.model_dump(by_alias=True, exclude_none=True),
+            )
+
+        profile = await asyncio.to_thread(_apply_suspend)
         return {"provider": provider_response.model_dump(by_alias=True, exclude_none=True), "database": {"profileId": profile.id if profile else None}}
 
     @app.post("/api/v1/esim-access/profiles/unsuspend")
@@ -2098,15 +2171,19 @@ def register_esim_access_routes(
         _: AdminUser = Depends(_require_admin_actor),
     ) -> dict[str, Any]:
         provider_response = await provider.unsuspend_profile(payload.provider_request)
-        profile = SupabaseStore(db).apply_profile_action(
-            action="unsuspend",
-            identifier_key="iccid",
-            identifier_value=payload.provider_request.iccid,
-            platform_code=payload.context.platform_code,
-            actor_phone=payload.context.actor_phone,
-            note=payload.context.note,
-            payload=provider_response.model_dump(by_alias=True, exclude_none=True),
-        )
+
+        def _apply_unsuspend() -> Any:
+            return SupabaseStore(db).apply_profile_action(
+                action="unsuspend",
+                identifier_key="iccid",
+                identifier_value=payload.provider_request.iccid,
+                platform_code=payload.context.platform_code,
+                actor_phone=payload.context.actor_phone,
+                note=payload.context.note,
+                payload=provider_response.model_dump(by_alias=True, exclude_none=True),
+            )
+
+        profile = await asyncio.to_thread(_apply_unsuspend)
         return {"provider": provider_response.model_dump(by_alias=True, exclude_none=True), "database": {"profileId": profile.id if profile else None}}
 
     @app.post("/api/v1/esim-access/profiles/revoke")
@@ -2125,15 +2202,19 @@ def register_esim_access_routes(
         _: AdminUser = Depends(_require_admin_actor),
     ) -> dict[str, Any]:
         provider_response = await provider.revoke_profile(payload.provider_request)
-        profile = SupabaseStore(db).apply_profile_action(
-            action="revoke",
-            identifier_key="iccid",
-            identifier_value=payload.provider_request.iccid,
-            platform_code=payload.context.platform_code,
-            actor_phone=payload.context.actor_phone,
-            note=payload.context.note,
-            payload=provider_response.model_dump(by_alias=True, exclude_none=True),
-        )
+
+        def _apply_revoke() -> Any:
+            return SupabaseStore(db).apply_profile_action(
+                action="revoke",
+                identifier_key="iccid",
+                identifier_value=payload.provider_request.iccid,
+                platform_code=payload.context.platform_code,
+                actor_phone=payload.context.actor_phone,
+                note=payload.context.note,
+                payload=provider_response.model_dump(by_alias=True, exclude_none=True),
+            )
+
+        profile = await asyncio.to_thread(_apply_revoke)
         return {"provider": provider_response.model_dump(by_alias=True, exclude_none=True), "database": {"profileId": profile.id if profile else None}}
 
     @app.post("/api/v1/esim-access/balance/query")
@@ -2163,7 +2244,8 @@ def register_esim_access_routes(
         db: Session = Depends(get_db),
         actor: AppUser | AdminUser = Depends(_require_active_actor),
     ) -> Any:
-        _require_topup_profile_access(db, actor, payload.provider_request)
+        # Synchronous ownership/access check — offload off the event loop.
+        await asyncio.to_thread(_require_topup_profile_access, db, actor, payload.provider_request)
         try:
             provider_response = await provider.top_up(payload.provider_request)
         except Exception as exc:
@@ -2175,22 +2257,30 @@ def register_esim_access_routes(
             if payload.provider_request.iccid:
                 query_request = ProfileQueryRequest(iccid=payload.provider_request.iccid)
                 profile_response = await provider.query_profiles(query_request)
-                profiles = store.sync_profiles(
-                    profile_response.model_dump(by_alias=True, exclude_none=True),
-                    platform_code=payload.platform_code,
-                    platform_name=payload.platform_name,
-                    actor_phone=payload.actor_phone,
-                )
-                profiles_synced = len(profiles)
+
+                def _sync_topup_profiles() -> int:
+                    profiles = store.sync_profiles(
+                        profile_response.model_dump(by_alias=True, exclude_none=True),
+                        platform_code=payload.platform_code,
+                        platform_name=payload.platform_name,
+                        actor_phone=payload.actor_phone,
+                    )
+                    return len(profiles)
+
+                profiles_synced = await asyncio.to_thread(_sync_topup_profiles)
             if payload.provider_request.esim_tran_no:
                 usage_request = UsageCheckRequest(esim_tran_no_list=[payload.provider_request.esim_tran_no])
                 async with usage_sync_lock:
                     usage_response = await provider.usage_check(usage_request)
-                    usage_profiles = store.sync_usage_records(
-                        usage_response.model_dump(by_alias=True, exclude_none=True),
-                        actor_phone=payload.actor_phone,
-                    )
-                usage_records_synced = len(usage_profiles)
+
+                    def _sync_topup_usage() -> int:
+                        usage_profiles = store.sync_usage_records(
+                            usage_response.model_dump(by_alias=True, exclude_none=True),
+                            actor_phone=payload.actor_phone,
+                        )
+                        return len(usage_profiles)
+
+                    usage_records_synced = await asyncio.to_thread(_sync_topup_usage)
         return {
             "provider": provider_response.model_dump(by_alias=True, exclude_none=True),
             "database": {
@@ -2236,13 +2326,18 @@ def register_esim_access_routes(
         db.close()
         async with usage_sync_lock:
             provider_response = await provider.usage_check(payload.provider_request)
-            profiles = SupabaseStore(db).sync_usage_records(
-                provider_response.model_dump(by_alias=True, exclude_none=True),
-                actor_phone=payload.actor_phone,
-            )
+
+            def _sync_usage_work() -> int:
+                profiles = SupabaseStore(db).sync_usage_records(
+                    provider_response.model_dump(by_alias=True, exclude_none=True),
+                    actor_phone=payload.actor_phone,
+                )
+                return len(profiles)
+
+            profiles_synced = await asyncio.to_thread(_sync_usage_work)
         return {
             "provider": provider_response.model_dump(by_alias=True, exclude_none=True),
-            "database": {"profilesSynced": len(profiles)},
+            "database": {"profilesSynced": profiles_synced},
         }
 
     @app.post("/api/v1/esim-access/profiles/{profile_id}/recover")
@@ -2260,30 +2355,37 @@ def register_esim_access_routes(
         the moment the provider materializes it (faster than waiting for cron).
         """
         from supabase_store import ESimProfile, OrderItem
-        actor = require_active_subject(db, claims=claims)
-        target_user_id = _resolve_target_user_id(actor=actor, claims=claims, requested_user_id=None)
-        profile = db.scalar(
-            select(ESimProfile).where(
-                ESimProfile.id == profile_id,
-                ESimProfile.user_id == target_user_id,
+
+        # Synchronous lookup + snapshot + session release. This endpoint is polled
+        # every 4s, so keep the blocking DB work off the event loop via a thread.
+        def _recover_prologue() -> tuple[str | None, str | None, str]:
+            actor = require_active_subject(db, claims=claims)
+            target_user_id = _resolve_target_user_id(actor=actor, claims=claims, requested_user_id=None)
+            profile = db.scalar(
+                select(ESimProfile).where(
+                    ESimProfile.id == profile_id,
+                    ESimProfile.user_id == target_user_id,
+                )
             )
-        )
-        if profile is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found")
-        # Snapshot the identifiers we need from the DB row, then release the
-        # connection BEFORE the (potentially slow) provider call. The detail
-        # screen polls this every 4s after Activate — if every poll held a
-        # pool slot across a 1-3 s provider round-trip, the DATABASE_POOL_SIZE=4
-        # pool drains within ~16 s and every other endpoint freezes waiting
-        # for a slot. Followed the same pattern used by _sync_usage_for_esim_tran_nos.
-        profile_iccid = profile.iccid
-        order_no: str | None = None
-        if profile.order_item_id is not None:
-            oi = db.scalar(select(OrderItem).where(OrderItem.id == profile.order_item_id))
-            if oi is not None:
-                order_no = oi.provider_order_no
-        actor_phone_value = str(claims.get("phone") or "")
-        db.close()
+            if profile is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found")
+            # Snapshot the identifiers we need from the DB row, then release the
+            # connection BEFORE the (potentially slow) provider call. The detail
+            # screen polls this every 4s after Activate — if every poll held a
+            # pool slot across a 1-3 s provider round-trip, the DATABASE_POOL_SIZE=4
+            # pool drains within ~16 s and every other endpoint freezes waiting
+            # for a slot. Followed the same pattern used by _sync_usage_for_esim_tran_nos.
+            profile_iccid = profile.iccid
+            order_no: str | None = None
+            if profile.order_item_id is not None:
+                oi = db.scalar(select(OrderItem).where(OrderItem.id == profile.order_item_id))
+                if oi is not None:
+                    order_no = oi.provider_order_no
+            actor_phone_value = str(claims.get("phone") or "")
+            db.close()
+            return profile_iccid, order_no, actor_phone_value
+
+        profile_iccid, order_no, actor_phone_value = await asyncio.to_thread(_recover_prologue)
 
         if profile_iccid:
             resp = await provider.query_profiles(ProfileQueryRequest(iccid=profile_iccid))
@@ -2296,19 +2398,23 @@ def register_esim_access_routes(
             )
 
         # Re-acquire a session for the write-back. SQLAlchemy will check out a
-        # fresh connection from the pool transparently.
-        SupabaseStore(db).sync_profiles(
-            resp.model_dump(by_alias=True, exclude_none=True),
-            platform_code="user-recover",
-            platform_name="User-initiated recovery",
-            actor_phone=actor_phone_value,
-        )
-        db.commit()
-        # Refetch the post-sync profile state via a fresh scalar (the original
-        # profile object is detached after db.close()).
-        profile = db.scalar(
-            select(ESimProfile).where(ESimProfile.id == profile_id)
-        )
+        # fresh connection from the pool transparently. Contiguous synchronous
+        # DB section (sync + commit + refetch) — offload to a worker thread.
+        def _recover_writeback() -> Any:
+            SupabaseStore(db).sync_profiles(
+                resp.model_dump(by_alias=True, exclude_none=True),
+                platform_code="user-recover",
+                platform_name="User-initiated recovery",
+                actor_phone=actor_phone_value,
+            )
+            db.commit()
+            # Refetch the post-sync profile state via a fresh scalar (the original
+            # profile object is detached after db.close()).
+            return db.scalar(
+                select(ESimProfile).where(ESimProfile.id == profile_id)
+            )
+
+        profile = await asyncio.to_thread(_recover_writeback)
         if profile is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile disappeared during recover")
         # Bonus: when the profile already has an esim_tran_no, do a quick
@@ -2323,14 +2429,19 @@ def register_esim_access_routes(
                 usage_resp = await provider.usage_check(
                     UsageCheckRequest(esimTranNoList=[esim_tran_no])
                 )
-                SupabaseStore(db).sync_usage_records(
-                    usage_resp.model_dump(by_alias=True, exclude_none=True),
-                    actor_phone=actor_phone_value,
-                )
-                db.commit()
-                profile = db.scalar(
-                    select(ESimProfile).where(ESimProfile.id == profile_id)
-                )
+
+                # Contiguous synchronous DB write + commit + refetch — offload.
+                def _recover_usage_writeback() -> Any:
+                    SupabaseStore(db).sync_usage_records(
+                        usage_resp.model_dump(by_alias=True, exclude_none=True),
+                        actor_phone=actor_phone_value,
+                    )
+                    db.commit()
+                    return db.scalar(
+                        select(ESimProfile).where(ESimProfile.id == profile_id)
+                    )
+
+                profile = await asyncio.to_thread(_recover_usage_writeback)
             except Exception as exc:  # pragma: no cover - best-effort
                 LOGGER.warning("recover usage_check failed: %s", str(exc)[:200])
         # Return enough state that the frontend can short-circuit its polling
@@ -2373,12 +2484,17 @@ def register_esim_access_routes(
         user_id: str | None = Query(default=None, alias="userId"),
         include_terminal: bool = Query(default=False, alias="includeTerminal"),
     ) -> dict[str, Any]:
-        actor = require_active_subject(db, claims=claims)
-        target_user_id = _resolve_target_user_id(actor=actor, claims=claims, requested_user_id=user_id)
-        store = SupabaseStore(db)
-        existing_rows = store.list_profiles_for_user(user_id=target_user_id)
-        esim_tran_nos = _collect_esim_tran_nos(existing_rows)
-        db.close()
+        # Synchronous lookup + snapshot + session release — offload off the loop.
+        def _collect_target_esim_tran_nos() -> tuple[str, list[str]]:
+            actor = require_active_subject(db, claims=claims)
+            target_user_id = _resolve_target_user_id(actor=actor, claims=claims, requested_user_id=user_id)
+            store = SupabaseStore(db)
+            existing_rows = store.list_profiles_for_user(user_id=target_user_id)
+            esim_tran_nos = _collect_esim_tran_nos(existing_rows)
+            db.close()
+            return target_user_id, esim_tran_nos
+
+        target_user_id, esim_tran_nos = await asyncio.to_thread(_collect_target_esim_tran_nos)
 
         if esim_tran_nos:
             actor_phone = str(claims.get("phone") or "")
@@ -2399,17 +2515,22 @@ def register_esim_access_routes(
                     )
         else:
             sync_summary = _empty_usage_sync_summary()
-        db.close()
-        store = SupabaseStore(db)
-        profile_data = _serialize_profiles_for_user(
-            store=store,
-            user_id=target_user_id,
-            limit=limit,
-            offset=offset,
-            status_filter=status,
-            installed_filter=installed,
-            include_terminal=include_terminal,
-        )
+
+        # Re-open session and serialize profiles — synchronous DB work, offloaded.
+        def _serialize_after_sync() -> dict[str, Any]:
+            db.close()
+            store = SupabaseStore(db)
+            return _serialize_profiles_for_user(
+                store=store,
+                user_id=target_user_id,
+                limit=limit,
+                offset=offset,
+                status_filter=status,
+                installed_filter=installed,
+                include_terminal=include_terminal,
+            )
+
+        profile_data = await asyncio.to_thread(_serialize_after_sync)
         return {
             "success": True,
             "data": {
@@ -2474,13 +2595,15 @@ def register_esim_access_routes(
         "/api/v1/esim-access/orders/my",
         summary="List customer orders for the authenticated subject",
     )
-    async def list_my_orders(
+    def list_my_orders(
         db: Session = Depends(get_db),
         claims: dict[str, Any] = Depends(get_token_claims),
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
         user_id: str | None = Query(default=None, alias="userId"),
     ) -> dict[str, Any]:
+        # Plain `def`: all work below is synchronous SQLAlchemy/serialization, so
+        # FastAPI runs it in a worker thread instead of blocking the event loop.
         actor = require_active_subject(db, claims=claims)
         target_user_id = _resolve_target_user_id(actor=actor, claims=claims, requested_user_id=user_id)
         rows = (
@@ -2570,7 +2693,7 @@ def register_esim_access_routes(
             403: {"description": "Token subject cannot access the requested user scope."},
         },
     )
-    async def list_my_profiles(
+    def list_my_profiles(
         db: Session = Depends(get_db),
         claims: dict[str, Any] = Depends(get_token_claims),
         limit: int = Query(default=100, ge=1, le=500),
@@ -2580,6 +2703,8 @@ def register_esim_access_routes(
         user_id: str | None = Query(default=None, alias="userId"),
         include_terminal: bool = Query(default=False, alias="includeTerminal"),
     ) -> dict[str, Any]:
+        # Plain `def`: all work below is synchronous SQLAlchemy/serialization, so
+        # FastAPI runs it in a worker thread instead of blocking the event loop.
         actor = require_active_subject(db, claims=claims)
         target_user_id = _resolve_target_user_id(actor=actor, claims=claims, requested_user_id=user_id)
         store = SupabaseStore(db)
@@ -2605,11 +2730,13 @@ def register_esim_access_routes(
             403: {"description": "Ownership mismatch or forbidden target user scope."},
         },
     )
-    async def install_my_profile(
+    def install_my_profile(
         payload: MyProfileActionPayload,
         db: Session = Depends(get_db),
         claims: dict[str, Any] = Depends(get_token_claims),
     ) -> dict[str, Any]:
+        # Plain `def`: all work below is synchronous SQLAlchemy/serialization, so
+        # FastAPI runs it in a worker thread instead of blocking the event loop.
         actor = require_active_subject(db, claims=claims)
         target_user_id = _resolve_target_user_id(actor=actor, claims=claims, requested_user_id=payload.user_id)
         identifier_key, identifier_value = _resolve_profile_identifier(payload)
@@ -2640,11 +2767,13 @@ def register_esim_access_routes(
             403: {"description": "Ownership mismatch or forbidden target user scope."},
         },
     )
-    async def activate_my_profile(
+    def activate_my_profile(
         payload: MyProfileActionPayload,
         db: Session = Depends(get_db),
         claims: dict[str, Any] = Depends(get_token_claims),
     ) -> dict[str, Any]:
+        # Plain `def`: all work below is synchronous SQLAlchemy/serialization, so
+        # FastAPI runs it in a worker thread instead of blocking the event loop.
         actor = require_active_subject(db, claims=claims)
         target_user_id = _resolve_target_user_id(actor=actor, claims=claims, requested_user_id=payload.user_id)
         identifier_key, identifier_value = _resolve_profile_identifier(payload)
@@ -2671,7 +2800,7 @@ def register_esim_access_routes(
     @app.post("/api/v1/esim-access/webhook/events")
     @app.post("/api/v1/esim-access/webhooks/events/{path_secret}")
     @app.post("/api/v1/esim-access/webhook/events/{path_secret}")
-    async def receive_webhook(
+    def receive_webhook(
         event: WebhookEvent,
         db: Session = Depends(get_db),
         x_esim_access_webhook_secret: str | None = Header(
@@ -2682,6 +2811,8 @@ def register_esim_access_routes(
         query_secret: str | None = Query(default=None, alias="secret"),
         path_secret: str | None = None,
     ) -> dict[str, Any]:
+        # Plain `def`: all work below is synchronous SQLAlchemy/serialization, so
+        # FastAPI runs it in a worker thread instead of blocking the event loop.
         _require_valid_esim_webhook_secret(
             header_secret=x_esim_access_webhook_secret,
             alternate_header_secret=x_webhook_secret,

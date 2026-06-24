@@ -88,6 +88,31 @@ class AuthRoutingCorsTest(unittest.TestCase):
         self.assertIn("authorization", allow_headers)
         self.assertIn("content-type", allow_headers)
 
+    def test_auth_preflight_allows_production_web_origin(self) -> None:
+        response = self.client.options(
+            "/api/v1/auth/user/otp/request",
+            headers={
+                "Origin": "https://tulipbookings.com",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "authorization,content-type",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers.get("access-control-allow-origin"), "https://tulipbookings.com")
+        self.assertEqual(response.headers.get("access-control-allow-credentials"), "true")
+
+    def test_auth_preflight_rejects_unknown_origin(self) -> None:
+        response = self.client.options(
+            "/api/v1/auth/user/otp/request",
+            headers={
+                "Origin": "https://evil.example.com",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "authorization,content-type",
+            },
+        )
+        # An arbitrary origin must never be reflected back as allowed.
+        self.assertNotEqual(response.headers.get("access-control-allow-origin"), "https://evil.example.com")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -39,6 +39,7 @@ from esim_access_api import (
     ESimAccessAPIError,
     ESimAccessHTTPError,
     register_esim_access_routes,
+    stop_periodic_usage_sync_worker,
 )
 from fib_payment_api import (
     FIBPaymentAPI,
@@ -53,13 +54,15 @@ from users import register_user_routes
 from wings_api import register_wings_routes
 
 DEFAULT_CORS_ALLOWED_ORIGINS = [
+    # Production web origins.
+    "https://tulipbookings.com",
+    "https://www.tulipbookings.com",
+    "https://dlerazeezcore.github.io",
+    # Native shell / dev origins.
     "capacitor://localhost",
     "ionic://localhost",
     "http://localhost",
     "https://localhost",
-    "https://www.figma.com",
-    "https://figma.com",
-    "https://makeproxy-m.figma.site",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
     "http://localhost:5173",
@@ -67,7 +70,9 @@ DEFAULT_CORS_ALLOWED_ORIGINS = [
 ]
 CORS_ALLOWED_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 CORS_ALLOWED_HEADERS = ["*"]
-DEFAULT_CORS_ALLOW_ORIGIN_REGEX = r".*"
+# No arbitrary-origin reflection by default; only explicit allow_origins are
+# echoed back. An operator can still opt into a regex via CORS_ALLOW_ORIGIN_REGEX.
+DEFAULT_CORS_ALLOW_ORIGIN_REGEX: str | None = None
 # Connection-tuning constants stay here; URLs/endpoints live in config.py (env-overridable).
 FIB_PAYMENT_TIMEOUT_SECONDS = 30.0
 FIB_PAYMENT_RATE_LIMIT_PER_SECOND = 8.0
@@ -226,6 +231,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 rate_limit_per_second=TWILIO_VERIFY_RATE_LIMIT_PER_SECOND,
             )
         yield
+        # Stop the background eSIM usage-sync worker before tearing down the
+        # provider/DB it depends on (replaces esim_access_api's deprecated
+        # @app.on_event("shutdown") handler).
+        await stop_periodic_usage_sync_worker(app)
         await app.state.esim_access_api.close()
         if app.state.fib_payment_api is not None:
             await app.state.fib_payment_api.close()
@@ -478,7 +487,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     register_push_notification_routes(app, get_push_provider, get_db)
     register_admin_routes(app, get_db)
     register_app_meta_routes(app, get_db)
-    register_wings_routes(app)
+    register_wings_routes(app, get_db)
 
     return app
 

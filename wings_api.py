@@ -1,12 +1,20 @@
 from __future__ import annotations
 
-from typing import Any
+import asyncio
+import logging
+from typing import Any, Callable
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
+from sqlalchemy.orm import Session
+
 from pydantic import BaseModel, Field
 
+from auth import get_token_claims, require_active_subject
 from config import get_settings
+from supabase_store import AdminUser, AppUser
+
+LOGGER = logging.getLogger("uvicorn.error")
 
 
 def _wings_search_url() -> str:
@@ -147,14 +155,27 @@ async def _post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
     except Exception:
         body = {"raw_text": resp.text}
     if resp.status_code >= 400:
+        LOGGER.error(
+            "WINGS upstream availability request failed: status=%s body=%s",
+            resp.status_code,
+            body,
+        )
         raise HTTPException(
-            status_code=resp.status_code,
-            detail={"provider": "wings", "status_code": resp.status_code, "response": body},
+            status_code=502,
+            detail={"provider": "wings", "error": "Upstream availability request failed"},
         )
     return body
 
 
-def register_wings_routes(app: FastAPI) -> None:
+def register_wings_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
+    def _require_active_actor(
+        claims: dict[str, Any] = Depends(get_token_claims),
+        db: Session = Depends(get_db),
+    ) -> AppUser | AdminUser:
+        row = require_active_subject(db, claims=claims)
+        assert isinstance(row, (AppUser, AdminUser))
+        return row
+
     @app.get("/api/v1/wings/health")
     async def wings_health() -> dict[str, Any]:
         settings = get_settings()
@@ -168,12 +189,17 @@ def register_wings_routes(app: FastAPI) -> None:
         }
 
     @app.post("/api/v1/wings/availability/raw")
-    async def wings_availability_raw(req: WingsAvailabilityRequest) -> dict[str, Any]:
+    async def wings_availability_raw(
+        req: WingsAvailabilityRequest,
+        _: AppUser | AdminUser = Depends(_require_active_actor),
+    ) -> dict[str, Any]:
         search_url = _wings_search_url()
         payload_economy = _build_search_payload(req, ["Economy"])
         payload_business = _build_search_payload(req, ["Business"])
-        resp_economy = await _post_json(search_url, payload_economy)
-        resp_business = await _post_json(search_url, payload_business)
+        resp_economy, resp_business = await asyncio.gather(
+            _post_json(search_url, payload_economy),
+            _post_json(search_url, payload_business),
+        )
         provider_response = _only_basic_smart_biz(resp_economy, resp_business)
 
         return {

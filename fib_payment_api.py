@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import uuid
 from time import time
 from typing import Any, Callable
@@ -17,6 +18,9 @@ from sqlalchemy.orm import Session
 
 from auth import get_token_claims, require_active_subject
 from supabase_store import AdminUser, AppUser, PaymentAttempt, SupabaseStore, parse_provider_datetime
+
+
+logger = logging.getLogger(__name__)
 
 
 class FIBPaymentError(Exception):
@@ -761,25 +765,31 @@ def _map_fib_exception(exc: Exception) -> JSONResponse:
         else:
             error_code = exc.error_code or "FIB_PROVIDER_REJECTED"
             message = "Payment request was rejected by provider."
+        # Log provider-supplied detail server-side only; never leak it to clients.
+        logger.warning(
+            "FIB provider error (status=%s, errorCode=%s): providerMessage=%r providerPayload=%r",
+            status_code,
+            error_code,
+            exc.error_message,
+            exc.payload,
+        )
         return _error_response(
             status_code=status_code,
             error_code=error_code,
             message=message,
-            provider_message=exc.error_message,
-            details={"providerPayload": exc.payload or {}},
         )
     if isinstance(exc, FIBPaymentHTTPError):
+        logger.warning("FIB upstream HTTP error: %s", exc)
         return _error_response(
             status_code=502,
             error_code="FIB_UPSTREAM_UNAVAILABLE",
             message="Unable to reach payment provider.",
-            provider_message=str(exc),
         )
+    logger.exception("Unexpected FIB payment error")
     return _error_response(
         status_code=500,
         error_code="INTERNAL_ERROR",
         message="Payment request failed unexpectedly.",
-        provider_message=str(exc),
     )
 
 
@@ -911,10 +921,17 @@ async def _create_checkout_attempt(
     metadata = dict(payload.metadata or {})
     transaction_id = _extract_transaction_id(metadata)
 
-    existing_success = store.get_payment_attempt_by_transaction_id(transaction_id)
+    def _read_existing_attempt() -> PaymentAttempt | None:
+        return store.get_payment_attempt_by_transaction_id(transaction_id)
+
+    existing_success = await asyncio.to_thread(_read_existing_attempt)
     if existing_success is not None:
         return existing_success
-    existing_context = _resolve_checkout_context(store=store, transaction_id=transaction_id)
+
+    def _read_existing_context() -> dict[str, Any] | None:
+        return _resolve_checkout_context(store=store, transaction_id=transaction_id)
+
+    existing_context = await asyncio.to_thread(_read_existing_context)
     if existing_context is not None:
         if not _actor_matches_payment_context(
             owner_user_id=owner_user_id,
@@ -981,39 +998,43 @@ async def _create_checkout_attempt(
     if linked_admin_user_id:
         metadata["linkedAdminUserId"] = linked_admin_user_id
 
-    checkout_context = _build_checkout_context_payload(
-        transaction_id=transaction_id,
-        metadata=metadata,
-        provider_payload_dict=provider_payload_dict,
-        provider_response=provider_response,
-        provider_response_dict=provider_response_dict,
-        amount_minor=amount_minor,
-        currency_code=currency_code,
-        user_id=linked_user_id,
-        admin_user_id=linked_admin_user_id,
-        external_user_ref=external_user_ref,
-    )
-    marker_tx = _checkout_event_id_by_transaction(transaction_id)
-    marker_payment = _checkout_event_id_by_payment(provider_response.payment_id)
-    if store.get_payment_provider_event(provider="fib", provider_event_id=marker_tx) is None:
-        store.create_payment_provider_event(
-            provider="fib",
-            event_type="fib.checkout_created",
-            provider_event_id=marker_tx,
-            signature_valid=None,
-            raw_payload=checkout_context,
-            processed=True,
+    def _persist_checkout_context() -> dict[str, Any]:
+        checkout_context = _build_checkout_context_payload(
+            transaction_id=transaction_id,
+            metadata=metadata,
+            provider_payload_dict=provider_payload_dict,
+            provider_response=provider_response,
+            provider_response_dict=provider_response_dict,
+            amount_minor=amount_minor,
+            currency_code=currency_code,
+            user_id=linked_user_id,
+            admin_user_id=linked_admin_user_id,
+            external_user_ref=external_user_ref,
         )
-    if store.get_payment_provider_event(provider="fib", provider_event_id=marker_payment) is None:
-        store.create_payment_provider_event(
-            provider="fib",
-            event_type="fib.checkout_created",
-            provider_event_id=marker_payment,
-            signature_valid=None,
-            raw_payload=checkout_context,
-            processed=True,
-        )
-    db.commit()
+        marker_tx = _checkout_event_id_by_transaction(transaction_id)
+        marker_payment = _checkout_event_id_by_payment(provider_response.payment_id)
+        if store.get_payment_provider_event(provider="fib", provider_event_id=marker_tx) is None:
+            store.create_payment_provider_event(
+                provider="fib",
+                event_type="fib.checkout_created",
+                provider_event_id=marker_tx,
+                signature_valid=None,
+                raw_payload=checkout_context,
+                processed=True,
+            )
+        if store.get_payment_provider_event(provider="fib", provider_event_id=marker_payment) is None:
+            store.create_payment_provider_event(
+                provider="fib",
+                event_type="fib.checkout_created",
+                provider_event_id=marker_payment,
+                signature_valid=None,
+                raw_payload=checkout_context,
+                processed=True,
+            )
+        db.commit()
+        return checkout_context
+
+    checkout_context = await asyncio.to_thread(_persist_checkout_context)
     return PaymentAttempt(
         id=checkout_context["paymentAttemptId"],
         transaction_id=transaction_id,
@@ -1111,40 +1132,47 @@ def register_fib_payment_routes(
     ) -> Any:
         owner_user_id, owner_admin_user_id, _ = actor
         store = SupabaseStore(db)
-        row = store.get_payment_attempt_by_any_reference(payment_id)
-        if row is None and not refresh:
-            checkout_context = _resolve_checkout_context(store=store, provider_payment_id=payment_id)
-            if checkout_context is not None:
+
+        def _read_initial() -> tuple[Any, PaymentAttempt | None]:
+            row = store.get_payment_attempt_by_any_reference(payment_id)
+            if row is None and not refresh:
+                checkout_context = _resolve_checkout_context(store=store, provider_payment_id=payment_id)
+                if checkout_context is not None:
+                    if not _actor_matches_payment_context(
+                        owner_user_id=owner_user_id,
+                        owner_admin_user_id=owner_admin_user_id,
+                        context=checkout_context,
+                    ):
+                        return _error_response(
+                            status_code=403,
+                            error_code="PAYMENT_FORBIDDEN",
+                            message="You do not have access to this payment.",
+                        ), None
+                    return _to_checkout_response_from_context(checkout_context), None
+            if row is None and not refresh:
+                return _error_response(
+                    status_code=404,
+                    error_code="FIB_PAYMENT_NOT_FOUND",
+                    message="Payment was not found.",
+                    details={"paymentId": payment_id},
+                ), None
+            if row is not None and not refresh:
                 if not _actor_matches_payment_context(
                     owner_user_id=owner_user_id,
                     owner_admin_user_id=owner_admin_user_id,
-                    context=checkout_context,
+                    row=row,
                 ):
                     return _error_response(
                         status_code=403,
                         error_code="PAYMENT_FORBIDDEN",
                         message="You do not have access to this payment.",
-                    )
-                return _to_checkout_response_from_context(checkout_context)
-        if row is None and not refresh:
-            return _error_response(
-                status_code=404,
-                error_code="FIB_PAYMENT_NOT_FOUND",
-                message="Payment was not found.",
-                details={"paymentId": payment_id},
-            )
-        if row is not None and not refresh:
-            if not _actor_matches_payment_context(
-                owner_user_id=owner_user_id,
-                owner_admin_user_id=owner_admin_user_id,
-                row=row,
-            ):
-                return _error_response(
-                    status_code=403,
-                    error_code="PAYMENT_FORBIDDEN",
-                    message="You do not have access to this payment.",
-                )
-            return _to_checkout_response(row)
+                    ), None
+                return _to_checkout_response(row), None
+            return None, row
+
+        early_response, row = await asyncio.to_thread(_read_initial)
+        if early_response is not None:
+            return early_response
 
         provider_payment_id = row.provider_payment_id if row is not None else payment_id
         if not provider_payment_id:
@@ -1157,14 +1185,19 @@ def register_fib_payment_routes(
             )
         try:
             provider_status = await provider.get_payment_status(provider_payment_id)
-            resolved_row = _upsert_successful_attempt_from_provider_status(
-                db=db,
-                store=store,
-                provider_payment_id=provider_payment_id,
-                provider_status=provider_status,
-                transaction_id_hint=row.transaction_id if row is not None else None,
-            )
-            db.commit()
+
+            def _persist_and_resolve() -> PaymentAttempt | None:
+                resolved_row = _upsert_successful_attempt_from_provider_status(
+                    db=db,
+                    store=store,
+                    provider_payment_id=provider_payment_id,
+                    provider_status=provider_status,
+                    transaction_id_hint=row.transaction_id if row is not None else None,
+                )
+                db.commit()
+                return resolved_row
+
+            resolved_row = await asyncio.to_thread(_persist_and_resolve)
             if resolved_row is not None:
                 if not _actor_matches_payment_context(
                     owner_user_id=owner_user_id,
@@ -1176,9 +1209,17 @@ def register_fib_payment_routes(
                         error_code="PAYMENT_FORBIDDEN",
                         message="You do not have access to this payment.",
                     )
-                db.refresh(resolved_row)
+
+                def _refresh_resolved() -> None:
+                    db.refresh(resolved_row)
+
+                await asyncio.to_thread(_refresh_resolved)
                 return _to_checkout_response(resolved_row)
-            checkout_context = _resolve_checkout_context(store=store, provider_payment_id=provider_payment_id) or {}
+
+            def _read_checkout_context() -> dict[str, Any]:
+                return _resolve_checkout_context(store=store, provider_payment_id=provider_payment_id) or {}
+
+            checkout_context = await asyncio.to_thread(_read_checkout_context)
             if not _actor_matches_payment_context(
                 owner_user_id=owner_user_id,
                 owner_admin_user_id=owner_admin_user_id,
@@ -1222,16 +1263,21 @@ def register_fib_payment_routes(
             )
 
         store = SupabaseStore(db)
-        row: PaymentAttempt | None = None
-        if payload.payment_id:
-            row = store.get_payment_attempt_by_provider_payment_id(
-                provider="fib",
-                provider_payment_id=payload.payment_id,
-            )
-            if row is None:
-                row = store.get_payment_attempt_by_any_reference(payload.payment_id)
-        if row is None and payload.transaction_id:
-            row = store.get_payment_attempt_by_transaction_id(payload.transaction_id)
+
+        def _read_confirm_target() -> PaymentAttempt | None:
+            row: PaymentAttempt | None = None
+            if payload.payment_id:
+                row = store.get_payment_attempt_by_provider_payment_id(
+                    provider="fib",
+                    provider_payment_id=payload.payment_id,
+                )
+                if row is None:
+                    row = store.get_payment_attempt_by_any_reference(payload.payment_id)
+            if row is None and payload.transaction_id:
+                row = store.get_payment_attempt_by_transaction_id(payload.transaction_id)
+            return row
+
+        row: PaymentAttempt | None = await asyncio.to_thread(_read_confirm_target)
         if row is not None and not _actor_matches_payment_context(
             owner_user_id=owner_user_id,
             owner_admin_user_id=owner_admin_user_id,
@@ -1245,7 +1291,10 @@ def register_fib_payment_routes(
 
         provider_payment_id = payload.payment_id or (row.provider_payment_id if row is not None else None)
         if provider_payment_id is None and payload.transaction_id:
-            checkout_context = _resolve_checkout_context(store=store, transaction_id=payload.transaction_id)
+            def _read_confirm_context() -> dict[str, Any] | None:
+                return _resolve_checkout_context(store=store, transaction_id=payload.transaction_id)
+
+            checkout_context = await asyncio.to_thread(_read_confirm_context)
             provider_payment_id = _metadata_string(checkout_context or {}, ("providerPaymentId", "paymentId"))
         if not provider_payment_id:
             return _error_response(
@@ -1256,14 +1305,19 @@ def register_fib_payment_routes(
 
         try:
             provider_status = await provider.get_payment_status(provider_payment_id)
-            resolved_row = _upsert_successful_attempt_from_provider_status(
-                db=db,
-                store=store,
-                provider_payment_id=provider_payment_id,
-                provider_status=provider_status,
-                transaction_id_hint=payload.transaction_id or (row.transaction_id if row is not None else None),
-            )
-            db.commit()
+
+            def _persist_and_resolve() -> PaymentAttempt | None:
+                resolved_row = _upsert_successful_attempt_from_provider_status(
+                    db=db,
+                    store=store,
+                    provider_payment_id=provider_payment_id,
+                    provider_status=provider_status,
+                    transaction_id_hint=payload.transaction_id or (row.transaction_id if row is not None else None),
+                )
+                db.commit()
+                return resolved_row
+
+            resolved_row = await asyncio.to_thread(_persist_and_resolve)
             if resolved_row is not None:
                 if not _actor_matches_payment_context(
                     owner_user_id=owner_user_id,
@@ -1275,13 +1329,21 @@ def register_fib_payment_routes(
                         error_code="PAYMENT_FORBIDDEN",
                         message="You do not have access to this payment.",
                     )
-                db.refresh(resolved_row)
+
+                def _refresh_resolved() -> None:
+                    db.refresh(resolved_row)
+
+                await asyncio.to_thread(_refresh_resolved)
                 return _to_checkout_response(resolved_row)
-            checkout_context = _resolve_checkout_context(
-                store=store,
-                transaction_id=payload.transaction_id,
-                provider_payment_id=provider_payment_id,
-            ) or {}
+
+            def _read_confirm_fallback_context() -> dict[str, Any]:
+                return _resolve_checkout_context(
+                    store=store,
+                    transaction_id=payload.transaction_id,
+                    provider_payment_id=provider_payment_id,
+                ) or {}
+
+            checkout_context = await asyncio.to_thread(_read_confirm_fallback_context)
             if not _actor_matches_payment_context(
                 owner_user_id=owner_user_id,
                 owner_admin_user_id=owner_admin_user_id,
@@ -1358,23 +1420,34 @@ def register_fib_payment_routes(
         event_type = f"fib.{(provider_status or 'unknown').strip().lower()}"
 
         store = SupabaseStore(db)
-        event = None
-        if provider_event_id:
-            existing_event = store.get_payment_provider_event(provider="fib", provider_event_id=provider_event_id)
-            if existing_event is not None and existing_event.processed:
-                return JSONResponse(
-                    status_code=202,
-                    content={
-                        "success": True,
-                        "status": "accepted",
-                        "duplicateEvent": True,
-                        "eventId": existing_event.id,
-                        "paymentAttemptId": existing_event.payment_attempt_id,
-                    },
-                )
-            if existing_event is not None:
-                event = existing_event
-            else:
+
+        def _process_webhook() -> JSONResponse:
+            event = None
+            if provider_event_id:
+                existing_event = store.get_payment_provider_event(provider="fib", provider_event_id=provider_event_id)
+                if existing_event is not None and existing_event.processed:
+                    return JSONResponse(
+                        status_code=202,
+                        content={
+                            "success": True,
+                            "status": "accepted",
+                            "duplicateEvent": True,
+                            "eventId": existing_event.id,
+                            "paymentAttemptId": existing_event.payment_attempt_id,
+                        },
+                    )
+                if existing_event is not None:
+                    event = existing_event
+                else:
+                    event = store.create_payment_provider_event(
+                        provider="fib",
+                        event_type=event_type,
+                        provider_event_id=provider_event_id,
+                        signature_valid=signature_valid,
+                        raw_payload=payload,
+                        processed=False,
+                    )
+            if event is None:
                 event = store.create_payment_provider_event(
                     provider="fib",
                     event_type=event_type,
@@ -1383,119 +1456,112 @@ def register_fib_payment_routes(
                     raw_payload=payload,
                     processed=False,
                 )
-        if event is None:
-            event = store.create_payment_provider_event(
-                provider="fib",
-                event_type=event_type,
-                provider_event_id=provider_event_id,
-                signature_valid=signature_valid,
-                raw_payload=payload,
-                processed=False,
-            )
 
-        row: PaymentAttempt | None = None
-        if provider_payment_id:
-            row = store.get_payment_attempt_by_provider_payment_id(
-                provider="fib",
-                provider_payment_id=provider_payment_id,
-                for_update=True,
-            )
-        if row is None and webhook_transaction_id:
-            row = store.get_payment_attempt_by_transaction_id(webhook_transaction_id, for_update=True)
-
-        transition_applied = False
-        if row is not None and provider_payment_id:
-            store.update_payment_attempt(
-                row,
-                provider="fib",
-                provider_payment_id=provider_payment_id,
-                provider_reference=provider_event_id,
-                provider_response={
-                    "providerStatus": provider_status,
-                    "webhookPayload": payload,
-                    "providerRefs": {
-                        "providerPaymentId": provider_payment_id,
-                        "providerEventId": provider_event_id,
-                    },
-                },
-            )
-            if normalized_status in PERSISTED_PAYMENT_STATUSES:
-                transition_applied = store.apply_payment_status_transition(
-                    row,
-                    new_status=normalized_status,
-                    paid_at=paid_at,
-                )
-                processing_error = None
-            else:
-                transition_applied = False
-                processing_error = "Ignored non-success payment status for success-only payment_attempts policy."
-            store.mark_payment_provider_event_processed(
-                event,
-                processed=True,
-                payment_attempt_id=row.id,
-                processing_error=processing_error,
-            )
-        elif provider_payment_id:
-            resolved_row = _upsert_successful_attempt_from_provider_status(
-                db=db,
-                store=store,
-                provider_payment_id=provider_payment_id,
-                provider_status=payload,
-                transaction_id_hint=webhook_transaction_id,
-            )
-            if resolved_row is not None:
-                row = resolved_row
-                transition_applied = True
-                store.mark_payment_provider_event_processed(
-                    event,
-                    processed=True,
-                    payment_attempt_id=resolved_row.id,
-                )
-            else:
-                store.mark_payment_provider_event_processed(
-                    event,
-                    processed=True,
-                    processing_error=(
-                        "Payment attempt not persisted because status is non-successful "
-                        "or owner context could not be resolved."
-                    ),
-                )
-        else:
-            store.mark_payment_provider_event_processed(
-                event,
-                processed=False,
-                processing_error="Webhook payload is missing provider payment identifier.",
-            )
-
-        try:
-            db.commit()
-        except IntegrityError:
-            db.rollback()
+            row: PaymentAttempt | None = None
             if provider_payment_id:
                 row = store.get_payment_attempt_by_provider_payment_id(
                     provider="fib",
                     provider_payment_id=provider_payment_id,
+                    for_update=True,
                 )
-            if row is None:
-                return _error_response(
-                    status_code=409,
-                    error_code="PAYMENT_UPDATE_CONFLICT",
-                    message="Payment update conflicted with concurrent operation.",
+            if row is None and webhook_transaction_id:
+                row = store.get_payment_attempt_by_transaction_id(webhook_transaction_id, for_update=True)
+
+            transition_applied = False
+            if row is not None and provider_payment_id:
+                store.update_payment_attempt(
+                    row,
+                    provider="fib",
+                    provider_payment_id=provider_payment_id,
+                    provider_reference=provider_event_id,
+                    provider_response={
+                        "providerStatus": provider_status,
+                        "webhookPayload": payload,
+                        "providerRefs": {
+                            "providerPaymentId": provider_payment_id,
+                            "providerEventId": provider_event_id,
+                        },
+                    },
+                )
+                if normalized_status in PERSISTED_PAYMENT_STATUSES:
+                    transition_applied = store.apply_payment_status_transition(
+                        row,
+                        new_status=normalized_status,
+                        paid_at=paid_at,
+                    )
+                    processing_error = None
+                else:
+                    transition_applied = False
+                    processing_error = "Ignored non-success payment status for success-only payment_attempts policy."
+                store.mark_payment_provider_event_processed(
+                    event,
+                    processed=True,
+                    payment_attempt_id=row.id,
+                    processing_error=processing_error,
+                )
+            elif provider_payment_id:
+                resolved_row = _upsert_successful_attempt_from_provider_status(
+                    db=db,
+                    store=store,
+                    provider_payment_id=provider_payment_id,
+                    provider_status=payload,
+                    transaction_id_hint=webhook_transaction_id,
+                )
+                if resolved_row is not None:
+                    row = resolved_row
+                    transition_applied = True
+                    store.mark_payment_provider_event_processed(
+                        event,
+                        processed=True,
+                        payment_attempt_id=resolved_row.id,
+                    )
+                else:
+                    store.mark_payment_provider_event_processed(
+                        event,
+                        processed=True,
+                        processing_error=(
+                            "Payment attempt not persisted because status is non-successful "
+                            "or owner context could not be resolved."
+                        ),
+                    )
+            else:
+                store.mark_payment_provider_event_processed(
+                    event,
+                    processed=False,
+                    processing_error="Webhook payload is missing provider payment identifier.",
                 )
 
-        return JSONResponse(
-            status_code=202,
-            content={
-                "success": True,
-                "status": "accepted",
-                "eventId": event.id if event is not None else None,
-                "paymentAttemptId": row.id if row is not None else None,
-                "paymentId": row.provider_payment_id if row else provider_payment_id,
-                "transactionId": row.transaction_id if row else None,
-                "normalizedStatus": row.status if row else normalized_status,
-                "transitionApplied": transition_applied,
-            },
-        )
+            try:
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+                if provider_payment_id:
+                    row = store.get_payment_attempt_by_provider_payment_id(
+                        provider="fib",
+                        provider_payment_id=provider_payment_id,
+                    )
+                if row is None:
+                    return _error_response(
+                        status_code=409,
+                        error_code="PAYMENT_UPDATE_CONFLICT",
+                        message="Payment update conflicted with concurrent operation.",
+                    )
+
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "success": True,
+                    "status": "accepted",
+                    "eventId": event.id if event is not None else None,
+                    "paymentAttemptId": row.id if row is not None else None,
+                    "paymentId": row.provider_payment_id if row else provider_payment_id,
+                    "transactionId": row.transaction_id if row else None,
+                    "normalizedStatus": row.status if row else normalized_status,
+                    "transitionApplied": transition_applied,
+                },
+            )
+
+        return await asyncio.to_thread(_process_webhook)
 
     # Backward-compatible aliases for already deployed frontend/mobile builds.
     @app.post("/api/v1/fib-payments/payments", status_code=201)
