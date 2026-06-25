@@ -651,6 +651,35 @@ def build_currency_meta(code: str, *, rate: float, custom_fields: dict[str, Any]
     }
 
 
+_RULE_SCOPE_SPECIFICITY = {"package": 4, "country": 3, "provider": 2, "global": 1}
+
+
+def _best_scoped_rule(rules: list, *, package_code: str | None, country_code: str | None, provider_code: str | None):
+    """In-memory equivalent of get_best_pricing_rule's resolution (package >
+    country > provider > global, then priority/created_at/id), used to quote a
+    whole catalog without an N+1 DB query per package."""
+    def matches(r) -> bool:
+        scope = r.rule_scope
+        if scope == "global":
+            return True
+        if scope == "package":
+            return bool(package_code) and r.package_code == package_code
+        if scope == "country":
+            return bool(country_code) and r.country_code == country_code
+        if scope == "provider":
+            return bool(provider_code) and r.provider_code == provider_code
+        return False
+
+    candidates = [r for r in rules if matches(r)]
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda r: (_RULE_SCOPE_SPECIFICITY.get(r.rule_scope, 0), r.priority, r.created_at, r.id),
+        reverse=True,
+    )
+    return candidates[0]
+
+
 class ExchangeRate(TimeMixin, Base):
     __tablename__ = "exchange_rates"
     __table_args__ = (
@@ -3820,6 +3849,82 @@ class SupabaseStore:
             row = newest_by_code[code]
             currencies.append(build_currency_meta(code, rate=float(row.rate), custom_fields=row.custom_fields or {}))
         return currencies
+
+    def quote_esim_sale_prices(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        currency_code: str = "IQD",
+        provider_code: str = "esim_access",
+        at_time: datetime | None = None,
+    ) -> dict[str, int]:
+        """Batch-quote the sale price (minor units of `currency_code`) for catalog
+        packages so the DISPLAYED price matches what checkout will charge. Applies
+        the same engine as save_managed_order: provider cost → currency, best
+        pricing rule (or the configured fallback markup), then best discount,
+        rounded (IQD → nearest 250). Active rules are loaded once (no N+1).
+
+        `items`: [{"packageCode", "countryCode"|None, "providerPriceMinor"}].
+        """
+        out: dict[str, int] = {}
+        if not items:
+            return out
+        now = at_time or utcnow()
+        rate_row = self.get_active_exchange_rate(base_currency="USD", quote_currency=currency_code, at_time=now)
+        rate = rate_row.rate if rate_row is not None else 1.0
+        markup_fallback = self._markup_percent_from_exchange(rate_row)
+        pricing_rules = list(
+            self.session.scalars(
+                select(PricingRule).where(
+                    PricingRule.service_type == "esim",
+                    PricingRule.active.is_(True),
+                    or_(PricingRule.starts_at.is_(None), PricingRule.starts_at <= now),
+                    or_(PricingRule.ends_at.is_(None), PricingRule.ends_at > now),
+                )
+            ).all()
+        )
+        discount_rules = list(
+            self.session.scalars(
+                select(DiscountRule).where(
+                    DiscountRule.service_type == "esim",
+                    DiscountRule.active.is_(True),
+                    or_(DiscountRule.starts_at.is_(None), DiscountRule.starts_at <= now),
+                    or_(DiscountRule.ends_at.is_(None), DiscountRule.ends_at > now),
+                )
+            ).all()
+        )
+        is_iqd = (currency_code or "").upper() == "IQD"
+        for item in items:
+            pkg = item.get("packageCode")
+            if not pkg:
+                continue
+            provider_minor = parse_provider_int(item.get("providerPriceMinor")) or 0
+            country = (item.get("countryCode") or None)
+            converted = int(round((provider_minor / ESIM_ACCESS_PRICE_UNIT) * rate))
+            rule = _best_scoped_rule(pricing_rules, package_code=pkg, country_code=country, provider_code=provider_code)
+            if rule is not None:
+                markup_minor = self._calculate_adjustment_minor(
+                    adjustment_type=rule.adjustment_type, adjustment_value=rule.adjustment_value, basis_minor=converted
+                )
+            elif markup_fallback > 0:
+                markup_minor = self._calculate_adjustment_minor(
+                    adjustment_type="percent", adjustment_value=markup_fallback, basis_minor=converted
+                )
+            else:
+                markup_minor = 0
+            total_before_discount = converted + markup_minor
+            drule = _best_scoped_rule(discount_rules, package_code=pkg, country_code=country, provider_code=provider_code)
+            discount_minor = 0
+            if drule is not None:
+                basis = total_before_discount if drule.applies_to in {"item_total", "total_price", "booking_total"} else converted
+                discount_minor = self._calculate_adjustment_minor(
+                    adjustment_type=drule.discount_type, adjustment_value=drule.discount_value, basis_minor=basis
+                )
+            sale = max(total_before_discount - discount_minor, 0)
+            if is_iqd:
+                sale = round_to_step(sale, IQD_ROUNDING_STEP)
+            out[pkg] = sale
+        return out
 
     def list_profiles_for_user(
         self,

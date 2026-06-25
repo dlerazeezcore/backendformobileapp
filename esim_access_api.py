@@ -354,6 +354,38 @@ def _augment_package_list_response(
     return payload
 
 
+def _single_country_code(item: dict[str, Any]) -> str | None:
+    """A package's country for country-scoped pricing rules — only when it covers
+    exactly one country (regional/multi-country bundles → None)."""
+    parts = [p.strip().upper() for p in str(item.get("location") or "").split(",") if p.strip()]
+    return parts[0] if len(parts) == 1 else None
+
+
+def _apply_sale_prices(db: Session, payload: dict[str, Any]) -> None:
+    """Attach `salePriceMinor` (IQD) to each catalog package via the same pricing
+    engine checkout uses, so the displayed price reflects per-country/per-bundle
+    rules. Mutates the payload in place. Runs in a worker thread (sync DB)."""
+    obj = payload.get("obj")
+    if not isinstance(obj, dict):
+        return
+    package_list = obj.get("packageList")
+    if not isinstance(package_list, list):
+        return
+    items = [
+        {"packageCode": it.get("packageCode"), "countryCode": _single_country_code(it), "providerPriceMinor": it.get("price")}
+        for it in package_list
+        if isinstance(it, dict) and it.get("packageCode")
+    ]
+    if not items:
+        return
+    quote = SupabaseStore(db).quote_esim_sale_prices(items)
+    for it in package_list:
+        if isinstance(it, dict):
+            sale = quote.get(it.get("packageCode"))
+            if sale is not None:
+                it["salePriceMinor"] = sale
+
+
 def _augment_profile_usage_units(provider_payload: dict[str, Any]) -> dict[str, Any]:
     payload = dict(provider_payload)
     obj = payload.get("obj")
@@ -1791,6 +1823,7 @@ def register_esim_access_routes(
     async def query_packages(
         payload: PackageQueryRequest,
         provider: ESimAccessAPI = Depends(get_provider),
+        db: Session = Depends(get_db),
     ) -> dict[str, Any]:
         provider_response = await provider.get_packages(payload)
         raw_payload = provider_response.model_dump(by_alias=True, exclude_none=True)
@@ -1799,10 +1832,16 @@ def register_esim_access_routes(
         # otherwise we'd hide top-up SKUs that legitimately have validityDays
         # = 1 unlimited shape on the provider side.
         is_topup_query = (payload.type or "").strip().upper() == "TOPUP" or bool(payload.iccid)
-        return _augment_package_list_response(
-            raw_payload,
-            drop_daily_unlimited=not is_topup_query,
-        )
+        augmented = _augment_package_list_response(raw_payload, drop_daily_unlimited=not is_topup_query)
+        # Attach the rule-applied IQD sale price per package so the displayed
+        # catalog price matches checkout (per-country / per-bundle pricing rules).
+        # Offloaded to a thread (sync DB) and best-effort — a quote failure must
+        # never break the catalog.
+        try:
+            await asyncio.to_thread(_apply_sale_prices, db, augmented)
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.warning("packages.quote_failed detail=%s", exc)
+        return augmented
 
     @app.post("/api/v1/esim-access/orders")
     async def create_order(
