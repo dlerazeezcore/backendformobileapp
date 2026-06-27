@@ -159,7 +159,7 @@ class FIBPaymentAPI:
         *,
         client_id: str,
         client_secret: str,
-        base_url: str = "https://fib.stage.fib.iq",
+        base_url: str = "https://fib.prod.fib.iq",
         timeout: float = 30.0,
         rate_limit_per_second: float = 8.0,
         default_status_callback_url: str | None = None,
@@ -358,7 +358,13 @@ def _extract_error_message(payload: dict[str, Any], fallback: str) -> str:
 
 def _normalize_payment_status(raw_status: str | None) -> str:
     value = (raw_status or "").strip().upper()
-    if value in {"PAID", "SUCCESS", "COMPLETED", "SETTLED", "REFUNDED"}:
+    if value == "REFUNDED":
+        # Track refunds as a distinct terminal state (the store models the paid -> refunded
+        # transition). REFUND_REQUESTED intentionally falls through to "pending" below so an
+        # already-paid attempt keeps its "paid" status until the final REFUNDED arrives — the DB
+        # only permits paid/refunded as persisted terminal payment states.
+        return "refunded"
+    if value in {"PAID", "SUCCESS", "COMPLETED", "SETTLED"}:
         return "paid"
     if value in {"FAILED", "DECLINED", "REJECTED", "ERROR"}:
         return "failed"
@@ -445,6 +451,17 @@ def _extract_provider_status(payload: dict[str, Any]) -> str | None:
 
 def _extract_provider_event_id(payload: dict[str, Any]) -> str | None:
     for key in ("eventId", "event_id", "notificationId", "webhookId", "id"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _extract_explicit_event_id(payload: dict[str, Any]) -> str | None:
+    # Only dedicated event-id fields count as a globally-unique webhook id. Unlike
+    # _extract_provider_event_id this does NOT fall back to "id" (FIB's status callback carries the
+    # paymentId in "id"), so distinct status changes for the same payment are not collapsed.
+    for key in ("eventId", "event_id", "notificationId", "webhookId"):
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
@@ -975,9 +992,16 @@ async def _create_checkout_attempt(
     currency_code = payload.currency.strip().upper() if payload.currency else "IQD"
     redirect_uri = payload.success_url or payload.return_url or payload.cancel_url
 
+    description = payload.description
+    if description is not None and len(description) > 50:
+        # FIB caps the payment description at 50 chars. Surface a clean 422 (via the ValueError ->
+        # INVALID_PAYMENT_REQUEST path) instead of letting the downstream CreatePaymentRequest raise a
+        # pydantic ValidationError that would fall through to a generic 500.
+        raise ValueError("description must be 50 characters or fewer")
+
     provider_payload = CreatePaymentRequest(
         monetaryValue={"amount": str(amount_minor), "currency": currency_code},
-        description=payload.description,
+        description=description,
         redirectUri=redirect_uri,
         statusCallbackUrl=_metadata_string(metadata, ("statusCallbackUrl", "status_callback_url")),
     )
@@ -1380,6 +1404,10 @@ def register_fib_payment_routes(
     ) -> JSONResponse:
         raw_body = await request.body()
         signature_valid: bool | None = None
+        # Response-code policy: 202 = accepted (FIB's success ack). We deliberately answer non-2xx for
+        # untrusted/misconfigured calls rather than FIB's documented 202/406/500 — 401 (bad signature),
+        # 503 (no secret configured), 400 (bad JSON), 409 (write conflict) — so forged or misrouted
+        # callbacks are never acknowledged as processed.
         if not provider.webhook_secret:
             return _error_response(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -1411,13 +1439,23 @@ def register_fib_payment_routes(
             )
         payload = payload_raw if isinstance(payload_raw, dict) else {"raw": payload_raw}
 
-        provider_event_id = _extract_provider_event_id(payload)
         provider_payment_id = _extract_provider_payment_id(payload)
         webhook_transaction_id = _extract_webhook_transaction_id(payload)
         provider_status = _extract_provider_status(payload)
         normalized_status = _normalize_payment_status(provider_status)
         paid_at = parse_provider_datetime(_extract_paid_at(payload))
         event_type = f"fib.{(provider_status or 'unknown').strip().lower()}"
+        provider_reference_hint = _extract_provider_event_id(payload)
+        # Idempotency key: prefer a dedicated event id. FIB's status callback has none (it sends only
+        # {"id": <paymentId>, "status": ...}), so synthesize a per-(payment, status) key — retries of
+        # the same status dedupe, while a later REFUNDED is still processed (not dropped as a PAID dup).
+        explicit_event_id = _extract_explicit_event_id(payload)
+        if explicit_event_id is not None:
+            provider_event_id: str | None = explicit_event_id
+        elif provider_payment_id:
+            provider_event_id = f"{provider_payment_id}:{normalized_status}"
+        else:
+            provider_event_id = None
 
         store = SupabaseStore(db)
 
@@ -1473,7 +1511,7 @@ def register_fib_payment_routes(
                     row,
                     provider="fib",
                     provider_payment_id=provider_payment_id,
-                    provider_reference=provider_event_id,
+                    provider_reference=provider_reference_hint,
                     provider_response={
                         "providerStatus": provider_status,
                         "webhookPayload": payload,

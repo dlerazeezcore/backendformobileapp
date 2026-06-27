@@ -199,7 +199,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         app.state.fib_payment_api = None
         fib_webhook_secret = cfg.fib_payment_webhook_secret or FIB_PAYMENT_WEBHOOK_SECRET
-        if cfg.fib_payment_client_id and cfg.fib_payment_client_secret and fib_webhook_secret:
+        if cfg.fib_payment_client_id and cfg.fib_payment_client_secret:
+            # The webhook secret is OPTIONAL. FIB does not sign its status callbacks, so payment
+            # confirmation is done by polling the FIB status endpoint (create/status/confirm). The
+            # self-managed webhook secret only guards our own /webhook endpoint; when it is absent the
+            # webhook route stays disabled (returns 503) while the rest of the integration is fully active.
             app.state.fib_payment_api = FIBPaymentAPI(
                 client_id=cfg.fib_payment_client_id,
                 client_secret=cfg.fib_payment_client_secret,
@@ -210,11 +214,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 default_redirect_uri=cfg.fib_payment_redirect_uri,
                 webhook_secret=fib_webhook_secret,
             )
-        elif cfg.fib_payment_client_id and cfg.fib_payment_client_secret:
-            LOGGER.warning(
-                "FIB payment credentials are set but FIB_PAYMENT_WEBHOOK_SECRET is missing; "
-                "FIB integration will remain disabled until a webhook secret is configured."
-            )
+            if not fib_webhook_secret:
+                LOGGER.info(
+                    "FIB payment integration active (create/status/confirm via polling). "
+                    "FIB_PAYMENT_WEBHOOK_SECRET is not set, so the /webhook endpoint is disabled; "
+                    "payment confirmation relies on polling the FIB status endpoint."
+                )
         app.state.push_notification_service = PushNotificationService(
             service_account_file=cfg.firebase_service_account_file,
             service_account_json=cfg.firebase_service_account_json,

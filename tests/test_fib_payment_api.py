@@ -112,6 +112,22 @@ class _FakeProviderWithoutWebhookSecret(_FakeProvider):
     webhook_secret = None
 
 
+class _StatefulFakeProvider(_FakeProvider):
+    """Fake provider whose polled status can be flipped between calls (e.g. PAID -> REFUNDED)."""
+
+    def __init__(self, status: str = "PAID") -> None:
+        self.status = status
+
+    async def get_payment_status(self, payment_id: str) -> PaymentStatusResponse:
+        return PaymentStatusResponse(
+            paymentId=payment_id,
+            status=self.status,
+            paidAt="2026-04-07T00:10:00+03:00",
+            validUntil="2026-04-08T00:00:00+03:00",
+            amount={"amount": 5000, "currency": "IQD"},
+        )
+
+
 class FIBPaymentRoutesTest(unittest.TestCase):
     def setUp(self) -> None:
         os.environ["ESIM_ACCESS_ACCESS_CODE"] = "test-code"
@@ -428,6 +444,104 @@ class FIBPaymentRoutesTest(unittest.TestCase):
             paid_attempts = session.scalars(select(PaymentAttempt)).all()
             self.assertEqual(len(paid_attempts), 1)
             self.assertEqual(paid_attempts[0].status, "paid")
+
+    def test_checkout_rejects_overlong_description(self) -> None:
+        payload = {
+            "amount": 5000,
+            "currency": "IQD",
+            "description": "x" * 60,
+            "metadata": {"transactionId": "tx-long-desc", "customerUserId": self.known_user_id},
+        }
+        response = self.client.post("/api/v1/payments/fib/checkout", json=payload, headers=self.user_headers)
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json().get("errorCode"), "INVALID_PAYMENT_REQUEST")
+        with self.session_factory() as session:
+            row = session.scalar(
+                select(PaymentAttempt).where(PaymentAttempt.transaction_id == "tx-long-desc")
+            )
+            self.assertIsNone(row)
+
+    def test_refunded_status_is_tracked_via_polling(self) -> None:
+        provider = _StatefulFakeProvider(status="PAID")
+
+        app = FastAPI()
+
+        def _get_provider() -> _StatefulFakeProvider:
+            return provider
+
+        def _get_db() -> Generator[Session, None, None]:
+            session = self.session_factory()
+            try:
+                yield session
+            finally:
+                session.close()
+
+        register_fib_payment_routes(app, _get_provider, _get_db)
+        client = TestClient(app)
+
+        payload = {
+            "amount": 5000,
+            "currency": "IQD",
+            "description": "Refund tracking",
+            "metadata": {"transactionId": "tx-refund-poll", "customerUserId": self.known_user_id},
+        }
+        create_response = client.post("/api/v1/payments/fib/checkout", json=payload, headers=self.user_headers)
+        self.assertEqual(create_response.status_code, 200)
+
+        provider.status = "PAID"
+        paid = client.get("/api/v1/payments/fib/fib-pay-1?refresh=true", headers=self.user_headers)
+        self.assertEqual(paid.status_code, 200)
+        self.assertEqual(paid.json().get("status"), "paid")
+
+        provider.status = "REFUNDED"
+        refunded = client.get("/api/v1/payments/fib/fib-pay-1?refresh=true", headers=self.user_headers)
+        self.assertEqual(refunded.status_code, 200)
+        self.assertEqual(refunded.json().get("status"), "refunded")
+
+        with self.session_factory() as session:
+            row = session.scalar(
+                select(PaymentAttempt).where(PaymentAttempt.transaction_id == "tx-refund-poll")
+            )
+            self.assertIsNotNone(row)
+            assert row is not None
+            self.assertEqual(row.status, "refunded")
+
+    def test_webhook_processes_refund_after_paid(self) -> None:
+        payload = {
+            "amount": 5000,
+            "currency": "IQD",
+            "description": "Top-up checkout",
+            "metadata": {"transactionId": "tx-webhook-refund", "customerUserId": self.known_user_id},
+        }
+        create_response = self.client.post("/api/v1/payments/fib/checkout", json=payload, headers=self.user_headers)
+        self.assertEqual(create_response.status_code, 200)
+
+        paid = self.client.post(
+            "/api/v1/payments/fib/webhook",
+            headers={"X-FIB-WEBHOOK-SECRET": "whsec"},
+            json={"paymentId": "fib-pay-1", "status": "PAID"},
+        )
+        self.assertEqual(paid.status_code, 202)
+        self.assertEqual(paid.json().get("transitionApplied"), True)
+        self.assertEqual(paid.json().get("normalizedStatus"), "paid")
+
+        # Same paymentId, no explicit eventId: must NOT be treated as a duplicate of the PAID event.
+        refunded = self.client.post(
+            "/api/v1/payments/fib/webhook",
+            headers={"X-FIB-WEBHOOK-SECRET": "whsec"},
+            json={"paymentId": "fib-pay-1", "status": "REFUNDED"},
+        )
+        self.assertEqual(refunded.status_code, 202)
+        self.assertNotEqual(refunded.json().get("duplicateEvent"), True)
+        self.assertEqual(refunded.json().get("normalizedStatus"), "refunded")
+
+        with self.session_factory() as session:
+            row = session.scalar(
+                select(PaymentAttempt).where(PaymentAttempt.transaction_id == "tx-webhook-refund")
+            )
+            self.assertIsNotNone(row)
+            assert row is not None
+            self.assertEqual(row.status, "refunded")
 
 
 if __name__ == "__main__":
