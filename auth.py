@@ -383,15 +383,19 @@ def _normalize_otp_channel(channel: str | None, *, field_name: str) -> str | Non
     return normalized_channel
 
 
+def _mask_phone(value: str | None) -> str:
+    """Mask a phone number for logging — keep only the last 3 digits (SEC-6)."""
+    digits = "".join(ch for ch in (value or "") if ch.isdigit())
+    if len(digits) <= 3:
+        return "***"
+    return f"***{digits[-3:]}"
+
+
 def _log_phone_lookup(context: str, raw_phone: str, normalized_phone: str) -> None:
-    candidates = phone_lookup_candidates(normalized_phone)
-    LOGGER.info(
-        "%s phone lookup raw=%s canonical=%s candidates=%s",
-        context,
-        raw_phone,
-        normalized_phone,
-        candidates,
-    )
+    # SEC-6: never log full phone numbers (PII). Mask to the last 3 digits and
+    # drop the raw value + candidate list entirely.
+    _ = raw_phone
+    LOGGER.info("%s phone lookup phone=%s", context, _mask_phone(normalized_phone))
 
 
 async def _verify_twilio_user_otp(
@@ -614,11 +618,16 @@ def register_auth_routes(
     @app.post("/api/v1/auth/user/otp/verify")
     async def verify_user_otp(
         payload: OTPVerifyPayload,
+        request: Request,
         db: Session = Depends(get_db),
         provider: TwilioWhatsAppVerifyAPI = Depends(get_twilio_provider),
     ) -> dict[str, Any]:
         normalized_phone = _normalize_and_validate_signup_phone(payload.phone)
         requested_channel = _normalize_otp_channel(payload.channel, field_name="channel")
+        # BE-5: rate-limit OTP verification (brute-force protection on the code),
+        # mirroring the request/reset/login endpoints.
+        enforce_rate_limit(f"otpverify:phone:{normalized_phone}", max_events=10, window_seconds=600)
+        enforce_rate_limit(f"otpverify:ip:{_client_ip(request)}", max_events=30, window_seconds=3600)
         _log_phone_lookup("auth.user.otp.verify", payload.phone, normalized_phone)
         await _verify_twilio_user_otp(
             provider=provider,

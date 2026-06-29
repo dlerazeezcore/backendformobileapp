@@ -48,6 +48,27 @@ class AdminAuthorizationTest(unittest.TestCase):
                     password_hash=hash_password("StrongPass123"),
                 )
             )
+            # SEC-3: a plain admin with ONLY can_manage_pricing.
+            session.add(
+                AdminUser(
+                    id="44444444-4444-4444-4444-444444444444",
+                    phone="+9647700000044",
+                    name="Pricing Only Admin",
+                    status="active",
+                    role="admin",
+                    can_manage_pricing=True,
+                )
+            )
+            # SEC-3: an owner with NO granular flags — must still bypass them.
+            session.add(
+                AdminUser(
+                    id="55555555-5555-5555-5555-555555555555",
+                    phone="+9647700000055",
+                    name="Owner No Flags",
+                    status="active",
+                    role="owner",
+                )
+            )
             session.add(
                 AppUser(
                     id="22222222-2222-2222-2222-222222222222",
@@ -396,6 +417,51 @@ class AdminAuthorizationTest(unittest.TestCase):
             payload = response.json()
             self.assertTrue(payload.get("deleted"))
             self.assertEqual(payload.get("userId"), "33333333-3333-3333-3333-333333333333")
+
+    def _token(self, subject_id: str, phone: str) -> dict[str, str]:
+        token = create_access_token(
+            subject_id=subject_id,
+            phone=phone,
+            subject_type="admin",
+            secret_key="test-auth-secret",
+            ttl_seconds=3600,
+        )
+        return {"Authorization": f"Bearer {token}"}
+
+    def test_permission_scoped_admin_allowed_on_matching_route(self) -> None:
+        # The pricing-only admin can reach pricing routes.
+        headers = self._token("44444444-4444-4444-4444-444444444444", "+9647700000044")
+        with TestClient(create_app()) as client:
+            resp = client.get("/api/v1/admin/pricing-rules", headers=headers)
+            self.assertEqual(resp.status_code, 200, resp.text)
+
+    def test_permission_scoped_admin_blocked_on_other_routes(self) -> None:
+        # ...but not order- or content-scoped routes.
+        headers = self._token("44444444-4444-4444-4444-444444444444", "+9647700000044")
+        with TestClient(create_app()) as client:
+            self.assertEqual(client.get("/api/v1/admin/orders", headers=headers).status_code, 403)
+            self.assertEqual(
+                client.get("/api/v1/admin/featured-locations", headers=headers).status_code, 403
+            )
+
+    def test_full_flag_admin_passes_all_gated_routes(self) -> None:
+        headers = self._token("11111111-1111-1111-1111-111111111111", "+9647700000001")
+        with TestClient(create_app()) as client:
+            self.assertEqual(client.get("/api/v1/admin/orders", headers=headers).status_code, 200)
+            self.assertEqual(client.get("/api/v1/admin/pricing-rules", headers=headers).status_code, 200)
+            self.assertEqual(
+                client.get("/api/v1/admin/featured-locations", headers=headers).status_code, 200
+            )
+
+    def test_owner_bypasses_granular_permission_flags(self) -> None:
+        # Owner has every granular flag False but must still pass every route.
+        headers = self._token("55555555-5555-5555-5555-555555555555", "+9647700000055")
+        with TestClient(create_app()) as client:
+            self.assertEqual(client.get("/api/v1/admin/orders", headers=headers).status_code, 200)
+            self.assertEqual(client.get("/api/v1/admin/pricing-rules", headers=headers).status_code, 200)
+            self.assertEqual(
+                client.get("/api/v1/admin/featured-locations", headers=headers).status_code, 200
+            )
 
     def test_admin_user_delete_requires_admin_token(self) -> None:
         user_token = create_access_token(

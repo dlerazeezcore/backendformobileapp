@@ -67,6 +67,11 @@ DEFAULT_CORS_ALLOWED_ORIGINS = [
     "http://127.0.0.1:3000",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    # Expo web dev server (npm run web / npm run dev → expo start --web --port 8081).
+    "http://localhost:8081",
+    "http://127.0.0.1:8081",
+    "http://localhost:19006",
+    "http://127.0.0.1:19006",
 ]
 CORS_ALLOWED_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 CORS_ALLOWED_HEADERS = ["*"]
@@ -235,6 +240,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 timeout=TWILIO_VERIFY_TIMEOUT_SECONDS,
                 rate_limit_per_second=TWILIO_VERIFY_RATE_LIMIT_PER_SECOND,
             )
+        # BE-1: start the background eSIM usage-sync worker here (replaces the
+        # deprecated @app.on_event("startup") handler in esim_access_api).
+        start_usage_sync = getattr(app.state, "start_esim_usage_sync_worker", None)
+        if start_usage_sync is not None:
+            await start_usage_sync()
         yield
         # Stop the background eSIM usage-sync worker before tearing down the
         # provider/DB it depends on (replaces esim_access_api's deprecated
@@ -403,13 +413,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def handle_fib_api_error(request: Request, exc: FIBPaymentAPIError) -> JSONResponse:
         _ = request
         mapped_status = exc.status_code if 400 <= exc.status_code < 600 else 502
+        # BE-2: the raw provider payload can carry internal identifiers / config
+        # hints — log it server-side only, never return it to the client.
+        LOGGER.warning(
+            "FIB API error (status=%s, code=%s): %s payload=%r",
+            exc.status_code, exc.error_code, exc.error_message, exc.payload,
+        )
         return JSONResponse(
             status_code=mapped_status,
             content={
                 "detail": str(exc),
                 "errorCode": exc.error_code or "FIB_API_ERROR",
                 "errorMessage": exc.error_message or "FIB request failed.",
-                "providerPayload": exc.payload or {},
             },
         )
 
@@ -429,13 +444,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def handle_twilio_api_error(request: Request, exc: TwilioVerifyAPIError) -> JSONResponse:
         _ = request
         mapped_status = exc.status_code if 400 <= exc.status_code < 600 else 502
+        # BE-2: log the raw provider payload server-side only; don't leak it.
+        LOGGER.warning(
+            "Twilio Verify API error (status=%s, code=%s): %s payload=%r",
+            exc.status_code, exc.error_code, exc.error_message, exc.payload,
+        )
         return JSONResponse(
             status_code=mapped_status,
             content={
                 "detail": str(exc),
                 "errorCode": exc.error_code or "TWILIO_VERIFY_ERROR",
                 "errorMessage": exc.error_message or "Twilio Verify request failed.",
-                "providerPayload": exc.payload or {},
             },
         )
 

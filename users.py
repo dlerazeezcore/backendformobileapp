@@ -5,13 +5,32 @@ from datetime import datetime
 from typing import Any, Callable
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from auth import get_token_claims, hash_password, require_active_subject
 from phone_utils import phone_lookup_candidates
 from supabase_store import AdminUser, AppUser, AppUserTraveler, SupabaseStore, utcnow
+
+# BE-6: persist only known account states/roles. Free-text values silently break
+# downstream logic (e.g. _is_row_active only treats "active" as live).
+_ALLOWED_ACCOUNT_STATUSES = {"active", "blocked", "suspended", "deleted"}
+_ALLOWED_ADMIN_ROLES = {"admin", "super_admin", "owner"}
+
+
+def _check_account_status(value: str) -> str:
+    normalized = (value or "").strip().lower()
+    if normalized not in _ALLOWED_ACCOUNT_STATUSES:
+        raise ValueError(f"status must be one of {sorted(_ALLOWED_ACCOUNT_STATUSES)}")
+    return normalized
+
+
+def _check_admin_role(value: str) -> str:
+    normalized = (value or "").strip().lower()
+    if normalized not in _ALLOWED_ADMIN_ROLES:
+        raise ValueError(f"role must be one of {sorted(_ALLOWED_ADMIN_ROLES)}")
+    return normalized
 
 
 class UserPayload(BaseModel):
@@ -25,6 +44,11 @@ class UserPayload(BaseModel):
     blocked_at: datetime | None = Field(default=None, alias="blockedAt")
     deleted_at: datetime | None = Field(default=None, alias="deletedAt")
     last_login_at: datetime | None = Field(default=None, alias="lastLoginAt")
+
+    @field_validator("status")
+    @classmethod
+    def _validate_status(cls, v: str) -> str:
+        return _check_account_status(v)
 
 
 class AdminUserPayload(BaseModel):
@@ -45,12 +69,27 @@ class AdminUserPayload(BaseModel):
     last_login_at: datetime | None = Field(default=None, alias="lastLoginAt")
     custom_fields: dict[str, Any] = Field(default_factory=dict, alias="customFields")
 
+    @field_validator("status")
+    @classmethod
+    def _validate_status(cls, v: str) -> str:
+        return _check_account_status(v)
+
+    @field_validator("role")
+    @classmethod
+    def _validate_role(cls, v: str) -> str:
+        return _check_admin_role(v)
+
 
 class AdminUserUpdatePayload(BaseModel):
     name: str | None = None
     is_loyalty: bool | None = Field(default=None, alias="isLoyalty")
     blocked: bool | None = None
     status: str | None = None
+
+    @field_validator("status")
+    @classmethod
+    def _validate_status(cls, v: str | None) -> str | None:
+        return None if v is None else _check_account_status(v)
 
     model_config = {"populate_by_name": True}
 

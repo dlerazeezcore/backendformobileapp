@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from fastapi import HTTPException, Request, status
@@ -8,6 +9,8 @@ from esim_access_api import ESimAccessAPI
 from fib_payment_api import FIBPaymentAPI
 from push_notification import PushNotificationService
 from twilio_whatsapp import TwilioWhatsAppVerifyAPI
+
+LOGGER = logging.getLogger(__name__)
 
 
 def get_provider(request: Request) -> ESimAccessAPI:
@@ -23,7 +26,9 @@ def get_db(request: Request) -> Any:
         try:
             session.rollback()
         except Exception:
-            pass
+            # BE-8: surface rollback failures instead of swallowing them — a failed
+            # rollback can leave a poisoned connection that the pool hands out next.
+            LOGGER.exception("get_db: session rollback failed")
         raise
     finally:
         session.close()

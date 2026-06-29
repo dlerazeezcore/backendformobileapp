@@ -14,12 +14,24 @@ from sqlalchemy.orm import Session, sessionmaker
 from auth import create_access_token
 from config import get_settings
 from esim_access_api import register_esim_access_routes
-from supabase_store import AppUser, Base, CustomerOrder, OrderItem, PaymentAttempt, normalize_database_url
+from fib_payment_api import PaymentAmount, PaymentStatusResponse
+from supabase_store import (
+    AppUser,
+    Base,
+    CustomerOrder,
+    ExchangeRate,
+    OrderItem,
+    PaymentAttempt,
+    SupabaseStore,
+    normalize_database_url,
+)
 
 
 class _ManagedOrderProvider:
     async def order_profiles(self, payload):
-        _ = payload
+        # Echo the request transactionId like the real eSIM Access provider does
+        # so OrderItem.provider_transaction_id matches the request.
+        txn = payload.transaction_id
         return type(
             "ProviderResponse",
             (),
@@ -28,14 +40,25 @@ class _ManagedOrderProvider:
                     lambda **_: {
                         "success": True,
                         "errorCode": "0",
-                        "obj": {
-                            "orderNo": "ORD-PROVIDER-1",
-                            "transactionId": "TRX-PROVIDER-1",
-                        },
+                        "obj": {"orderNo": "ORD-PROVIDER-1", "transactionId": txn},
                     }
                 )
             },
         )()
+
+
+class _FakeFibProvider:
+    def __init__(self, *, status: str = "PAID", amount: int = 0, currency: str = "IQD") -> None:
+        self.status = status
+        self.amount = amount
+        self.currency = currency
+
+    async def get_payment_status(self, payment_id: str) -> PaymentStatusResponse:
+        return PaymentStatusResponse(
+            payment_id=payment_id,
+            status=self.status,
+            amount=PaymentAmount(amount=self.amount, currency=self.currency),
+        )
 
 
 class ManagedOrderAuthBindingTest(unittest.TestCase):
@@ -79,6 +102,10 @@ class ManagedOrderAuthBindingTest(unittest.TestCase):
                     is_loyalty=True,
                 )
             )
+            # USD->IQD rate so server-recomputed FIB totals are realistic (>0).
+            session.add(
+                ExchangeRate(base_currency="USD", quote_currency="IQD", rate=1450.0, active=True)
+            )
             session.commit()
 
         app = FastAPI()
@@ -94,8 +121,39 @@ class ManagedOrderAuthBindingTest(unittest.TestCase):
             return _ManagedOrderProvider()
 
         register_esim_access_routes(app, _get_db, _get_provider)
+        self.app = app
         self.client = TestClient(app)
         self.engine = engine
+
+    def _expected_total(self, package_code: str, provider_price_minor: int, country_code: str | None = None) -> int:
+        with self.session_factory() as session:
+            quote = SupabaseStore(session).quote_esim_sale_prices(
+                [
+                    {
+                        "packageCode": package_code,
+                        "countryCode": country_code,
+                        "providerPriceMinor": provider_price_minor,
+                    }
+                ],
+                currency_code="IQD",
+            )
+        return quote[package_code]
+
+    def _seed_fib_attempt(self, *, provider_payment_id: str, amount_minor: int, user_id: str) -> None:
+        with self.session_factory() as session:
+            store = SupabaseStore(session)
+            store.create_payment_attempt(
+                transaction_id=f"fib-int-{provider_payment_id}",
+                payment_method="fib",
+                provider="fib",
+                provider_payment_id=provider_payment_id,
+                status="pending",
+                amount_minor=amount_minor,
+                currency_code="IQD",
+                user_id=user_id,
+                service_type="esim",
+            )
+            session.commit()
 
     def tearDown(self) -> None:
         self.engine.dispose()
@@ -138,13 +196,18 @@ class ManagedOrderAuthBindingTest(unittest.TestCase):
         self.assertEqual(response.status_code, 401)
 
     def test_managed_order_uses_token_owner_not_payload_user(self) -> None:
+        # The order must bind to the TOKEN subject, never the (spoofable) payload
+        # user — verified here through the real FIB-verified checkout path.
+        expected = self._expected_total("PKG-001", 100000, country_code="US")
+        self._seed_fib_attempt(provider_payment_id="PAY-OWNER-1", amount_minor=expected, user_id=self.user_id)
+        self.app.state.fib_payment_api = _FakeFibProvider(status="PAID", amount=expected, currency="IQD")
         response = self.client.post(
             "/api/v1/esim-access/orders/managed",
             headers=self._user_auth_header(),
             json={
                 "providerRequest": {
                     "transactionId": "APP-ORDER-20001",
-                    "packageInfoList": [{"packageCode": "PKG-001", "count": 1, "price": 1000}],
+                    "packageInfoList": [{"packageCode": "PKG-001", "count": 1, "price": 100000}],
                 },
                 "user": {
                     "phone": "+9647711111111",
@@ -153,10 +216,15 @@ class ManagedOrderAuthBindingTest(unittest.TestCase):
                 },
                 "platformCode": "mobile_app",
                 "currencyCode": "IQD",
-                "providerCurrencyCode": "IQD",
+                "providerCurrencyCode": "USD",
+                "countryCode": "US",
+                "countryName": "United States",
+                "packageCode": "PKG-001",
+                "paymentMethod": "fib",
+                "paymentTransactionId": "PAY-OWNER-1",
             },
         )
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 200, response.text)
         self.assertTrue(response.json().get("success"))
         self.assertEqual(response.json().get("providerOrderNo"), "ORD-PROVIDER-1")
         order_id = response.json()["database"]["customerOrderId"]

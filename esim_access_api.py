@@ -866,14 +866,16 @@ def build_topup_error_response(exc: Exception) -> JSONResponse:
                 "traceId": trace_id,
             },
         )
+    # BE-3: never stringify an arbitrary internal exception to the client. Log the
+    # detail server-side under a trace id and return a generic message.
     trace_id = str(uuid.uuid4())
+    LOGGER.error("Unexpected top-up error (trace=%s): %r", trace_id, exc)
     return JSONResponse(
         status_code=500,
         content={
             "success": False,
             "errorCode": "INTERNAL_ERROR",
             "message": "Top-up request failed unexpectedly.",
-            "providerMessage": str(exc),
             "requestId": trace_id,
             "traceId": trace_id,
         },
@@ -1464,6 +1466,13 @@ def _resolve_or_create_payment_for_managed_order(
     provider_response_payload: dict[str, Any],
 ) -> PaymentAttempt | None:
     method, provider_code = _resolve_payment_method_provider(payload)
+    # SEC-1 hardening: this path comps an order as "paid" straight from client
+    # input with NO provider verification. It is reserved for loyalty checkouts
+    # (already comp-gated upstream). FIB is verified in
+    # _verify_fib_payment_for_managed_order instead — never mint a paid attempt
+    # from a client-supplied status for any other method.
+    if method != "loyalty":
+        return None
     attempt: PaymentAttempt | None = None
     if payload.payment_attempt_id:
         attempt = store.get_payment_attempt_by_id(payload.payment_attempt_id, for_update=True)
@@ -1535,6 +1544,142 @@ def _resolve_or_create_payment_for_managed_order(
     elif method is not None:
         store.apply_payment_status_transition(attempt, new_status="paid")
     return attempt
+
+
+async def _verify_fib_payment_for_managed_order(
+    *,
+    fib_provider: Any,
+    db: Session,
+    payload: ManagedOrderPayload,
+    auth_user_id: str,
+) -> tuple[str, Any]:
+    """Re-verify a client-claimed FIB payment against the provider BEFORE the
+    managed order is provisioned (SEC-1), and confirm the paid amount matches the
+    server-recomputed total (SEC-2).
+
+    Returns ``(attempt_id, provider_status)``. Raises ``HTTPException`` on any
+    failure so ``order_profiles`` (real provider spend) is never reached for an
+    unpaid, forged, mis-priced, or replayed payment.
+    """
+    # Imported lazily so the loyalty path never couples to the FIB module and to
+    # avoid an import cycle at module load.
+    from fib_payment_api import (
+        FIBPaymentAPIError,
+        _actor_matches_payment_context,
+        _as_int,
+        _normalize_payment_status,
+    )
+
+    provider_payment_id = (
+        payload.payment_provider_payment_id or payload.payment_transaction_id or ""
+    ).strip()
+    if not provider_payment_id:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail="A FIB payment reference is required.",
+        )
+
+    def _load_attempt_and_quote() -> tuple[str, str, int]:
+        store = SupabaseStore(db)
+        attempt = store.get_payment_attempt_by_provider_payment_id(
+            provider="fib", provider_payment_id=provider_payment_id, for_update=True
+        ) or store.get_payment_attempt_by_transaction_id(
+            provider_payment_id, for_update=True
+        )
+        if attempt is None:
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail="No matching FIB payment was found.",
+            )
+        if not _actor_matches_payment_context(
+            owner_user_id=auth_user_id, owner_admin_user_id=None, row=attempt
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="This payment belongs to another account.",
+            )
+        # Replay guard: a paid FIB payment may finalize exactly ONE eSIM order. An
+        # idempotent re-submit (same provider transactionId) is allowed; a
+        # different order reusing the same payment is rejected.
+        if attempt.customer_order_id is not None:
+            bound_item = (
+                db.scalar(select(OrderItem).where(OrderItem.id == attempt.order_item_id))
+                if attempt.order_item_id
+                else None
+            )
+            if (
+                bound_item is None
+                or bound_item.provider_transaction_id != payload.provider_request.transaction_id
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="This payment has already been used for another order.",
+                )
+        # Recompute the authoritative IQD total from the provider-request cost
+        # (the same value order_profiles charges), never from client price fields.
+        package_info = payload.provider_request.package_info_list[0]
+        provider_minor = package_info.price
+        if not provider_minor or provider_minor <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Order is missing a provider price; cannot verify payment.",
+            )
+        quote = store.quote_esim_sale_prices(
+            [
+                {
+                    "packageCode": package_info.package_code,
+                    "countryCode": payload.country_code,
+                    "providerPriceMinor": provider_minor,
+                }
+            ],
+            currency_code="IQD",
+        )
+        expected_total = quote.get(package_info.package_code)
+        if expected_total is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Unable to compute the order total for payment verification.",
+            )
+        resolved_pid = attempt.provider_payment_id or provider_payment_id
+        attempt_id = attempt.id
+        # Release the pool slot during the provider round-trip below.
+        db.close()
+        return attempt_id, resolved_pid, expected_total
+
+    attempt_id, resolved_provider_payment_id, expected_total_minor = await asyncio.to_thread(
+        _load_attempt_and_quote
+    )
+
+    try:
+        provider_status = await fib_provider.get_payment_status(resolved_provider_payment_id)
+    except FIBPaymentAPIError:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not verify the payment with FIB. Please try again.",
+        )
+
+    if _normalize_payment_status(provider_status.status) != "paid":
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail="Payment has not been confirmed by FIB.",
+        )
+    amount = provider_status.amount
+    if amount is None:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail="Payment confirmation did not include an amount.",
+        )
+    if (amount.currency or "").upper() != "IQD":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Payment currency does not match the order.",
+        )
+    if _as_int(amount.amount, default=-1) != expected_total_minor:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Paid amount does not match the order total.",
+        )
+    return attempt_id, provider_status
 
 
 def _require_valid_esim_webhook_secret(
@@ -1797,7 +1942,6 @@ def register_esim_access_routes(
                 LOGGER.exception("Scheduled eSIM usage sync failed: %s", exc)
             await asyncio.sleep(usage_sync_interval_seconds)
 
-    @app.on_event("startup")
     async def _start_periodic_usage_sync_worker() -> None:
         if not usage_sync_enabled:
             LOGGER.info("Scheduled eSIM usage sync skipped: disabled by ESIM_USAGE_SYNC_ENABLED.")
@@ -1817,6 +1961,11 @@ def register_esim_access_routes(
             usage_sync_interval_seconds,
             usage_sync_batch_size,
         )
+
+    # BE-1: started from app.py's lifespan (replaces the deprecated
+    # @app.on_event("startup") handler). Exposed on app.state so the lifespan can
+    # invoke it once the DB/provider runtime state is initialized.
+    app.state.start_esim_usage_sync_worker = _start_periodic_usage_sync_worker
 
 
     @app.post("/api/v1/esim-access/packages/query")
@@ -1854,6 +2003,7 @@ def register_esim_access_routes(
     @app.post("/api/v1/esim-access/orders/managed")
     async def create_managed_order(
         payload: ManagedOrderPayload,
+        request: Request,
         provider: ESimAccessAPI = Depends(get_provider),
         db: Session = Depends(get_db),
         claims: dict[str, Any] = Depends(get_token_claims),
@@ -1887,12 +2037,42 @@ def register_esim_access_routes(
                 "notes": auth_user.notes,
             }
             auth_user_phone = auth_user.phone
+            auth_user_id = auth_user.id
             db.close()
-            return user_snapshot, auth_user_phone
+            return user_snapshot, auth_user_phone, auth_user_id
 
-        user_snapshot, auth_user_phone = await asyncio.to_thread(_prepare_managed_order)
-        provider_response = await provider.order_profiles(payload.provider_request)
+        user_snapshot, auth_user_phone, auth_user_id = await asyncio.to_thread(_prepare_managed_order)
         resolved_payment_method, resolved_payment_provider = _resolve_payment_method_provider(payload)
+
+        # SECURITY (SEC-1/SEC-2): never spend provider credit on client say-so.
+        # Verify payment server-side BEFORE provisioning. Loyalty was already
+        # comp-gated in _prepare_managed_order; FIB is re-verified against the
+        # provider with a server-recomputed amount; any other/missing method is
+        # rejected outright so the provider order can never be placed for free.
+        verified_fib_status: Any = None
+        verified_attempt_id: str | None = None
+        if resolved_payment_method == "loyalty":
+            pass
+        elif resolved_payment_method == "fib":
+            fib_provider = getattr(request.app.state, "fib_payment_api", None)
+            if fib_provider is None:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="FIB payments are not configured on this deployment.",
+                )
+            verified_attempt_id, verified_fib_status = await _verify_fib_payment_for_managed_order(
+                fib_provider=fib_provider,
+                db=db,
+                payload=payload,
+                auth_user_id=auth_user_id,
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Unsupported payment method for managed checkout.",
+            )
+
+        provider_response = await provider.order_profiles(payload.provider_request)
         provider_request_payload = payload.provider_request.model_dump(by_alias=True, exclude_none=True)
         provider_response_payload = provider_response.model_dump(by_alias=True, exclude_none=True)
 
@@ -1912,7 +2092,10 @@ def register_esim_access_routes(
                     provider_currency_code=payload.provider_currency_code,
                     exchange_rate=payload.exchange_rate,
                     sale_price_minor=payload.sale_price_minor,
-                    provider_price_minor=payload.provider_price_minor,
+                    # SEC-2: ignore the client-supplied provider cost. save_managed_order
+                    # falls back to the provider-request price (what we actually order),
+                    # so a tampered providerPriceMinor cannot shrink the server total.
+                    provider_price_minor=None,
                     country_code=payload.country_code,
                     country_name=payload.country_name,
                     package_code=payload.package_code,
@@ -1923,18 +2106,52 @@ def register_esim_access_routes(
                     custom_fields=payload.custom_fields,
                     auto_commit=False,
                 )
-                payment_attempt = _resolve_or_create_payment_for_managed_order(
-                    store=store,
-                    payload=payload,
-                    customer_order_id=customer_order.id,
-                    order_item_id=order_item.id,
-                    user_id=customer_order.user_id,
-                    service_type=order_item.service_type,
-                    amount_minor=order_item.sale_price_minor or customer_order.total_minor or 0,
-                    currency_code=customer_order.currency_code or "IQD",
-                    provider_request_payload=provider_request_payload,
-                    provider_response_payload=provider_response_payload,
-                )
+                if resolved_payment_method == "fib":
+                    # Bind the server-verified FIB attempt and persist its verified
+                    # status in the SAME commit as the order. Re-check ownership of
+                    # the order to close the verify→persist race.
+                    from fib_payment_api import _apply_verified_status
+
+                    payment_attempt = store.get_payment_attempt_by_id(
+                        verified_attempt_id, for_update=True
+                    )
+                    if payment_attempt is None:
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail="Verified payment could not be finalized.",
+                        )
+                    if (
+                        payment_attempt.customer_order_id is not None
+                        and payment_attempt.customer_order_id != customer_order.id
+                    ):
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail="This payment has already been used for another order.",
+                        )
+                    _apply_verified_status(
+                        store=store,
+                        row=payment_attempt,
+                        provider_payment_id=payment_attempt.provider_payment_id,
+                        provider_status=verified_fib_status,
+                    )
+                    store.link_payment_attempt_to_order(
+                        payment_attempt=payment_attempt,
+                        customer_order=customer_order,
+                        order_item=order_item,
+                    )
+                else:
+                    payment_attempt = _resolve_or_create_payment_for_managed_order(
+                        store=store,
+                        payload=payload,
+                        customer_order_id=customer_order.id,
+                        order_item_id=order_item.id,
+                        user_id=customer_order.user_id,
+                        service_type=order_item.service_type,
+                        amount_minor=order_item.sale_price_minor or customer_order.total_minor or 0,
+                        currency_code=customer_order.currency_code or "IQD",
+                        provider_request_payload=provider_request_payload,
+                        provider_response_payload=provider_response_payload,
+                    )
                 if payment_attempt is not None:
                     order_item.payment_method = payment_attempt.payment_method
                     order_item.payment_provider = payment_attempt.provider
@@ -2272,7 +2489,10 @@ def register_esim_access_routes(
     ) -> Any:
         try:
             return await provider.top_up(payload)
-        except Exception as exc:
+        except (ESimAccessAPIError, ESimAccessHTTPError) as exc:
+            # BE-3: only handle provider errors here; let unexpected internal
+            # errors propagate to the app-level handlers (SQLAlchemy->503 etc.)
+            # instead of being stringified to the client.
             return build_topup_error_response(exc)
 
     @app.post("/api/v1/esim-access/topups/managed", response_model=None)
@@ -2287,7 +2507,8 @@ def register_esim_access_routes(
         await asyncio.to_thread(_require_topup_profile_access, db, actor, payload.provider_request)
         try:
             provider_response = await provider.top_up(payload.provider_request)
-        except Exception as exc:
+        except (ESimAccessAPIError, ESimAccessHTTPError) as exc:
+            # BE-3: provider errors only; unexpected internals propagate upward.
             return build_topup_error_response(exc)
         profiles_synced = 0
         usage_records_synced = 0

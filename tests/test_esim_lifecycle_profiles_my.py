@@ -84,6 +84,10 @@ class EsimLifecycleProfilesMyTest(unittest.TestCase):
                     name="Lifecycle User",
                     email="lifecycle@example.com",
                     status="active",
+                    # Loyalty so these lifecycle tests use the comped checkout path
+                    # (payment is incidental here; FIB verification is covered in
+                    # test_managed_order_payment_verification.py).
+                    is_loyalty=True,
                 )
             )
             session.commit()
@@ -136,6 +140,7 @@ class EsimLifecycleProfilesMyTest(unittest.TestCase):
                 "platformCode": "mobile_app",
                 "currencyCode": "IQD",
                 "providerCurrencyCode": "IQD",
+                "paymentMethod": "loyalty",
                 "customFields": {
                     "supportTopUpType": 2,
                     "countryCode": "US",
@@ -264,6 +269,7 @@ class EsimLifecycleProfilesMyTest(unittest.TestCase):
                 "platformCode": "mobile_app",
                 "currencyCode": "IQD",
                 "providerCurrencyCode": "IQD",
+                "paymentMethod": "loyalty",
             },
         )
         self.assertEqual(order_response.status_code, 200)

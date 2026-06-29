@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
+import hmac
 import logging
 import os
 from time import monotonic
@@ -141,6 +142,29 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
             )
         return row
 
+    def _require_permission(flag: str) -> Callable[..., AdminUser]:
+        """SEC-3: per-route admin permission gate. ``owner``/``super_admin`` bypass
+        the granular flags; every other admin must have the specific permission
+        column (e.g. ``can_manage_pricing``) set, enforced server-side rather than
+        relying on the client to hide UI."""
+
+        def _dep(
+            claims: dict[str, Any] = Depends(get_token_claims),
+            db: Session = Depends(get_db),
+        ) -> AdminUser:
+            row = require_active_subject(db, claims=claims, subject_type="admin")
+            assert isinstance(row, AdminUser)
+            if (row.role or "").strip().lower() in {"super_admin", "owner"}:
+                return row
+            if not getattr(row, flag, False):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Admin permission '{flag}' is required.",
+                )
+            return row
+
+        return _dep
+
     def _serialize_admin_user(row: AdminUser) -> dict[str, Any]:
         return {
             "id": row.id,
@@ -175,7 +199,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
     def list_user_push_devices(
         user_id: str,
         db: Session = Depends(get_db),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_send_push")),
     ) -> dict[str, Any]:
         """Admin diagnostics: dump every push device row for one app user.
 
@@ -215,7 +239,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
     def purge_stale_user_devices(
         user_id: str,
         db: Session = Depends(get_db),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_send_push")),
     ) -> dict[str, Any]:
         """Deactivate any push device for the user that LOOKS like an APNs token
         (length <= 80 and no colon). Production FCM tokens are ~140-200 chars
@@ -240,7 +264,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
     @app.post("/api/v1/admin/profiles/normalize-statuses")
     def normalize_existing_statuses(
         db: Session = Depends(get_db),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
     ) -> dict[str, Any]:
         """One-shot backfill: rewrite app_status on existing rows through
         normalize_esim_status() so legacy values (CANCEL, GOT_RESOURCE, etc.)
@@ -296,7 +320,8 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="CRON_TOKEN env var is not configured on this deployment",
             )
-        if provided != expected:
+        # SEC-5: constant-time compare to avoid leaking the token via timing.
+        if not hmac.compare_digest(provided, expected):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Provide a valid X-Cron-Token header (or Bearer <CRON_TOKEN>)",
@@ -441,7 +466,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
     async def admin_refresh_orders_from_provider(
         db: Session = Depends(get_db),
         provider: Any = Depends(get_esim_provider),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
     ) -> dict[str, Any]:
         """Admin-triggered: same provider sync as the cron endpoint, but auth'd
         by admin JWT (no CRON_TOKEN). Use the "Refresh from provider" button on
@@ -453,7 +478,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
     @app.get("/api/v1/admin/profiles/audit")
     def audit_esim_profiles(
         db: Session = Depends(get_db),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
     ) -> dict[str, Any]:
         """Aggregate health-check over the esim_profiles table.
 
@@ -583,7 +608,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         profile_id: int,
         db: Session = Depends(get_db),
         provider: Any = Depends(get_esim_provider),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
     ) -> dict[str, Any]:
         """Re-query the eSIM provider for this profile and store the fresh
         activation_code / iccid / qr_url etc. Used to recover orders where the
@@ -652,7 +677,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
     def list_user_profiles_raw(
         user_id: str,
         db: Session = Depends(get_db),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
     ) -> dict[str, Any]:
         """Admin diagnostic: dump raw ESimProfile rows for one user.
 
@@ -720,7 +745,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
     def refund_profile(
         payload: RefundPayload,
         db: Session = Depends(get_db),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
     ) -> dict[str, Any]:
         profile = SupabaseStore(db).apply_profile_action(
             action="refund",
@@ -738,7 +763,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
     def install_profile(
         payload: ProfileStatePayload,
         db: Session = Depends(get_db),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
     ) -> dict[str, Any]:
         profile = SupabaseStore(db).apply_profile_action(
             action="install",
@@ -755,7 +780,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
     def activate_profile(
         payload: ProfileStatePayload,
         db: Session = Depends(get_db),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
     ) -> dict[str, Any]:
         profile = SupabaseStore(db).apply_profile_action(
             action="activate",
@@ -773,7 +798,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
     def save_pricing_rule(
         payload: PricingRulePayload,
         db: Session = Depends(get_db),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_pricing")),
     ) -> dict[str, Any]:
         row = SupabaseStore(db).save_pricing_rule(payload.model_dump(by_alias=False))
         return {"pricingRule": {"id": row.id}}
@@ -784,7 +809,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         db: Session = Depends(get_db),
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_pricing")),
     ) -> dict[str, Any]:
         rows = SupabaseStore(db).list_rows(PricingRule, limit=limit, offset=offset)
         return {"pricingRules": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
@@ -793,7 +818,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
     def save_discount_rule(
         payload: DiscountRulePayload,
         db: Session = Depends(get_db),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_pricing")),
     ) -> dict[str, Any]:
         row = SupabaseStore(db).save_discount_rule(payload.model_dump(by_alias=False))
         return {"discountRule": {"id": row.id}}
@@ -803,7 +828,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         db: Session = Depends(get_db),
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_pricing")),
     ) -> dict[str, Any]:
         rows = SupabaseStore(db).list_rows(DiscountRule, limit=limit, offset=offset)
         return {"discountRules": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
@@ -812,7 +837,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
     def save_featured_location(
         payload: FeaturedLocationPayload,
         db: Session = Depends(get_db),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_content")),
     ) -> dict[str, Any]:
         row = SupabaseStore(db).save_featured_location(payload.model_dump(by_alias=False))
         cache_key = _featured_locations_cache_key(payload.service_type)
@@ -825,7 +850,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         db: Session = Depends(get_db),
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_content")),
     ) -> dict[str, Any]:
         rows = SupabaseStore(db).list_rows(FeaturedLocation, limit=limit, offset=offset)
         return {"locations": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
@@ -834,7 +859,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
     def delete_featured_location(
         location_id: int,
         db: Session = Depends(get_db),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_content")),
     ) -> dict[str, Any]:
         deleted = SupabaseStore(db).delete_featured_location(location_id)
         # Bust public caches across all service types so the change shows immediately.
@@ -892,7 +917,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
     def save_exchange_rate(
         payload: ExchangeRatePayload,
         db: Session = Depends(get_db),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_pricing")),
     ) -> dict[str, Any]:
         row = SupabaseStore(db).save_exchange_rate(payload.model_dump(by_alias=False))
         return {"exchangeRate": {"id": row.id}}
@@ -902,7 +927,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         db: Session = Depends(get_db),
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_pricing")),
     ) -> dict[str, Any]:
         rows = SupabaseStore(db).list_rows(ExchangeRate, limit=limit, offset=offset)
         return {"exchangeRates": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
@@ -912,7 +937,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         db: Session = Depends(get_db),
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
     ) -> dict[str, Any]:
         rows = SupabaseStore(db).list_rows(CustomerOrder, limit=limit, offset=offset)
         return {"orders": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
@@ -922,7 +947,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         db: Session = Depends(get_db),
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
     ) -> dict[str, Any]:
         rows = SupabaseStore(db).list_rows(OrderItem, limit=limit, offset=offset)
         return {"orderItems": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
@@ -932,7 +957,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         db: Session = Depends(get_db),
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
     ) -> dict[str, Any]:
         rows = SupabaseStore(db).list_rows(ESimProfile, limit=limit, offset=offset)
         return {"profiles": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
@@ -942,7 +967,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         db: Session = Depends(get_db),
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
     ) -> dict[str, Any]:
         rows = SupabaseStore(db).list_rows(ESimLifecycleEvent, limit=limit, offset=offset)
         return {"events": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
@@ -952,7 +977,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         db: Session = Depends(get_db),
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
     ) -> dict[str, Any]:
         rows = SupabaseStore(db).list_rows(PaymentAttempt, limit=limit, offset=offset)
         return {"paymentAttempts": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
@@ -962,7 +987,7 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         db: Session = Depends(get_db),
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
     ) -> dict[str, Any]:
         rows = SupabaseStore(db).list_rows(PaymentProviderEvent, limit=limit, offset=offset)
         return {"paymentProviderEvents": rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}
