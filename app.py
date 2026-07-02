@@ -58,10 +58,10 @@ DEFAULT_CORS_ALLOWED_ORIGINS = [
     "https://tulipbookings.com",
     "https://www.tulipbookings.com",
     "https://dlerazeezcore.github.io",
-    # Native shell / dev origins.
+    # Native shell / dev origins. NOTE: no bare "http://localhost" (L12) —
+    # "https://localhost" stays because it is the Capacitor Android WebView origin.
     "capacitor://localhost",
     "ionic://localhost",
-    "http://localhost",
     "https://localhost",
     "http://localhost:3000",
     "http://127.0.0.1:3000",

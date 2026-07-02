@@ -69,6 +69,16 @@ class AdminAuthorizationTest(unittest.TestCase):
                     role="owner",
                 )
             )
+            # BE-1: a super_admin — may manage admin users but not owner accounts.
+            session.add(
+                AdminUser(
+                    id="66666666-6666-6666-6666-666666666666",
+                    phone="+9647700000066",
+                    name="Super Admin",
+                    status="active",
+                    role="super_admin",
+                )
+            )
             session.add(
                 AppUser(
                     id="22222222-2222-2222-2222-222222222222",
@@ -82,6 +92,7 @@ class AdminAuthorizationTest(unittest.TestCase):
                     id="33333333-3333-3333-3333-333333333333",
                     phone="+9647701234567",
                     name="Alice Example",
+                    email="alice@example.com",
                     status="active",
                 )
             )
@@ -329,25 +340,74 @@ class AdminAuthorizationTest(unittest.TestCase):
             self.assertTrue(row["isBlocked"])
             self.assertTrue(row["isLoyalty"])
 
-    def test_admin_users_list_includes_stable_status_flags(self) -> None:
-        token = create_access_token(
-            subject_id="11111111-1111-1111-1111-111111111111",
-            phone="+9647700000001",
-            subject_type="admin",
-            secret_key="test-auth-secret",
-            ttl_seconds=3600,
-        )
+    def test_admin_users_directory_is_owner_gated_with_stable_shape(self) -> None:
+        # BE-2: the any-admin duplicate was removed; the owner/super-gated
+        # handler in admin.py is the live one.
+        plain_admin = self._token("11111111-1111-1111-1111-111111111111", "+9647700000001")
+        owner = self._token("55555555-5555-5555-5555-555555555555", "+9647700000055")
         with TestClient(create_app()) as client:
-            response = client.get("/api/v1/admin/admin-users", headers={"Authorization": f"Bearer {token}"})
+            self.assertEqual(
+                client.get("/api/v1/admin/admin-users", headers=plain_admin).status_code, 403
+            )
+            response = client.get("/api/v1/admin/admin-users", headers=owner)
             self.assertEqual(response.status_code, 200)
             payload = response.json()
-            self.assertIn("adminUsers", payload)
-            self.assertGreaterEqual(len(payload["adminUsers"]), 1)
-            row = payload["adminUsers"][0]
-            self.assertIn("status", row)
-            self.assertIn("isLoyalty", row)
-            self.assertIn("blockedAt", row)
-            self.assertIn("deletedAt", row)
+            self.assertIn("admins", payload)
+            self.assertGreaterEqual(len(payload["admins"]), 1)
+            row = payload["admins"][0]
+            for key in ("id", "phone", "name", "role", "status", "canManageUsers", "canSendPush"):
+                self.assertIn(key, row)
+
+    def test_admin_users_post_requires_owner_or_super(self) -> None:
+        # BE-1: any-admin could previously create/overwrite admin accounts.
+        plain_admin = self._token("11111111-1111-1111-1111-111111111111", "+9647700000001")
+        super_admin = self._token("66666666-6666-6666-6666-666666666666", "+9647700000066")
+        owner = self._token("55555555-5555-5555-5555-555555555555", "+9647700000055")
+        new_admin = {"phone": "+9647700000077", "name": "Fresh Admin", "role": "admin"}
+        with TestClient(create_app()) as client:
+            denied = client.post("/api/v1/admin/admin-users", headers=plain_admin, json=new_admin)
+            self.assertEqual(denied.status_code, 403)
+
+            created = client.post("/api/v1/admin/admin-users", headers=owner, json=new_admin)
+            self.assertEqual(created.status_code, 200, created.text)
+            body = created.json()["adminUser"]
+            self.assertEqual(body["phone"], "+9647700000077")
+            self.assertEqual(body["role"], "admin")
+
+            also_ok = client.post(
+                "/api/v1/admin/admin-users",
+                headers=super_admin,
+                json={"phone": "+9647700000078", "name": "Second Admin", "role": "admin"},
+            )
+            self.assertEqual(also_ok.status_code, 200, also_ok.text)
+
+    def test_super_admin_cannot_assign_or_overwrite_owner(self) -> None:
+        super_admin = self._token("66666666-6666-6666-6666-666666666666", "+9647700000066")
+        owner = self._token("55555555-5555-5555-5555-555555555555", "+9647700000055")
+        with TestClient(create_app()) as client:
+            elevate = client.post(
+                "/api/v1/admin/admin-users",
+                headers=super_admin,
+                json={"phone": "+9647700000088", "name": "Sneaky Owner", "role": "owner"},
+            )
+            self.assertEqual(elevate.status_code, 403)
+
+            # Upsert keyed on the existing owner's phone must not demote them.
+            demote = client.post(
+                "/api/v1/admin/admin-users",
+                headers=super_admin,
+                json={"phone": "+9647700000055", "name": "Demoted", "role": "admin"},
+            )
+            self.assertEqual(demote.status_code, 403)
+
+            # A real owner can still do both.
+            owner_ok = client.post(
+                "/api/v1/admin/admin-users",
+                headers=owner,
+                json={"phone": "+9647700000089", "name": "Co Owner", "role": "owner"},
+            )
+            self.assertEqual(owner_ok.status_code, 200, owner_ok.text)
+            self.assertEqual(owner_ok.json()["adminUser"]["role"], "owner")
 
     def test_admin_can_delete_user_by_id(self) -> None:
         token = create_access_token(
@@ -462,6 +522,86 @@ class AdminAuthorizationTest(unittest.TestCase):
             self.assertEqual(
                 client.get("/api/v1/admin/featured-locations", headers=headers).status_code, 200
             )
+
+    def test_user_write_routes_require_can_manage_users(self) -> None:
+        # SEC-3: pricing-only admin (no can_manage_users) is blocked on every
+        # AppUser write route; owner bypasses the flag entirely.
+        pricing_only = self._token("44444444-4444-4444-4444-444444444444", "+9647700000044")
+        owner = self._token("55555555-5555-5555-5555-555555555555", "+9647700000055")
+        target = "33333333-3333-3333-3333-333333333333"
+        with TestClient(create_app()) as client:
+            self.assertEqual(
+                client.patch(f"/api/v1/admin/users/{target}", headers=pricing_only, json={"isLoyalty": True}).status_code,
+                403,
+            )
+            self.assertEqual(
+                client.delete(f"/api/v1/admin/users/{target}", headers=pricing_only).status_code, 403
+            )
+            self.assertEqual(
+                client.delete("/api/v1/admin/users", params={"userId": target}, headers=pricing_only).status_code,
+                403,
+            )
+            self.assertEqual(
+                client.post(
+                    "/api/v1/admin/users",
+                    headers=pricing_only,
+                    json={"phone": "+9647701234567", "name": "Alice Example", "status": "active"},
+                ).status_code,
+                403,
+            )
+
+            allowed = client.patch(f"/api/v1/admin/users/{target}", headers=owner, json={"isLoyalty": True})
+            self.assertEqual(allowed.status_code, 200, allowed.text)
+            self.assertTrue(allowed.json()["user"]["isLoyalty"])
+
+    def test_users_save_omitted_email_preserves_stored_email(self) -> None:
+        # M2: a profile save without the email field must not wipe the address.
+        token = create_access_token(
+            subject_id="22222222-2222-2222-2222-222222222222",
+            phone="+9647700000002",
+            subject_type="user",
+            secret_key="test-auth-secret",
+            ttl_seconds=3600,
+        )
+        headers = {"Authorization": f"Bearer {token}"}
+        with TestClient(create_app()) as client:
+            seeded = client.post(
+                "/api/v1/admin/users",
+                headers=headers,
+                json={"phone": "+9647700000002", "name": "Standard User", "email": "keepme@example.com"},
+            )
+            self.assertEqual(seeded.status_code, 200, seeded.text)
+
+            no_email = client.post(
+                "/api/v1/admin/users",
+                headers=headers,
+                json={"phone": "+9647700000002", "name": "Renamed User"},
+            )
+            self.assertEqual(no_email.status_code, 200, no_email.text)
+
+            with client.app.state.db_session_factory() as session:
+                row = session.scalar(select(AppUser).where(AppUser.id == "22222222-2222-2222-2222-222222222222"))
+                self.assertIsNotNone(row)
+                assert row is not None
+                self.assertEqual(row.email, "keepme@example.com")
+                self.assertEqual(row.name, "Renamed User")
+
+    def test_users_save_duplicate_email_returns_409(self) -> None:
+        # M2: unique CI email index must surface as a conflict, not a 500.
+        token = create_access_token(
+            subject_id="22222222-2222-2222-2222-222222222222",
+            phone="+9647700000002",
+            subject_type="user",
+            secret_key="test-auth-secret",
+            ttl_seconds=3600,
+        )
+        with TestClient(create_app()) as client:
+            response = client.post(
+                "/api/v1/admin/users",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"phone": "+9647700000002", "name": "Standard User", "email": "alice@example.com"},
+            )
+            self.assertEqual(response.status_code, 409, response.text)
 
     def test_admin_user_delete_requires_admin_token(self) -> None:
         user_token = create_access_token(

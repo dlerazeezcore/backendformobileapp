@@ -309,7 +309,11 @@ def _lookup_admin_by_phone(db: Session, phone: str) -> AdminUser | None:
         return None
     row = _lookup_row_by_compact_phone(db, AdminUser, candidates)
     if row is not None:
-        LOGGER.info("auth.lookup.admin fallback-compact-match canonical=%s stored=%s", canonical, row.phone)
+        LOGGER.info(
+            "auth.lookup.admin fallback-compact-match canonical=%s stored=%s",
+            _mask_phone(canonical),
+            _mask_phone(row.phone),
+        )
     return row
 
 
@@ -324,7 +328,11 @@ def _lookup_user_by_phone(db: Session, phone: str) -> AppUser | None:
         return None
     row = _lookup_row_by_compact_phone(db, AppUser, candidates)
     if row is not None:
-        LOGGER.info("auth.lookup.user fallback-compact-match canonical=%s stored=%s", canonical, row.phone)
+        LOGGER.info(
+            "auth.lookup.user fallback-compact-match canonical=%s stored=%s",
+            _mask_phone(canonical),
+            _mask_phone(row.phone),
+        )
     return row
 
 

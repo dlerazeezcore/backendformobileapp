@@ -33,12 +33,15 @@ class AdminManagementTest(unittest.TestCase):
         tmp.close()
         self.db_path = tmp.name
         self.admin_id = str(uuid.uuid4())
+        self.limited_admin_id = str(uuid.uuid4())
         self.user_id = str(uuid.uuid4())
         self.engine = create_engine(f"sqlite:///{self.db_path}", connect_args={"check_same_thread": False}, future=True)
         Base.metadata.create_all(self.engine)
         self.Session = sessionmaker(bind=self.engine, autoflush=False, autocommit=False, future=True)
         with self.Session() as s:
-            s.add(AdminUser(id=self.admin_id, phone="+9647500000000", name="Admin", status="active"))
+            # SEC-3: user-management writes now require the can_manage_users grant.
+            s.add(AdminUser(id=self.admin_id, phone="+9647500000000", name="Admin", status="active", can_manage_users=True))
+            s.add(AdminUser(id=self.limited_admin_id, phone="+9647500000099", name="Limited Admin", status="active"))
             s.add(AppUser(id=self.user_id, phone="+9647501112222", name="Cust One", status="active"))
             s.commit()
 
@@ -91,6 +94,12 @@ class AdminManagementTest(unittest.TestCase):
         self.assertTrue(body["success"])
         self.assertIn("orders", body["data"])
         self.assertIsInstance(body["data"]["orders"], list)
+
+    def test_admin_without_can_manage_users_gets_403_on_user_writes(self) -> None:
+        token = create_access_token(subject_id=self.limited_admin_id, phone="+9647500000099", subject_type="admin", secret_key="test-auth-secret", ttl_seconds=3600)
+        h = {"Authorization": f"Bearer {token}"}
+        self.assertEqual(self.client.patch(f"/api/v1/admin/users/{self.user_id}", headers=h, json={"isLoyalty": True}).status_code, 403)
+        self.assertEqual(self.client.delete(f"/api/v1/admin/users/{self.user_id}", headers=h).status_code, 403)
 
     def test_admin_endpoints_reject_non_admin(self) -> None:
         user_token = create_access_token(subject_id=self.user_id, phone="+9647501112222", subject_type="user", secret_key="test-auth-secret", ttl_seconds=3600)

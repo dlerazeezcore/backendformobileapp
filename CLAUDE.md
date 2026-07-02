@@ -11,6 +11,8 @@ Every screen and component is TWO files:
 - **Thin UI** (`.tsx`) — JSX only. No business `useState`, no API calls, no router pushes, no derived computation. Pulls ONE hook and renders. Target ~50 lines.
 - **Wiring hook** — owns state, API calls, navigation, validation, errors, toasts. Returns a typed view-model the UI destructures.
 
+Clarifications: pure UI-affordance `useState` (input focus, password visibility, modal open/closed) is allowed in the `.tsx`; "business state" means data, selection, and anything the view-model should own. Framework bootstrap files (`app/_layout.tsx`, `app/(tabs)/_layout.tsx`) are exempt — they are wiring, not screens. Derived computation (`.map`/`.filter`/`.find`, math, string building) belongs in the hook: screens render pre-shaped view-models.
+
 | Kind | Thin UI | Wiring |
 |---|---|---|
 | Screen | `app/<route>/<screen>.tsx` | `src/screens/<area>/use<Screen>.ts` |
@@ -48,4 +50,4 @@ Three GitHub Actions are the release pipeline. Any change or edit must keep all 
 2. **Deploy web → GitHub Pages** — `tulip-booking/.github/workflows/deploy.yml`
 3. **iOS App Store Connect** — `tulip-booking/.github/workflows/ios-appstoreconnect.yml`
 
-Add any new checks (typecheck / tests) as SEPARATE jobs or workflows. Never modify these three in a way that alters or breaks their build/deploy behavior.
+A fourth, separate check workflow runs typecheck on PRs: `tulip-booking/.github/workflows/check.yml` (`tsc --noEmit`). Add any new checks (typecheck / tests) as SEPARATE jobs or workflows like it. Never modify the three release workflows in a way that alters or breaks their build/deploy behavior.

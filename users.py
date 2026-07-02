@@ -7,29 +7,22 @@ from typing import Any, Callable
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from auth import get_token_claims, hash_password, require_active_subject
 from phone_utils import phone_lookup_candidates
 from supabase_store import AdminUser, AppUser, AppUserTraveler, SupabaseStore, utcnow
 
-# BE-6: persist only known account states/roles. Free-text values silently break
+# Persist only known account states. Free-text values silently break
 # downstream logic (e.g. _is_row_active only treats "active" as live).
 _ALLOWED_ACCOUNT_STATUSES = {"active", "blocked", "suspended", "deleted"}
-_ALLOWED_ADMIN_ROLES = {"admin", "super_admin", "owner"}
 
 
 def _check_account_status(value: str) -> str:
     normalized = (value or "").strip().lower()
     if normalized not in _ALLOWED_ACCOUNT_STATUSES:
         raise ValueError(f"status must be one of {sorted(_ALLOWED_ACCOUNT_STATUSES)}")
-    return normalized
-
-
-def _check_admin_role(value: str) -> str:
-    normalized = (value or "").strip().lower()
-    if normalized not in _ALLOWED_ADMIN_ROLES:
-        raise ValueError(f"role must be one of {sorted(_ALLOWED_ADMIN_ROLES)}")
     return normalized
 
 
@@ -49,35 +42,6 @@ class UserPayload(BaseModel):
     @classmethod
     def _validate_status(cls, v: str) -> str:
         return _check_account_status(v)
-
-
-class AdminUserPayload(BaseModel):
-    phone: str
-    name: str
-    email: str | None = None
-    password: str | None = Field(default=None, min_length=8)
-    status: str = "active"
-    role: str = "admin"
-    can_manage_users: bool = Field(default=False, alias="canManageUsers")
-    can_manage_orders: bool = Field(default=False, alias="canManageOrders")
-    can_manage_pricing: bool = Field(default=False, alias="canManagePricing")
-    can_manage_content: bool = Field(default=False, alias="canManageContent")
-    can_send_push: bool = Field(default=False, alias="canSendPush")
-    notes: str | None = None
-    blocked_at: datetime | None = Field(default=None, alias="blockedAt")
-    deleted_at: datetime | None = Field(default=None, alias="deletedAt")
-    last_login_at: datetime | None = Field(default=None, alias="lastLoginAt")
-    custom_fields: dict[str, Any] = Field(default_factory=dict, alias="customFields")
-
-    @field_validator("status")
-    @classmethod
-    def _validate_status(cls, v: str) -> str:
-        return _check_account_status(v)
-
-    @field_validator("role")
-    @classmethod
-    def _validate_role(cls, v: str) -> str:
-        return _check_admin_role(v)
 
 
 class AdminUserUpdatePayload(BaseModel):
@@ -117,14 +81,31 @@ def _serialize_traveler(row: AppUserTraveler) -> dict[str, Any]:
     }
 
 
+def _ensure_admin_permission(row: AdminUser, flag: str) -> None:
+    """SEC-3: mirror of admin.py's per-route permission gate — ``owner``/``super_admin``
+    bypass the granular flags; every other admin must have the specific permission
+    column (e.g. ``can_manage_users``) set, enforced server-side."""
+    if (row.role or "").strip().lower() in {"super_admin", "owner"}:
+        return
+    if not getattr(row, flag, False):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Admin permission '{flag}' is required.",
+        )
+
+
 def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
-    def _require_admin_actor(
-        claims: dict[str, Any] = Depends(get_token_claims),
-        db: Session = Depends(get_db),
-    ) -> AdminUser:
-        row = require_active_subject(db, claims=claims, subject_type="admin")
-        assert isinstance(row, AdminUser)
-        return row
+    def _require_permission(flag: str) -> Callable[..., AdminUser]:
+        def _dep(
+            claims: dict[str, Any] = Depends(get_token_claims),
+            db: Session = Depends(get_db),
+        ) -> AdminUser:
+            row = require_active_subject(db, claims=claims, subject_type="admin")
+            assert isinstance(row, AdminUser)
+            _ensure_admin_permission(row, flag)
+            return row
+
+        return _dep
 
     def _require_active_actor(
         claims: dict[str, Any] = Depends(get_token_claims),
@@ -227,7 +208,10 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
                 )
 
             actor_row.name = data.get("name") or actor_row.name
-            actor_row.email = data.get("email")
+            # M2: only touch email when the client actually sent the field —
+            # an omitted email must not wipe the stored address (null still clears).
+            if "email" in payload.model_fields_set:
+                actor_row.email = data.get("email")
             if "password_hash" in data:
                 actor_row.password_hash = data["password_hash"]
 
@@ -239,9 +223,19 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
             actor_row.updated_at = utcnow()
             user = actor_row
         else:
+            _ensure_admin_permission(actor, "can_manage_users")
             user = SupabaseStore(db).ensure_user(**data)
 
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            # M2: unique CI email index (migration 0035) — surface as a
+            # conflict (matching update_auth_me in auth.py), not a 500.
+            db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Email already in use",
+            ) from exc
         db.refresh(user)
         return {"user": {"id": user.id, "phone": user.phone, "name": user.name, "status": user.status}}
 
@@ -318,7 +312,7 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         user_id: str,
         payload: AdminUserUpdatePayload,
         db: Session = Depends(get_db),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_users")),
     ) -> dict[str, Any]:
         row = db.scalar(select(AppUser).where(AppUser.id == user_id))
         if row is None:
@@ -358,7 +352,7 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
     def delete_user_by_id(
         user_id: str,
         db: Session = Depends(get_db),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_users")),
     ) -> dict[str, Any]:
         user_row = db.scalar(select(AppUser).where(AppUser.id == user_id))
         if user_row is None:
@@ -373,7 +367,7 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         user_id: str | None = Query(default=None, alias="userId"),
         phone: str | None = Query(default=None),
         db: Session = Depends(get_db),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_users")),
     ) -> dict[str, Any]:
         user_row: AppUser | None = None
         if user_id:
@@ -390,47 +384,3 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         payload = _soft_delete_user_row(user_row)
         db.commit()
         return payload
-
-    @app.post("/api/v1/admin/admin-users")
-    def save_admin_user(
-        payload: AdminUserPayload,
-        db: Session = Depends(get_db),
-        _: AdminUser = Depends(_require_admin_actor),
-    ) -> dict[str, Any]:
-        data = payload.model_dump(by_alias=False)
-        password = data.pop("password", None)
-        if password is not None:
-            data["password_hash"] = hash_password(password)
-        admin_user = SupabaseStore(db).ensure_admin_user(**data)
-        db.commit()
-        db.refresh(admin_user)
-        return {
-            "adminUser": {
-                "id": admin_user.id,
-                "phone": admin_user.phone,
-                "name": admin_user.name,
-                "status": admin_user.status,
-                "role": admin_user.role,
-            }
-        }
-
-    @app.get("/api/v1/admin/admin-users")
-    def list_admin_users(
-        db: Session = Depends(get_db),
-        limit: int = Query(default=100, ge=1, le=500),
-        offset: int = Query(default=0, ge=0),
-        _: AdminUser = Depends(_require_admin_actor),
-    ) -> dict[str, Any]:
-        rows = SupabaseStore(db).list_rows(AdminUser, exclude={"password_hash"}, limit=limit, offset=offset)
-        normalized_rows: list[dict[str, Any]] = []
-        for row in rows:
-            normalized_rows.append(
-                {
-                    **row,
-                    "isLoyalty": bool(row.get("is_loyalty", False)),
-                    "status": str(row.get("status") or "active"),
-                    "blockedAt": row.get("blocked_at"),
-                    "deletedAt": row.get("deleted_at"),
-                }
-            )
-        return {"adminUsers": normalized_rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}

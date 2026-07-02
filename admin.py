@@ -11,11 +11,13 @@ from typing import Any, Callable
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 
 from dependencies import get_provider as get_esim_provider
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from auth import get_token_claims, require_active_subject
+from auth import get_token_claims, hash_password, require_active_subject
+from phone_utils import phone_lookup_candidates
+from users import _check_account_status
 from supabase_store import (
     AdminUser,
     CustomerOrder,
@@ -107,6 +109,47 @@ class ExchangeRatePayload(BaseModel):
     custom_fields: dict[str, Any] = Field(default_factory=dict, alias="customFields")
 
 
+# Persist only known admin roles — free-text roles would silently bypass the
+# owner/super_admin gates in register_admin_routes.
+_ALLOWED_ADMIN_ROLES = {"admin", "super_admin", "owner"}
+
+
+def _check_admin_role(value: str) -> str:
+    normalized = (value or "").strip().lower()
+    if normalized not in _ALLOWED_ADMIN_ROLES:
+        raise ValueError(f"role must be one of {sorted(_ALLOWED_ADMIN_ROLES)}")
+    return normalized
+
+
+class AdminUserPayload(BaseModel):
+    phone: str
+    name: str
+    email: str | None = None
+    password: str | None = Field(default=None, min_length=8)
+    status: str = "active"
+    role: str = "admin"
+    can_manage_users: bool = Field(default=False, alias="canManageUsers")
+    can_manage_orders: bool = Field(default=False, alias="canManageOrders")
+    can_manage_pricing: bool = Field(default=False, alias="canManagePricing")
+    can_manage_content: bool = Field(default=False, alias="canManageContent")
+    can_send_push: bool = Field(default=False, alias="canSendPush")
+    notes: str | None = None
+    blocked_at: datetime | None = Field(default=None, alias="blockedAt")
+    deleted_at: datetime | None = Field(default=None, alias="deletedAt")
+    last_login_at: datetime | None = Field(default=None, alias="lastLoginAt")
+    custom_fields: dict[str, Any] = Field(default_factory=dict, alias="customFields")
+
+    @field_validator("status")
+    @classmethod
+    def _validate_status(cls, v: str) -> str:
+        return _check_account_status(v)
+
+    @field_validator("role")
+    @classmethod
+    def _validate_role(cls, v: str) -> str:
+        return _check_admin_role(v)
+
+
 class FeaturedLocationPayload(BaseModel):
     code: str
     name: str
@@ -194,6 +237,50 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
             query = query.where(AdminUser.phone == phone.strip())
         rows = db.scalars(query).all()
         return {"admins": [_serialize_admin_user(r) for r in rows]}
+
+    @app.post("/api/v1/admin/admin-users")
+    def save_admin_user(
+        payload: AdminUserPayload,
+        db: Session = Depends(get_db),
+        actor: AdminUser = Depends(_require_owner_or_super),
+    ) -> dict[str, Any]:
+        # BE-1: same owner/super gate as the GET/DELETE siblings. On top of it,
+        # only an owner may assign the owner role or touch an owner account —
+        # ensure_admin_user upserts by phone, so a super_admin could otherwise
+        # replace/demote the owner.
+        from sqlalchemy import select as _select
+
+        actor_role = (actor.role or "").strip().lower()
+        if actor_role != "owner":
+            if payload.role == "owner":
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Only an owner can assign the owner role",
+                )
+            existing = db.scalar(
+                _select(AdminUser).where(AdminUser.phone.in_(phone_lookup_candidates(payload.phone)))
+            )
+            if existing is not None and (existing.role or "").strip().lower() == "owner":
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Only an owner can modify an owner account",
+                )
+        data = payload.model_dump(by_alias=False)
+        password = data.pop("password", None)
+        if password is not None:
+            data["password_hash"] = hash_password(password)
+        admin_user = SupabaseStore(db).ensure_admin_user(**data)
+        db.commit()
+        db.refresh(admin_user)
+        return {
+            "adminUser": {
+                "id": admin_user.id,
+                "phone": admin_user.phone,
+                "name": admin_user.name,
+                "status": admin_user.status,
+                "role": admin_user.role,
+            }
+        }
 
     @app.get("/api/v1/admin/users/{user_id}/push-devices")
     def list_user_push_devices(
