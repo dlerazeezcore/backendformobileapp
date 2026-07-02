@@ -894,6 +894,7 @@ def register_auth_routes(
     def auth_me(
         token: str = Depends(require_bearer_token),
         db: Session = Depends(get_db),
+        x_app_version: str | None = Header(default=None, alias="X-App-Version"),
     ) -> dict[str, Any]:
         settings = get_settings()
         claims = decode_access_token(token, secret_key=settings.auth_secret_key)
@@ -923,6 +924,14 @@ def register_auth_routes(
         row = db.scalar(select(AppUser).where(AppUser.id == subject_id))
         if row is None:
             raise _api_error(status.HTTP_401_UNAUTHORIZED, "AUTH_SUBJECT_NOT_FOUND", "Auth subject not found")
+        # Stamp the app build this user is running (sent by the client on every
+        # request; /auth/me fires on each launch). Write only on change so the
+        # common case stays read-only.
+        reported_version = (x_app_version or "").strip()[:32]
+        if reported_version and reported_version != (row.app_version or ""):
+            row.app_version = reported_version
+            row.app_version_updated_at = utcnow()
+            db.commit()
         return {
             "subjectType": "user",
             "id": row.id,

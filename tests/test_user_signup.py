@@ -322,6 +322,35 @@ class PublicUserSignupTest(unittest.TestCase):
             detail = invalid_email.json().get("detail") or {}
             self.assertEqual(detail.get("code"), "AUTH_INVALID_EMAIL")
 
+    def test_auth_me_stamps_reported_app_version(self) -> None:
+        with TestClient(create_app()) as client:
+            login = client.post(
+                "/api/v1/auth/user/login",
+                json={"phone": "+9647700000002", "password": "StrongPass123"},
+            )
+            self.assertEqual(login.status_code, 200)
+            headers = {"Authorization": f"Bearer {login.json()['accessToken']}"}
+
+            # No header → nothing stamped.
+            self.assertEqual(client.get("/api/v1/auth/me", headers=headers).status_code, 200)
+            with self.session_factory() as session:
+                row = session.scalar(select(AppUser).where(AppUser.phone == "+9647700000002"))
+                self.assertIsNone(row.app_version)
+
+            # Header present → version stamped with a timestamp.
+            resp = client.get("/api/v1/auth/me", headers={**headers, "X-App-Version": "1.4.0"})
+            self.assertEqual(resp.status_code, 200)
+            with self.session_factory() as session:
+                row = session.scalar(select(AppUser).where(AppUser.phone == "+9647700000002"))
+                self.assertEqual(row.app_version, "1.4.0")
+                self.assertIsNotNone(row.app_version_updated_at)
+
+            # Newer build reported → value updated.
+            client.get("/api/v1/auth/me", headers={**headers, "X-App-Version": "1.5.0"})
+            with self.session_factory() as session:
+                row = session.scalar(select(AppUser).where(AppUser.phone == "+9647700000002"))
+                self.assertEqual(row.app_version, "1.5.0")
+
 
 if __name__ == "__main__":
     unittest.main()

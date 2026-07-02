@@ -303,6 +303,8 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
                     "isBlocked": bool(is_blocked),
                     "isLoyalty": bool(row.get("is_loyalty", False)),
                     "updatedAt": row.get("updated_at"),
+                    "appVersion": row.get("app_version"),
+                    "appVersionUpdatedAt": row.get("app_version_updated_at"),
                 }
             )
         return {"users": normalized_rows, "pagination": {"limit": limit, "offset": offset, "count": len(rows)}}

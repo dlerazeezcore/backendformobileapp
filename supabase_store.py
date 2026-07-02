@@ -463,6 +463,11 @@ class AppUser(TimeMixin, Base):
     blocked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Last app build this user was seen on (X-App-Version header, stamped by
+    # GET /auth/me on every launch). Lets the admin panel show who is on the
+    # latest published version. Migration 0047.
+    app_version: Mapped[str | None] = mapped_column(String(32))
+    app_version_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     customer_orders: Mapped[list["CustomerOrder"]] = relationship(back_populates="user")
     profiles: Mapped[list["ESimProfile"]] = relationship(back_populates="user")
     push_devices: Mapped[list["PushDevice"]] = relationship(back_populates="user", foreign_keys="PushDevice.user_id")
