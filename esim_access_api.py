@@ -1413,6 +1413,12 @@ class ManagedTopUpPayload(BaseModel):
     platform_name: str | None = Field(default=None, alias="platformName")
     actor_phone: str | None = Field(default=None, alias="actorPhone")
     sync_after_topup: bool = Field(default=True, alias="syncAfterTopup")
+    # SEC (BE-3): top-ups must be paid like orders — loyalty (comp-gated
+    # server-side) or a FIB payment re-verified against the provider before the
+    # provider spend. Mirrors the ManagedOrderPayload payment fields.
+    payment_method: str | None = Field(default=None, alias="paymentMethod")
+    payment_provider_payment_id: str | None = Field(default=None, alias="paymentProviderPaymentId")
+    payment_transaction_id: str | None = Field(default=None, alias="paymentTransactionId")
 
 
 class ManagedEsimTranActionPayload(BaseModel):
@@ -1600,21 +1606,8 @@ async def _verify_fib_payment_for_managed_order(
             )
         # Replay guard: a paid FIB payment may finalize exactly ONE eSIM order. An
         # idempotent re-submit (same provider transactionId) is allowed; a
-        # different order reusing the same payment is rejected.
-        if attempt.customer_order_id is not None:
-            bound_item = (
-                db.scalar(select(OrderItem).where(OrderItem.id == attempt.order_item_id))
-                if attempt.order_item_id
-                else None
-            )
-            if (
-                bound_item is None
-                or bound_item.provider_transaction_id != payload.provider_request.transaction_id
-            ):
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="This payment has already been used for another order.",
-                )
+        # different order (or a top-up) reusing the same payment is rejected.
+        _ensure_attempt_free_for_order(db, attempt, payload.provider_request.transaction_id)
         # Recompute the authoritative IQD total from the provider-request cost
         # (the same value order_profiles charges), never from client price fields.
         package_info = payload.provider_request.package_info_list[0]
@@ -1679,7 +1672,235 @@ async def _verify_fib_payment_for_managed_order(
             status_code=status.HTTP_409_CONFLICT,
             detail="Paid amount does not match the order total.",
         )
+
+    # BE-4: claim the payment for THIS order transaction in a locked transaction
+    # BEFORE the provider spend, so a concurrent request reusing the same
+    # payment short-circuits with 409 instead of double-spending provider
+    # credit in the verify→persist window.
+    def _claim() -> None:
+        attempt = SupabaseStore(db).get_payment_attempt_by_id(attempt_id, for_update=True)
+        if attempt is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Verified payment could not be finalized.",
+            )
+        already_bound = _ensure_attempt_free_for_order(
+            db, attempt, payload.provider_request.transaction_id
+        )
+        if not already_bound:
+            meta = dict(attempt.metadata_payload or {})
+            meta["orderClaim"] = {
+                "transactionId": payload.provider_request.transaction_id,
+                "claimedAt": utcnow().isoformat(),
+            }
+            attempt.metadata_payload = meta
+        db.commit()
+
+    await asyncio.to_thread(_claim)
     return attempt_id, provider_status
+
+
+def _ensure_attempt_free_for_order(db: Session, attempt: Any, order_transaction_id: str) -> bool:
+    """Replay/cross-use guard for order payments. Returns True when the attempt
+    is already bound to THIS order (idempotent resubmit — no claim needed),
+    False when it is free to claim. Raises 409 on any other reuse."""
+    meta = attempt.metadata_payload or {}
+    if meta.get("topupClaim"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This payment has already been used for a top-up.",
+        )
+    if attempt.customer_order_id is not None:
+        bound_item = (
+            db.scalar(select(OrderItem).where(OrderItem.id == attempt.order_item_id))
+            if attempt.order_item_id
+            else None
+        )
+        if bound_item is None or bound_item.provider_transaction_id != order_transaction_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This payment has already been used for another order.",
+            )
+        return True
+    claim = meta.get("orderClaim")
+    if claim and claim.get("transactionId") != order_transaction_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This payment has already been used for another order.",
+        )
+    return False
+
+
+def _release_order_claim(db: Session, attempt_id: str, order_transaction_id: str) -> None:
+    """Best-effort un-claim after a failed provider order so the customer can
+    retry with the same (still unspent) payment."""
+    try:
+        attempt = SupabaseStore(db).get_payment_attempt_by_id(attempt_id, for_update=True)
+        if attempt is None:
+            return
+        claim = (attempt.metadata_payload or {}).get("orderClaim")
+        if claim and claim.get("transactionId") == order_transaction_id:
+            meta = dict(attempt.metadata_payload)
+            meta.pop("orderClaim", None)
+            attempt.metadata_payload = meta
+            db.commit()
+    except Exception:
+        LOGGER.warning("order.claim_release_failed attempt=%s", attempt_id, exc_info=True)
+        try:
+            db.rollback()
+        except Exception:
+            LOGGER.warning("order.claim_release_rollback_failed attempt=%s", attempt_id, exc_info=True)
+
+
+def _ensure_attempt_free_for_topup(attempt: Any, topup_transaction_id: str) -> None:
+    """Replay guard for top-up payments: a FIB payment may fund exactly ONE
+    top-up (idempotent re-submits of the same top-up transaction are allowed),
+    and never a top-up if it already paid for an order."""
+    meta = attempt.metadata_payload or {}
+    if (
+        attempt.customer_order_id is not None
+        or attempt.order_item_id is not None
+        or meta.get("orderClaim")
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This payment has already been used for another order.",
+        )
+    claim = meta.get("topupClaim")
+    if claim and claim.get("transactionId") != topup_transaction_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This payment has already been used for another top-up.",
+        )
+
+
+def _release_topup_claim(db: Session, attempt_id: str, topup_transaction_id: str) -> None:
+    """Best-effort un-claim after a failed provider top-up so the customer can
+    retry with the same (still unspent) payment."""
+    try:
+        attempt = SupabaseStore(db).get_payment_attempt_by_id(attempt_id, for_update=True)
+        if attempt is None:
+            return
+        claim = (attempt.metadata_payload or {}).get("topupClaim")
+        if claim and claim.get("transactionId") == topup_transaction_id:
+            meta = dict(attempt.metadata_payload)
+            meta.pop("topupClaim", None)
+            attempt.metadata_payload = meta
+            db.commit()
+    except Exception:
+        LOGGER.warning("topup.claim_release_failed attempt=%s", attempt_id, exc_info=True)
+        try:
+            db.rollback()
+        except Exception:
+            LOGGER.warning("topup.claim_release_rollback_failed attempt=%s", attempt_id, exc_info=True)
+
+
+async def _verify_fib_payment_for_managed_topup(
+    *,
+    fib_provider: Any,
+    db: Session,
+    provider_payment_id: str,
+    auth_user_id: str,
+    expected_total_minor: int,
+    topup_transaction_id: str,
+) -> str:
+    """Server-side FIB verification for a managed top-up (BE-3), mirroring
+    _verify_fib_payment_for_managed_order: the payment must exist, belong to
+    the acting user, and be confirmed paid at the server-recomputed IQD total.
+
+    The attempt is then CLAIMED for this top-up transaction id in a locked
+    transaction BEFORE the provider spend, so a concurrent request reusing the
+    same payment short-circuits with 409 instead of double-spending credit.
+    Returns the claimed attempt id.
+    """
+    from fib_payment_api import (
+        FIBPaymentAPIError,
+        _actor_matches_payment_context,
+        _as_int,
+        _normalize_payment_status,
+    )
+
+    pid = (provider_payment_id or "").strip()
+    if not pid:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail="A FIB payment reference is required.",
+        )
+
+    def _load_attempt() -> tuple[str, str]:
+        store = SupabaseStore(db)
+        attempt = store.get_payment_attempt_by_provider_payment_id(
+            provider="fib", provider_payment_id=pid, for_update=True
+        ) or store.get_payment_attempt_by_transaction_id(pid, for_update=True)
+        if attempt is None:
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail="No matching FIB payment was found.",
+            )
+        if not _actor_matches_payment_context(
+            owner_user_id=auth_user_id, owner_admin_user_id=None, row=attempt
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="This payment belongs to another account.",
+            )
+        _ensure_attempt_free_for_topup(attempt, topup_transaction_id)
+        resolved = attempt.provider_payment_id or pid
+        attempt_id = attempt.id
+        # Release the pool slot during the provider round-trip below.
+        db.close()
+        return attempt_id, resolved
+
+    attempt_id, resolved_pid = await asyncio.to_thread(_load_attempt)
+
+    try:
+        provider_status = await fib_provider.get_payment_status(resolved_pid)
+    except FIBPaymentAPIError:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not verify the payment with FIB. Please try again.",
+        )
+
+    if _normalize_payment_status(provider_status.status) != "paid":
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail="Payment has not been confirmed by FIB.",
+        )
+    amount = provider_status.amount
+    if amount is None:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail="Payment confirmation did not include an amount.",
+        )
+    if (amount.currency or "").upper() != "IQD":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Payment currency does not match the top-up.",
+        )
+    if _as_int(amount.amount, default=-1) != expected_total_minor:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Paid amount does not match the top-up total.",
+        )
+
+    def _claim() -> None:
+        attempt = SupabaseStore(db).get_payment_attempt_by_id(attempt_id, for_update=True)
+        if attempt is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Verified payment could not be finalized.",
+            )
+        _ensure_attempt_free_for_topup(attempt, topup_transaction_id)
+        meta = dict(attempt.metadata_payload or {})
+        meta["topupClaim"] = {
+            "transactionId": topup_transaction_id,
+            "claimedAt": utcnow().isoformat(),
+        }
+        attempt.metadata_payload = meta
+        db.commit()
+
+    await asyncio.to_thread(_claim)
+    return attempt_id
 
 
 def _require_valid_esim_webhook_secret(
@@ -1703,6 +1924,13 @@ def _require_valid_esim_webhook_secret(
     ]
     if not any(candidate and hmac.compare_digest(candidate, configured_secret) for candidate in candidates):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid eSIM Access webhook secret.")
+    # DEPRECATED: URL-borne secrets (path/query) end up in proxy/CDN/APM access
+    # logs. Accepted for provider-config compatibility, but reconfigure the
+    # webhook to send the X-ESIM-ACCESS-WEBHOOK-SECRET header and remove these.
+    if not (header_secret or alternate_header_secret) and (query_secret or path_secret):
+        LOGGER.warning(
+            "esim_webhook.secret_via_url_deprecated: move the webhook secret to the header form"
+        )
 
 
 async def stop_periodic_usage_sync_worker(app: FastAPI) -> None:
@@ -2072,7 +2300,18 @@ def register_esim_access_routes(
                 detail="Unsupported payment method for managed checkout.",
             )
 
-        provider_response = await provider.order_profiles(payload.provider_request)
+        try:
+            provider_response = await provider.order_profiles(payload.provider_request)
+        except Exception:
+            # The provider spend failed — free the claimed payment for a retry.
+            if verified_attempt_id is not None:
+                await asyncio.to_thread(
+                    _release_order_claim,
+                    db,
+                    verified_attempt_id,
+                    payload.provider_request.transaction_id,
+                )
+            raise
         provider_request_payload = payload.provider_request.model_dump(by_alias=True, exclude_none=True)
         provider_response_payload = provider_response.model_dump(by_alias=True, exclude_none=True)
 
@@ -2253,7 +2492,9 @@ def register_esim_access_routes(
                         try:
                             db.rollback()
                         except Exception:
-                            pass
+                            # A failed rollback can leave the connection poisoned
+                            # for the refetch below — surface it in logs.
+                            LOGGER.warning("profile_sync.rollback_failed", exc_info=True)
                         # The original ORM objects are detached after db.close().
                         # Refetch by primary key from a fresh session.
                         recovered_order_item = db.scalar(
@@ -2499,17 +2740,112 @@ def register_esim_access_routes(
     @app.post("/api/v1/esim-access/topup/managed", response_model=None)
     async def top_up_managed(
         payload: ManagedTopUpPayload,
+        request: Request,
         provider: ESimAccessAPI = Depends(get_provider),
         db: Session = Depends(get_db),
         actor: AppUser | AdminUser = Depends(_require_active_actor),
     ) -> Any:
         # Synchronous ownership/access check — offload off the event loop.
         await asyncio.to_thread(_require_topup_profile_access, db, actor, payload.provider_request)
+
+        # SECURITY (BE-3): never spend provider credit on client say-so. Admins
+        # may top up as a support action; app users must pay — loyalty is
+        # comp-gated server-side, FIB is re-verified against the provider at the
+        # server-recomputed IQD price, and the payment is claimed for this
+        # top-up transaction BEFORE the spend (replay/double-spend guard).
+        topup_transaction_id = payload.provider_request.transaction_id
+        verified_attempt_id: str | None = None
+        if not isinstance(actor, AdminUser):
+            requested_method, _ = _normalize_payment_method(payload.payment_method, None)
+            if requested_method == "loyalty":
+                if not bool(getattr(actor, "is_loyalty", False)):
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Loyalty top-up is not available for this account.",
+                    )
+            else:
+                fib_provider = getattr(request.app.state, "fib_payment_api", None)
+                if fib_provider is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="FIB payments are not configured on this deployment.",
+                    )
+                package_code = payload.provider_request.package_code
+                # Recompute the authoritative IQD sale price from the provider's
+                # own top-up catalog — never from client-supplied numbers. Same
+                # quoting recipe the catalog/checkout use (_apply_sale_prices).
+                catalog = await provider.get_packages(
+                    PackageQueryRequest(
+                        type="TOPUP",
+                        iccid=payload.provider_request.iccid,
+                        package_code=package_code,
+                    )
+                )
+                catalog_payload = catalog.model_dump(by_alias=True, exclude_none=True)
+                package_list = (catalog_payload.get("obj") or {}).get("packageList") or []
+                match = next(
+                    (
+                        it
+                        for it in package_list
+                        if isinstance(it, dict) and it.get("packageCode") == package_code
+                    ),
+                    None,
+                )
+                provider_minor = (match or {}).get("price")
+                if not provider_minor or provider_minor <= 0:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Unable to price the top-up package; cannot verify payment.",
+                    )
+
+                def _quote_expected_total() -> int | None:
+                    return SupabaseStore(db).quote_esim_sale_prices(
+                        [
+                            {
+                                "packageCode": package_code,
+                                "countryCode": _single_country_code(match),
+                                "providerPriceMinor": provider_minor,
+                            }
+                        ],
+                        currency_code="IQD",
+                    ).get(package_code)
+
+                expected_total_minor = await asyncio.to_thread(_quote_expected_total)
+                if expected_total_minor is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Unable to compute the top-up total for payment verification.",
+                    )
+                verified_attempt_id = await _verify_fib_payment_for_managed_topup(
+                    fib_provider=fib_provider,
+                    db=db,
+                    provider_payment_id=(
+                        payload.payment_provider_payment_id or payload.payment_transaction_id or ""
+                    ),
+                    auth_user_id=actor.id,
+                    expected_total_minor=expected_total_minor,
+                    topup_transaction_id=topup_transaction_id,
+                )
+
+        async def _release_claim_if_any() -> None:
+            if verified_attempt_id is not None:
+                await asyncio.to_thread(
+                    _release_topup_claim, db, verified_attempt_id, topup_transaction_id
+                )
+
         try:
             provider_response = await provider.top_up(payload.provider_request)
         except (ESimAccessAPIError, ESimAccessHTTPError) as exc:
             # BE-3: provider errors only; unexpected internals propagate upward.
+            await _release_claim_if_any()
             return build_topup_error_response(exc)
+        except Exception:
+            await _release_claim_if_any()
+            raise
+        if not bool(getattr(provider_response, "success", True)):
+            # Provider rejected the top-up without raising — the payment was not
+            # spent; free it for a retry.
+            await _release_claim_if_any()
         profiles_synced = 0
         usage_records_synced = 0
         if payload.sync_after_topup:

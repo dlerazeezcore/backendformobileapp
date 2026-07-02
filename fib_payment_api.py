@@ -1268,7 +1268,9 @@ def register_fib_payment_routes(
                 "expiresAt": provider_status.valid_until,
             }
             return _to_checkout_response_from_context(checkout_context)
-        except Exception as exc:
+        except (FIBPaymentAPIError, FIBPaymentHTTPError) as exc:
+            # Provider failures only — DB/logic errors propagate to the global
+            # handlers instead of being disguised as provider responses.
             return _map_fib_exception(exc)
 
     @app.post("/api/v1/payments/fib/confirm")
@@ -1392,7 +1394,9 @@ def register_fib_payment_routes(
                 "expiresAt": provider_status.valid_until,
             }
             return _to_checkout_response_from_context(checkout_context)
-        except Exception as exc:
+        except (FIBPaymentAPIError, FIBPaymentHTTPError) as exc:
+            # Provider failures only — DB/logic errors propagate to the global
+            # handlers instead of being disguised as provider responses.
             return _map_fib_exception(exc)
 
     @app.post("/api/v1/payments/fib/webhook")
@@ -1573,17 +1577,28 @@ def register_fib_payment_routes(
                 db.commit()
             except IntegrityError:
                 db.rollback()
+                # The rollback discarded everything this handler wrote (status
+                # transition + event bookkeeping). Ack 202 only if the intended
+                # terminal status is what actually persisted (a concurrent
+                # processor may have applied it); otherwise answer 409 so FIB
+                # retries and the event is reprocessed.
+                row = None
                 if provider_payment_id:
                     row = store.get_payment_attempt_by_provider_payment_id(
                         provider="fib",
                         provider_payment_id=provider_payment_id,
                     )
-                if row is None:
+                if row is None and webhook_transaction_id:
+                    row = store.get_payment_attempt_by_transaction_id(webhook_transaction_id)
+                intended_transition = normalized_status in PERSISTED_PAYMENT_STATUSES
+                if row is None or (intended_transition and row.status != normalized_status):
                     return _error_response(
                         status_code=409,
                         error_code="PAYMENT_UPDATE_CONFLICT",
                         message="Payment update conflicted with concurrent operation.",
                     )
+                transition_applied = intended_transition
+                event = None  # the event row was rolled back with the transaction
 
             return JSONResponse(
                 status_code=202,
