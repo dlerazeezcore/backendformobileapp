@@ -67,13 +67,28 @@ def _get_or_create(db: Session) -> AppReleaseInfo:
 
 
 def register_app_meta_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
-    async def _require_admin_actor(
-        claims: dict[str, Any] = Depends(get_token_claims),
-        db: Session = Depends(get_db),
-    ) -> AdminUser:
-        row = require_active_subject(db, claims=claims, subject_type="admin")
-        assert isinstance(row, AdminUser)
-        return row
+    def _require_permission(flag: str) -> Callable[..., AdminUser]:
+        """SEC-3: per-route admin permission gate (mirrors admin.py). ``owner``/
+        ``super_admin`` bypass the granular flags; every other admin must have
+        the specific permission column (e.g. ``can_manage_content``) set,
+        enforced server-side rather than relying on the client to hide UI."""
+
+        def _dep(
+            claims: dict[str, Any] = Depends(get_token_claims),
+            db: Session = Depends(get_db),
+        ) -> AdminUser:
+            row = require_active_subject(db, claims=claims, subject_type="admin")
+            assert isinstance(row, AdminUser)
+            if (row.role or "").strip().lower() in {"super_admin", "owner"}:
+                return row
+            if not getattr(row, flag, False):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Admin permission '{flag}' is required.",
+                )
+            return row
+
+        return _dep
 
     @app.get("/api/v1/app/version-info")
     def get_version_info(db: Session = Depends(get_db)) -> dict[str, Any]:
@@ -102,7 +117,9 @@ def register_app_meta_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
     def update_version_info(
         payload: AppVersionInfoUpdatePayload,
         db: Session = Depends(get_db),
-        _: AdminUser = Depends(_require_admin_actor),
+        # SEC-3: publishing latestVersion drives the mandatory-update modal —
+        # content publishing, so it needs the content grant.
+        _: AdminUser = Depends(_require_permission("can_manage_content")),
     ) -> dict[str, Any]:
         row = _get_or_create(db)
         provided = payload.model_fields_set

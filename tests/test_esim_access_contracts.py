@@ -88,6 +88,8 @@ class EsimAccessContractTest(unittest.TestCase):
         Base.metadata.create_all(engine)
         self.session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
         self.admin_id = str(uuid.uuid4())
+        self.noflag_admin_id = str(uuid.uuid4())
+        self.owner_id = str(uuid.uuid4())
         with self.session_factory() as session:
             session.add(
                 AdminUser(
@@ -96,19 +98,35 @@ class EsimAccessContractTest(unittest.TestCase):
                     name="Contract Admin",
                     status="active",
                     role="admin",
+                    # SEC-3: provider/profile admin routes now require the
+                    # can_manage_orders grant instead of any-admin.
+                    can_manage_orders=True,
+                )
+            )
+            # SEC-3: a plain admin with NO granular flags — must be rejected.
+            session.add(
+                AdminUser(
+                    id=self.noflag_admin_id,
+                    phone="+9647700000889",
+                    name="No Flag Admin",
+                    status="active",
+                    role="admin",
+                )
+            )
+            # SEC-3: an owner with NO granular flags — must still bypass them.
+            session.add(
+                AdminUser(
+                    id=self.owner_id,
+                    phone="+9647700000890",
+                    name="Owner No Flags",
+                    status="active",
+                    role="owner",
                 )
             )
             session.commit()
-        self.admin_headers = {
-            "Authorization": "Bearer "
-            + create_access_token(
-                subject_id=self.admin_id,
-                phone="+9647700000888",
-                subject_type="admin",
-                secret_key="test-auth-secret",
-                ttl_seconds=3600,
-            )
-        }
+        self.admin_headers = self._admin_token_headers(self.admin_id, "+9647700000888")
+        self.noflag_admin_headers = self._admin_token_headers(self.noflag_admin_id, "+9647700000889")
+        self.owner_headers = self._admin_token_headers(self.owner_id, "+9647700000890")
 
         app = FastAPI()
 
@@ -129,6 +147,18 @@ class EsimAccessContractTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.engine.dispose()
         get_settings.cache_clear()
+
+    def _admin_token_headers(self, subject_id: str, phone: str) -> dict[str, str]:
+        return {
+            "Authorization": "Bearer "
+            + create_access_token(
+                subject_id=subject_id,
+                phone=phone,
+                subject_type="admin",
+                secret_key="test-auth-secret",
+                ttl_seconds=3600,
+            )
+        }
 
     def test_packages_query_includes_machine_readable_included_countries(self) -> None:
         response = self.client.post(
@@ -164,6 +194,35 @@ class EsimAccessContractTest(unittest.TestCase):
             json={"iccid": "dummy"},
         )
         self.assertEqual(response.status_code, 401)
+
+    def test_profiles_query_requires_can_manage_orders_flag(self) -> None:
+        # SEC-3: a plain admin without can_manage_orders is rejected server-side.
+        response = self.client.post(
+            "/api/v1/esim-access/profiles/query",
+            json={"iccid": "dummy"},
+            headers=self.noflag_admin_headers,
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_sms_send_requires_can_send_push_flag(self) -> None:
+        # SEC-3: SMS to a customer's eSIM is messaging — neither a flagless
+        # admin nor an orders-only admin may send it.
+        for headers in (self.noflag_admin_headers, self.admin_headers):
+            response = self.client.post(
+                "/api/v1/esim-access/sms/send",
+                json={"iccid": "dummy", "message": "hello"},
+                headers=headers,
+            )
+            self.assertEqual(response.status_code, 403)
+
+    def test_owner_without_flags_bypasses_esim_permission_gates(self) -> None:
+        # SEC-3: owner has every granular flag False but must still pass.
+        response = self.client.post(
+            "/api/v1/esim-access/profiles/query",
+            json={"iccid": "dummy"},
+            headers=self.owner_headers,
+        )
+        self.assertEqual(response.status_code, 200)
 
     def test_webhook_requires_configured_secret(self) -> None:
         payload = {

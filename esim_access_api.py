@@ -2007,13 +2007,28 @@ def register_esim_access_routes(
     # Plain `def` dependencies: the only work is synchronous DB lookup via
     # require_active_subject (no awaits), so FastAPI runs them in a worker
     # thread instead of blocking the event loop.
-    def _require_admin_actor(
-        claims: dict[str, Any] = Depends(get_token_claims),
-        db: Session = Depends(get_db),
-    ) -> AdminUser:
-        row = require_active_subject(db, claims=claims, subject_type="admin")
-        assert isinstance(row, AdminUser)
-        return row
+    def _require_permission(flag: str) -> Callable[..., AdminUser]:
+        """SEC-3: per-route admin permission gate (mirrors admin.py). ``owner``/
+        ``super_admin`` bypass the granular flags; every other admin must have
+        the specific permission column (e.g. ``can_manage_orders``) set,
+        enforced server-side rather than relying on the client to hide UI."""
+
+        def _dep(
+            claims: dict[str, Any] = Depends(get_token_claims),
+            db: Session = Depends(get_db),
+        ) -> AdminUser:
+            row = require_active_subject(db, claims=claims, subject_type="admin")
+            assert isinstance(row, AdminUser)
+            if (row.role or "").strip().lower() in {"super_admin", "owner"}:
+                return row
+            if not getattr(row, flag, False):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Admin permission '{flag}' is required.",
+                )
+            return row
+
+        return _dep
 
     def _require_active_actor(
         claims: dict[str, Any] = Depends(get_token_claims),
@@ -2224,7 +2239,7 @@ def register_esim_access_routes(
     async def create_order(
         payload: OrderProfilesRequest,
         provider: ESimAccessAPI = Depends(get_provider),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
     ) -> ESimAccessResponse[OrderResult]:
         return await provider.order_profiles(payload)
 
@@ -2559,7 +2574,7 @@ def register_esim_access_routes(
     async def query_profiles(
         payload: ProfileQueryRequest,
         provider: ESimAccessAPI = Depends(get_provider),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
     ) -> dict[str, Any]:
         provider_response = await provider.query_profiles(payload)
         raw_payload = provider_response.model_dump(by_alias=True, exclude_none=True)
@@ -2570,7 +2585,7 @@ def register_esim_access_routes(
         payload: ManagedProfileSyncPayload,
         provider: ESimAccessAPI = Depends(get_provider),
         db: Session = Depends(get_db),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
     ) -> dict[str, Any]:
         provider_response = await provider.query_profiles(payload.provider_request)
 
@@ -2594,7 +2609,7 @@ def register_esim_access_routes(
     async def cancel_profile(
         payload: EsimTranNoRequest,
         provider: ESimAccessAPI = Depends(get_provider),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
     ) -> ESimAccessResponse[EmptyResult]:
         return await provider.cancel_profile(payload)
 
@@ -2603,7 +2618,7 @@ def register_esim_access_routes(
         payload: ManagedEsimTranActionPayload,
         provider: ESimAccessAPI = Depends(get_provider),
         db: Session = Depends(get_db),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
     ) -> dict[str, Any]:
         provider_response = await provider.cancel_profile(payload.provider_request)
 
@@ -2625,7 +2640,7 @@ def register_esim_access_routes(
     async def suspend_profile(
         payload: ICCIDRequest,
         provider: ESimAccessAPI = Depends(get_provider),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
     ) -> ESimAccessResponse[EmptyResult]:
         return await provider.suspend_profile(payload)
 
@@ -2634,7 +2649,7 @@ def register_esim_access_routes(
         payload: ManagedIccidActionPayload,
         provider: ESimAccessAPI = Depends(get_provider),
         db: Session = Depends(get_db),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
     ) -> dict[str, Any]:
         provider_response = await provider.suspend_profile(payload.provider_request)
 
@@ -2656,7 +2671,7 @@ def register_esim_access_routes(
     async def unsuspend_profile(
         payload: ICCIDRequest,
         provider: ESimAccessAPI = Depends(get_provider),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
     ) -> ESimAccessResponse[EmptyResult]:
         return await provider.unsuspend_profile(payload)
 
@@ -2665,7 +2680,7 @@ def register_esim_access_routes(
         payload: ManagedIccidActionPayload,
         provider: ESimAccessAPI = Depends(get_provider),
         db: Session = Depends(get_db),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
     ) -> dict[str, Any]:
         provider_response = await provider.unsuspend_profile(payload.provider_request)
 
@@ -2687,7 +2702,7 @@ def register_esim_access_routes(
     async def revoke_profile(
         payload: ICCIDRequest,
         provider: ESimAccessAPI = Depends(get_provider),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
     ) -> ESimAccessResponse[EmptyResult]:
         return await provider.revoke_profile(payload)
 
@@ -2696,7 +2711,7 @@ def register_esim_access_routes(
         payload: ManagedIccidActionPayload,
         provider: ESimAccessAPI = Depends(get_provider),
         db: Session = Depends(get_db),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
     ) -> dict[str, Any]:
         provider_response = await provider.revoke_profile(payload.provider_request)
 
@@ -2717,7 +2732,7 @@ def register_esim_access_routes(
     @app.post("/api/v1/esim-access/balance/query")
     async def query_balance(
         provider: ESimAccessAPI = Depends(get_provider),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
     ) -> ESimAccessResponse[BalanceResult]:
         return await provider.balance_query()
 
@@ -2726,7 +2741,7 @@ def register_esim_access_routes(
     async def top_up(
         payload: TopUpRequest,
         provider: ESimAccessAPI = Depends(get_provider),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
     ) -> Any:
         try:
             return await provider.top_up(payload)
@@ -2891,7 +2906,7 @@ def register_esim_access_routes(
     async def configure_webhook(
         payload: WebhookConfigRequest,
         provider: ESimAccessAPI = Depends(get_provider),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
     ) -> ESimAccessResponse[EmptyResult]:
         return await provider.set_webhook(payload)
 
@@ -2899,7 +2914,8 @@ def register_esim_access_routes(
     async def send_sms(
         payload: SendSmsRequest,
         provider: ESimAccessAPI = Depends(get_provider),
-        _: AdminUser = Depends(_require_admin_actor),
+        # SEC-3: sending SMS to a customer's eSIM is messaging, not order ops.
+        _: AdminUser = Depends(_require_permission("can_send_push")),
     ) -> ESimAccessResponse[EmptyResult]:
         return await provider.send_sms(payload)
 
@@ -2907,7 +2923,7 @@ def register_esim_access_routes(
     async def query_usage(
         payload: UsageCheckRequest,
         provider: ESimAccessAPI = Depends(get_provider),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
     ) -> ESimAccessResponse[UsageResult]:
         return await provider.usage_check(payload)
 
@@ -2916,7 +2932,7 @@ def register_esim_access_routes(
         payload: ManagedUsageSyncPayload,
         provider: ESimAccessAPI = Depends(get_provider),
         db: Session = Depends(get_db),
-        _: AdminUser = Depends(_require_admin_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
     ) -> dict[str, Any]:
         # Free the pool slot while waiting on upstream provider network latency.
         db.close()
@@ -3230,7 +3246,7 @@ def register_esim_access_routes(
     @app.get("/api/v1/admin/orders/detailed")
     def list_admin_orders_detailed(
         db: Session = Depends(get_db),
-        claims: dict[str, Any] = Depends(get_token_claims),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
         month: str | None = Query(default=None),
         limit: int = Query(default=500, ge=1, le=1000),
         offset: int = Query(default=0, ge=0),
@@ -3242,7 +3258,6 @@ def register_esim_access_routes(
         # worker thread instead. Filtering, counting and pagination happen in SQL
         # (with selectinload to avoid a joinedload cartesian blow-up) so we never
         # materialise the whole orders table in memory.
-        require_active_subject(db, claims=claims, subject_type="admin")
         ref = func.coalesce(CustomerOrder.booked_at, CustomerOrder.created_at)
         base = select(CustomerOrder)
         count_query = select(func.count()).select_from(CustomerOrder)

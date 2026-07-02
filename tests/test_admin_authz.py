@@ -554,6 +554,36 @@ class AdminAuthorizationTest(unittest.TestCase):
             self.assertEqual(allowed.status_code, 200, allowed.text)
             self.assertTrue(allowed.json()["user"]["isLoyalty"])
 
+    def test_version_info_put_requires_can_manage_content(self) -> None:
+        # SEC-3: publishing latestVersion drives the mandatory-update modal, so
+        # the PUT is content-gated; owner bypasses the flag entirely.
+        pricing_only = self._token("44444444-4444-4444-4444-444444444444", "+9647700000044")
+        content_admin = self._token("11111111-1111-1111-1111-111111111111", "+9647700000001")
+        owner = self._token("55555555-5555-5555-5555-555555555555", "+9647700000055")
+        with TestClient(create_app()) as client:
+            denied = client.put(
+                "/api/v1/admin/app/version-info",
+                headers=pricing_only,
+                json={"latestVersion": "9.9.9"},
+            )
+            self.assertEqual(denied.status_code, 403)
+
+            allowed = client.put(
+                "/api/v1/admin/app/version-info",
+                headers=content_admin,
+                json={"latestVersion": "2.0.0"},
+            )
+            self.assertEqual(allowed.status_code, 200, allowed.text)
+            self.assertEqual(allowed.json()["latestVersion"], "2.0.0")
+
+            owner_ok = client.put(
+                "/api/v1/admin/app/version-info",
+                headers=owner,
+                json={"latestVersion": "2.0.1"},
+            )
+            self.assertEqual(owner_ok.status_code, 200, owner_ok.text)
+            self.assertEqual(owner_ok.json()["latestVersion"], "2.0.1")
+
     def test_users_save_omitted_email_preserves_stored_email(self) -> None:
         # M2: a profile save without the email field must not wipe the address.
         token = create_access_token(
