@@ -1903,6 +1903,13 @@ async def _verify_fib_payment_for_managed_topup(
     return attempt_id
 
 
+# The eSIM Access webhook-save API accepts a bare URL only (WebhookConfigRequest
+# — no custom headers), so the secret necessarily travels in the URL path/query.
+# Log that once per process as a reminder to keep the URL treated as a
+# credential (scrubbed logs, periodic rotation) — not on every event.
+_url_secret_noted = False
+
+
 def _require_valid_esim_webhook_secret(
     *,
     header_secret: str | None,
@@ -1910,6 +1917,7 @@ def _require_valid_esim_webhook_secret(
     query_secret: str | None,
     path_secret: str | None = None,
 ) -> None:
+    global _url_secret_noted
     configured_secret = str(get_settings().esim_access_webhook_secret or "").strip()
     if not configured_secret:
         raise HTTPException(
@@ -1924,12 +1932,13 @@ def _require_valid_esim_webhook_secret(
     ]
     if not any(candidate and hmac.compare_digest(candidate, configured_secret) for candidate in candidates):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid eSIM Access webhook secret.")
-    # DEPRECATED: URL-borne secrets (path/query) end up in proxy/CDN/APM access
-    # logs. Accepted for provider-config compatibility, but reconfigure the
-    # webhook to send the X-ESIM-ACCESS-WEBHOOK-SECRET header and remove these.
-    if not (header_secret or alternate_header_secret) and (query_secret or path_secret):
-        LOGGER.warning(
-            "esim_webhook.secret_via_url_deprecated: move the webhook secret to the header form"
+    if not _url_secret_noted and not (header_secret or alternate_header_secret) and (query_secret or path_secret):
+        _url_secret_noted = True
+        LOGGER.info(
+            "esim_webhook.secret_via_url: provider sends the secret in the URL "
+            "(its webhook API takes a bare URL, no headers) — treat the webhook "
+            "URL as a credential: scrub URLs from access logs and rotate "
+            "ESIM_ACCESS_WEBHOOK_SECRET periodically."
         )
 
 
