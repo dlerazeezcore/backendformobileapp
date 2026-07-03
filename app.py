@@ -106,6 +106,17 @@ def _get_cors_allow_origin_regex() -> str | None:
     configured = os.getenv("CORS_ALLOW_ORIGIN_REGEX")
     if configured is not None:
         stripped = configured.strip()
+        # With allow_credentials=True a loose regex enables credentialed
+        # cross-origin reads. An unanchored pattern is the classic foot-gun
+        # ("https://app.example.com" also matches "https://app.example.com.evil.io"),
+        # so demand explicit ^...$ anchoring and warn loudly when it's missing.
+        if stripped and (not stripped.startswith("^") or not stripped.endswith("$")):
+            logging.getLogger("uvicorn.error").warning(
+                "CORS_ALLOW_ORIGIN_REGEX is not anchored (^...$): %r. "
+                "Unanchored patterns can match attacker-controlled origins under "
+                "allow_credentials=True — anchor the pattern explicitly.",
+                stripped,
+            )
         return stripped or None
     return DEFAULT_CORS_ALLOW_ORIGIN_REGEX
 
@@ -218,6 +229,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 default_status_callback_url=cfg.fib_payment_status_callback_url,
                 default_redirect_uri=cfg.fib_payment_redirect_uri,
                 webhook_secret=fib_webhook_secret,
+                webhook_allow_plaintext_secret=cfg.fib_webhook_allow_plaintext_secret,
             )
             if not fib_webhook_secret:
                 LOGGER.info(

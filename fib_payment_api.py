@@ -22,6 +22,24 @@ from supabase_store import AdminUser, AppUser, PaymentAttempt, SupabaseStore, pa
 
 logger = logging.getLogger(__name__)
 
+# One-time migration note (same log-once policy as the eSIM webhook URL-secret
+# note): fires the first time a webhook authenticates via the plaintext
+# X-FIB-WEBHOOK-SECRET header alone, so operators can see whether the HMAC
+# migration (then FIB_WEBHOOK_ALLOW_PLAINTEXT_SECRET=false) is still pending.
+_plaintext_webhook_auth_noted = False
+
+
+def _note_plaintext_webhook_auth_once() -> None:
+    global _plaintext_webhook_auth_noted
+    if _plaintext_webhook_auth_noted:
+        return
+    _plaintext_webhook_auth_noted = True
+    logger.info(
+        "FIB webhook authenticated via plaintext X-FIB-WEBHOOK-SECRET header (no HMAC signature). "
+        "Consider migrating the caller to the HMAC-over-body signature and setting "
+        "FIB_WEBHOOK_ALLOW_PLAINTEXT_SECRET=false."
+    )
+
 
 class FIBPaymentError(Exception):
     pass
@@ -165,6 +183,7 @@ class FIBPaymentAPI:
         default_status_callback_url: str | None = None,
         default_redirect_uri: str | None = None,
         webhook_secret: str | None = None,
+        webhook_allow_plaintext_secret: bool = True,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.client_id = client_id
@@ -172,6 +191,7 @@ class FIBPaymentAPI:
         self.default_status_callback_url = default_status_callback_url
         self.default_redirect_uri = default_redirect_uri
         self.webhook_secret = webhook_secret
+        self.webhook_allow_plaintext_secret = webhook_allow_plaintext_secret
         self.rate_limiter = AsyncRateLimiter(rate_limit_per_second)
         self.client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
@@ -1419,13 +1439,30 @@ def register_fib_payment_routes(
                 message="FIB webhook secret is not configured on this deployment.",
             )
         if provider.webhook_secret:
+            # Replay note (audit M4): the HMAC binds auth to the body, but FIB's
+            # callback payload carries no timestamp/nonce we could bound
+            # freshness on ({"id", "status"} only), so a captured signed body
+            # stays technically replayable. Impact is contained by (a) the
+            # per-(payment, status) idempotency key below and (b) finalization
+            # independently re-polling FIB server-side. Tightening further needs
+            # FIB to add a signed timestamp header — provider-side coordination.
             expected = hmac.new(provider.webhook_secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
             signature = _extract_webhook_signature({k.lower(): v for k, v in request.headers.items()})
+            # Plaintext-secret auth is a static bearer value with none of the
+            # body-binding the HMAC gives (audit M5). It stays available behind
+            # FIB_WEBHOOK_ALLOW_PLAINTEXT_SECRET (default on — it is the
+            # currently-deployed path) so it can be retired by config once the
+            # caller sends the HMAC signature.
+            allow_plaintext = bool(getattr(provider, "webhook_allow_plaintext_secret", True))
             secret_matches = bool(
-                x_fib_webhook_secret and hmac.compare_digest(x_fib_webhook_secret, provider.webhook_secret)
+                allow_plaintext
+                and x_fib_webhook_secret
+                and hmac.compare_digest(x_fib_webhook_secret, provider.webhook_secret)
             )
             signature_matches = bool(signature and hmac.compare_digest(signature, expected))
             signature_valid = secret_matches or signature_matches
+            if secret_matches and not signature_matches:
+                _note_plaintext_webhook_auth_once()
             if not signature_valid:
                 return _error_response(
                     status_code=status.HTTP_401_UNAUTHORIZED,

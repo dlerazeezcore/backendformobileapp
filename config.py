@@ -68,6 +68,13 @@ class Settings(BaseSettings):
     fib_payment_client_id: str | None = Field(default=None, alias="FIB_PAYMENT_CLIENT_ID")
     fib_payment_client_secret: str | None = Field(default=None, alias="FIB_PAYMENT_CLIENT_SECRET")
     fib_payment_webhook_secret: str | None = Field(default=None, alias="FIB_PAYMENT_WEBHOOK_SECRET")
+    # Accept the raw secret echoed in X-FIB-WEBHOOK-SECRET as webhook auth.
+    # Default True (it is the currently-deployed auth path); set False once the
+    # caller is migrated to the HMAC-over-body signature, which binds the auth
+    # to the payload instead of being a static replayable bearer value.
+    fib_webhook_allow_plaintext_secret: bool = Field(
+        default=True, alias="FIB_WEBHOOK_ALLOW_PLAINTEXT_SECRET"
+    )
     fib_payment_base_url: str = Field(default=DEFAULT_FIB_PAYMENT_BASE_URL, alias="FIB_PAYMENT_BASE_URL")
     fib_payment_status_callback_url: str = Field(
         default=DEFAULT_FIB_PAYMENT_STATUS_CALLBACK_URL, alias="FIB_PAYMENT_STATUS_CALLBACK_URL"
