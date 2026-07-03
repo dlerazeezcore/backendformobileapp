@@ -2262,7 +2262,7 @@ def register_esim_access_routes(
     ) -> dict[str, Any]:
         # Synchronous auth + snapshot + session release: offload to a worker
         # thread so the blocking DB read does not run on the event loop.
-        def _prepare_managed_order() -> tuple[dict[str, Any], str]:
+        def _prepare_managed_order() -> tuple[dict[str, Any], str, str]:
             auth_user = require_active_subject(db, claims=claims, subject_type="user")
             assert isinstance(auth_user, AppUser)
             # Loyalty is a comped payment method reserved for loyalty (VIP/staff)
@@ -2336,6 +2336,34 @@ def register_esim_access_routes(
                     payload.provider_request.transaction_id,
                 )
             raise
+        if not bool(getattr(provider_response, "success", True)):
+            # Provider rejected the order WITHOUT raising (defense-in-depth —
+            # the real client raises on non-success, but the top-up path
+            # defends against soft failures and this path must too, or a
+            # rejected order would be persisted and the verified payment
+            # consumed with no activation data behind it (audit M2). Free the
+            # claim and let the global ESimAccessAPIError handler shape the
+            # error response.
+            if verified_attempt_id is not None:
+                await asyncio.to_thread(
+                    _release_order_claim,
+                    db,
+                    verified_attempt_id,
+                    payload.provider_request.transaction_id,
+                )
+            soft_error_code = getattr(provider_response, "error_code", None)
+            soft_error_msg = getattr(provider_response, "error_msg", None)
+            raise ESimAccessAPIError(
+                error_code=(
+                    str(soft_error_code)
+                    if soft_error_code not in (None, "")
+                    else "ESIM_ORDER_PROVIDER_REJECTED"
+                ),
+                error_message=soft_error_msg,
+                status_code=None,
+                provider_message=soft_error_msg,
+                request_id=None,
+            )
         provider_request_payload = payload.provider_request.model_dump(by_alias=True, exclude_none=True)
         provider_response_payload = provider_response.model_dump(by_alias=True, exclude_none=True)
 
@@ -2868,8 +2896,28 @@ def register_esim_access_routes(
             raise
         if not bool(getattr(provider_response, "success", True)):
             # Provider rejected the top-up without raising — the payment was not
-            # spent; free it for a retry.
+            # spent; free it for a retry. Return a real error status as well:
+            # falling through to the 200 envelope made apiFetch clients read a
+            # failed top-up as success while the claim was already released
+            # (audit M1). Reusing build_topup_error_response keeps the error
+            # shape identical to the raising path, and the early return keeps a
+            # rejected top-up out of the sync_after_topup block (audit L10).
             await _release_claim_if_any()
+            soft_error_code = getattr(provider_response, "error_code", None)
+            soft_error_msg = getattr(provider_response, "error_msg", None)
+            return build_topup_error_response(
+                ESimAccessAPIError(
+                    error_code=(
+                        str(soft_error_code)
+                        if soft_error_code not in (None, "")
+                        else "ESIM_TOPUP_PROVIDER_REJECTED"
+                    ),
+                    error_message=soft_error_msg,
+                    status_code=None,
+                    provider_message=soft_error_msg,
+                    request_id=None,
+                )
+            )
         profiles_synced = 0
         usage_records_synced = 0
         if payload.sync_after_topup:

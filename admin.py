@@ -512,6 +512,9 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
                 if applied:
                     synced += 1
             except Exception as exc:  # pragma: no cover - resilience
+                # Keep the loop alive but preserve the full traceback in logs —
+                # the truncated string in `errors` is for the response only.
+                LOGGER.exception("admin.usage_refresh active-profile sync failed iccid=%s", iccid)
                 errors.append({"iccid": iccid, "error": str(exc)[:200]})
 
         for profile_id, order_no in broken_pairs:
@@ -538,6 +541,10 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
                 elif applied:
                     synced += 1
             except Exception as exc:  # pragma: no cover - resilience
+                LOGGER.exception(
+                    "admin.usage_refresh placeholder recovery failed profileId=%s orderNo=%s",
+                    profile_id, order_no,
+                )
                 errors.append({"profileId": profile_id, "orderNo": order_no, "error": str(exc)[:200]})
 
         return {
