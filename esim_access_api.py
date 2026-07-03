@@ -2166,6 +2166,14 @@ def register_esim_access_routes(
         if usage_sync_lock.locked():
             return {"enabled": True, "skipped": True, "reason": "sync already in progress"}
 
+        # Session lifecycle (audit L8): the early close() below is deliberate —
+        # it returns the pooled connection during the long provider round-trips,
+        # and SQLAlchemy re-begins transparently when _sync_usage_for_esim_tran_nos
+        # touches the same Session again (Session is a factory-scoped unit of
+        # work, not a raw connection). The second close() in `finally` is then a
+        # no-op-safe release. Do not "simplify" this into one close: holding the
+        # slot across the provider calls drains the pool (see pool sizing notes
+        # in create_managed_order).
         db = session_factory()
         try:
             esim_tran_nos = _list_all_esim_tran_nos(db)
