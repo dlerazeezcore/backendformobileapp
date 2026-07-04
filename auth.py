@@ -247,11 +247,29 @@ def _is_row_active(row: AppUser | AdminUser) -> bool:
     return row.status == "active" and row.deleted_at is None and row.blocked_at is None
 
 
+def _stamp_app_version(db: Session, row: AppUser | AdminUser, reported_version: str | None) -> None:
+    """Record the app build a user is running (from the ``X-App-Version`` header).
+
+    AppUser only; writes ONLY when the value changed, so the common case stays
+    read-only. Called from ``/auth/me`` (fires on every launch) and from
+    ``require_active_subject`` (any authenticated user request), so the admin
+    panel's per-user version column fills in from normal app usage.
+    """
+    if not isinstance(row, AppUser):
+        return
+    reported = (reported_version or "").strip()[:32]
+    if reported and reported != (row.app_version or ""):
+        row.app_version = reported
+        row.app_version_updated_at = utcnow()
+        db.commit()
+
+
 def require_active_subject(
     db: Session,
     *,
     claims: dict[str, Any],
     subject_type: str | None = None,
+    app_version: str | None = None,
 ) -> AppUser | AdminUser:
     token_subject_type = claims.get("typ")
     subject_id = claims.get("sub")
@@ -273,6 +291,8 @@ def require_active_subject(
         raise _api_error(status.HTTP_401_UNAUTHORIZED, "AUTH_SUBJECT_NOT_FOUND", "Auth subject not found")
     if not _is_row_active(row):
         raise _api_error(status.HTTP_403_FORBIDDEN, "AUTH_SUBJECT_INACTIVE", "Inactive account")
+    if app_version is not None:
+        _stamp_app_version(db, row, app_version)
     return row
 
 
@@ -925,13 +945,8 @@ def register_auth_routes(
         if row is None:
             raise _api_error(status.HTTP_401_UNAUTHORIZED, "AUTH_SUBJECT_NOT_FOUND", "Auth subject not found")
         # Stamp the app build this user is running (sent by the client on every
-        # request; /auth/me fires on each launch). Write only on change so the
-        # common case stays read-only.
-        reported_version = (x_app_version or "").strip()[:32]
-        if reported_version and reported_version != (row.app_version or ""):
-            row.app_version = reported_version
-            row.app_version_updated_at = utcnow()
-            db.commit()
+        # request; /auth/me fires on each launch). Write only on change.
+        _stamp_app_version(db, row, x_app_version)
         return {
             "subjectType": "user",
             "id": row.id,

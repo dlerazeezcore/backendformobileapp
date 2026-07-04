@@ -3378,10 +3378,13 @@ def register_esim_access_routes(
         installed: bool | None = Query(default=None),
         user_id: str | None = Query(default=None, alias="userId"),
         include_terminal: bool = Query(default=False, alias="includeTerminal"),
+        x_app_version: str | None = Header(default=None, alias="X-App-Version"),
     ) -> dict[str, Any]:
         # Plain `def`: all work below is synchronous SQLAlchemy/serialization, so
         # FastAPI runs it in a worker thread instead of blocking the event loop.
-        actor = require_active_subject(db, claims=claims)
+        # Opportunistically record the running app build (this is the most-hit
+        # authenticated user endpoint) — see auth._stamp_app_version.
+        actor = require_active_subject(db, claims=claims, app_version=x_app_version)
         target_user_id = _resolve_target_user_id(actor=actor, claims=claims, requested_user_id=user_id)
         store = SupabaseStore(db)
         profile_data = _serialize_profiles_for_user(

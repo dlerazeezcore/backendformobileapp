@@ -79,6 +79,16 @@ class PricingRulePayload(BaseModel):
     notes: str | None = None
     custom_fields: dict[str, Any] = Field(default_factory=dict, alias="customFields")
 
+    @field_validator("adjustment_type")
+    @classmethod
+    def _validate_adjustment_type(cls, v: str) -> str:
+        # percent = % on top of cost · fixed = flat amount ADDED to cost ·
+        # absolute = the exact final sale price (see supabase_store pricing engine).
+        normalized = (v or "").strip().lower()
+        if normalized not in {"percent", "fixed", "absolute"}:
+            raise ValueError("adjustmentType must be one of: percent, fixed, absolute")
+        return normalized
+
 
 class DiscountRulePayload(BaseModel):
     service_type: str = Field(default="esim", alias="serviceType")

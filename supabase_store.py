@@ -2578,24 +2578,33 @@ class SupabaseStore:
             at_time=now,
         )
         pricing_basis_minor = converted_provider_price_minor
+        subtotal_minor = converted_provider_price_minor
         markup_minor = 0
-        if pricing_rule is not None:
-            markup_minor = self._calculate_adjustment_minor(
-                adjustment_type=pricing_rule.adjustment_type,
-                adjustment_value=pricing_rule.adjustment_value,
-                basis_minor=pricing_basis_minor,
-            )
+        # An 'absolute' pricing rule sets an EXACT sale price (in sale-currency minor
+        # units) chosen by the admin. It replaces provider-cost + markup entirely and
+        # is NOT 250-rounded, so the exact price the admin typed is what shows and is
+        # charged. (Contrast: 'fixed' ADDS a flat amount to cost; 'percent' scales it.)
+        is_absolute_price = pricing_rule is not None and pricing_rule.adjustment_type == "absolute"
+        if is_absolute_price:
+            total_before_discount_minor = max(int(round(pricing_rule.adjustment_value)), 0)
+            markup_minor = max(total_before_discount_minor - subtotal_minor, 0)  # implied delta, for audit only
         else:
-            # No explicit pricing rule: apply the configured exchange-rate markup.
-            markup_percent = self._markup_percent_from_exchange(rate_row)
-            if markup_percent > 0:
+            if pricing_rule is not None:
                 markup_minor = self._calculate_adjustment_minor(
-                    adjustment_type="percent",
-                    adjustment_value=markup_percent,
+                    adjustment_type=pricing_rule.adjustment_type,
+                    adjustment_value=pricing_rule.adjustment_value,
                     basis_minor=pricing_basis_minor,
                 )
-        subtotal_minor = converted_provider_price_minor
-        total_before_discount_minor = subtotal_minor + markup_minor
+            else:
+                # No explicit pricing rule: apply the configured exchange-rate markup.
+                markup_percent = self._markup_percent_from_exchange(rate_row)
+                if markup_percent > 0:
+                    markup_minor = self._calculate_adjustment_minor(
+                        adjustment_type="percent",
+                        adjustment_value=markup_percent,
+                        basis_minor=pricing_basis_minor,
+                    )
+            total_before_discount_minor = subtotal_minor + markup_minor
         discount_rule = self.get_best_discount_rule(
             service_type="esim",
             package_code=package_code or package_info.get("packageCode"),
@@ -2614,8 +2623,9 @@ class SupabaseStore:
                 basis_minor=discount_basis_minor,
             )
         computed_sale_price_minor = max(total_before_discount_minor - discount_minor, 0)
-        # Consumer IQD prices are rounded to the nearest 250 dinars.
-        if (sale_currency_code or "").upper() == "IQD":
+        # Consumer IQD prices are rounded to the nearest 250 dinars — EXCEPT an
+        # 'absolute' exact price, which must display/charge exactly as entered.
+        if (sale_currency_code or "").upper() == "IQD" and not is_absolute_price:
             computed_sale_price_minor = round_to_step(computed_sale_price_minor, IQD_ROUNDING_STEP)
         # Server-authoritative pricing: the server-computed IQD price is the source of
         # truth so a tampered client cannot underpay. The client-supplied salePriceMinor
@@ -3907,17 +3917,22 @@ class SupabaseStore:
             country = (item.get("countryCode") or None)
             converted = int(round((provider_minor / ESIM_ACCESS_PRICE_UNIT) * rate))
             rule = _best_scoped_rule(pricing_rules, package_code=pkg, country_code=country, provider_code=provider_code)
-            if rule is not None:
-                markup_minor = self._calculate_adjustment_minor(
-                    adjustment_type=rule.adjustment_type, adjustment_value=rule.adjustment_value, basis_minor=converted
-                )
-            elif markup_fallback > 0:
-                markup_minor = self._calculate_adjustment_minor(
-                    adjustment_type="percent", adjustment_value=markup_fallback, basis_minor=converted
-                )
+            # 'absolute' = exact admin-set price: replaces cost+markup, not 250-rounded.
+            is_absolute = rule is not None and rule.adjustment_type == "absolute"
+            if is_absolute:
+                total_before_discount = max(int(round(rule.adjustment_value)), 0)
             else:
-                markup_minor = 0
-            total_before_discount = converted + markup_minor
+                if rule is not None:
+                    markup_minor = self._calculate_adjustment_minor(
+                        adjustment_type=rule.adjustment_type, adjustment_value=rule.adjustment_value, basis_minor=converted
+                    )
+                elif markup_fallback > 0:
+                    markup_minor = self._calculate_adjustment_minor(
+                        adjustment_type="percent", adjustment_value=markup_fallback, basis_minor=converted
+                    )
+                else:
+                    markup_minor = 0
+                total_before_discount = converted + markup_minor
             drule = _best_scoped_rule(discount_rules, package_code=pkg, country_code=country, provider_code=provider_code)
             discount_minor = 0
             if drule is not None:
@@ -3926,7 +3941,7 @@ class SupabaseStore:
                     adjustment_type=drule.discount_type, adjustment_value=drule.discount_value, basis_minor=basis
                 )
             sale = max(total_before_discount - discount_minor, 0)
-            if is_iqd:
+            if is_iqd and not is_absolute:
                 sale = round_to_step(sale, IQD_ROUNDING_STEP)
             out[pkg] = sale
         return out

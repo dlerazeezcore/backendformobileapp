@@ -351,6 +351,24 @@ class PublicUserSignupTest(unittest.TestCase):
                 row = session.scalar(select(AppUser).where(AppUser.phone == "+9647700000002"))
                 self.assertEqual(row.app_version, "1.5.0")
 
+    def test_profiles_my_also_stamps_app_version(self) -> None:
+        # Broadened capture: any authenticated user request stamps the build,
+        # not just /auth/me (require_active_subject wires it into profiles/my).
+        with TestClient(create_app()) as client:
+            login = client.post(
+                "/api/v1/auth/user/login",
+                json={"phone": "+9647700000002", "password": "StrongPass123"},
+            )
+            headers = {"Authorization": f"Bearer {login.json()['accessToken']}"}
+            resp = client.get(
+                "/api/v1/esim-access/profiles/my",
+                headers={**headers, "X-App-Version": "2.0.1"},
+            )
+            self.assertEqual(resp.status_code, 200)
+            with self.session_factory() as session:
+                row = session.scalar(select(AppUser).where(AppUser.phone == "+9647700000002"))
+                self.assertEqual(row.app_version, "2.0.1")
+
 
 if __name__ == "__main__":
     unittest.main()
