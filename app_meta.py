@@ -22,6 +22,14 @@ from auth import get_token_claims, require_active_subject
 from supabase_store import AdminUser, AppReleaseInfo, SupabaseStore, utcnow
 
 
+# Canonical production store listings. Used as the seed defaults for the
+# app_release_info singleton and backfilled onto existing rows by migration 0048,
+# so the in-app update modal and the app-update push always have a link on BOTH
+# stores (a missing iOS URL left iPhone users with a dead "Update now" button).
+DEFAULT_APP_STORE_URL = "https://apps.apple.com/us/app/tulip-booking/id6759516330"
+DEFAULT_PLAY_STORE_URL = "https://play.google.com/store/apps/details?id=com.theesim.app&hl=en-US"
+
+
 class _Model(BaseModel):
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
@@ -58,8 +66,8 @@ def _get_or_create(db: Session) -> AppReleaseInfo:
             id=1,
             latest_version="1.0.0",
             min_supported_version="1.0.0",
-            app_store_url="",
-            play_store_url="",
+            app_store_url=DEFAULT_APP_STORE_URL,
+            play_store_url=DEFAULT_PLAY_STORE_URL,
         )
         db.add(row)
         db.flush()

@@ -14,10 +14,20 @@ from config import read_bool_env
 # This is intentionally simple and process-local: each worker keeps its own
 # window state. It is meant as an abuse brake on unauthenticated endpoints,
 # not as a distributed quota system. Keys are namespaced by caller (e.g.
-# "otp:phone:<phone>" / "login:ip:<ip>") so independent limits do not collide.
+# "login:ip:<ip>") so independent limits do not collide.
 
 _LOCK = threading.Lock()
 _EVENTS: dict[str, deque[float]] = defaultdict(deque)
+
+# BE-3: opportunistic sweep to stop ``_EVENTS`` growing one dead key per distinct
+# phone/IP forever. Every distinct caller creates a bucket; once its events age
+# out the (now empty) key would otherwise linger indefinitely. We sweep drained
+# buckets periodically. ``_SWEEP_HORIZON_SECONDS`` MUST be >= the largest window
+# any caller passes to ``enforce_rate_limit`` (currently 3600s) so a live bucket
+# is never dropped mid-window.
+_SWEEP_EVERY_CALLS = 1024
+_SWEEP_HORIZON_SECONDS = 3600
+_calls_since_sweep = 0
 
 
 def _enabled() -> bool:
@@ -25,22 +35,43 @@ def _enabled() -> bool:
     return read_bool_env("RATE_LIMIT_ENABLED", True)
 
 
+def _test_bypass_active() -> bool:
+    """SEC-7: the limiter no-ops under pytest so the suite can hammer endpoints
+    without tripping 429s. Gate that bypass behind an explicit, overridable flag
+    (default on, but only under pytest) so a production process can never be
+    silently un-limited just because ``PYTEST_CURRENT_TEST`` leaked into its env.
+    """
+    if not os.environ.get("PYTEST_CURRENT_TEST"):
+        return False
+    return read_bool_env("RATE_LIMIT_BYPASS_IN_TESTS", True)
+
+
 def reset() -> None:
     """Clear all recorded events. Intended for tests."""
+    global _calls_since_sweep
     with _LOCK:
         _EVENTS.clear()
+        _calls_since_sweep = 0
+
+
+def _sweep_stale_buckets_locked(now: float) -> None:
+    """Drop buckets that can no longer affect a decision: empty ones, or ones
+    whose most recent event is older than the sweep horizon. Caller holds _LOCK."""
+    horizon = now - _SWEEP_HORIZON_SECONDS
+    stale_keys = [key for key, bucket in _EVENTS.items() if not bucket or bucket[-1] <= horizon]
+    for key in stale_keys:
+        del _EVENTS[key]
 
 
 def enforce_rate_limit(key: str, max_events: int, window_seconds: int) -> None:
     """Record one event for ``key`` and raise HTTP 429 when the sliding window
     has more than ``max_events`` events within ``window_seconds``.
 
-    No-op under pytest (so the existing suite stays green) and when the
-    RATE_LIMIT_ENABLED flag is disabled.
+    No-op under the pytest test-bypass flag (so the existing suite stays green)
+    and when the RATE_LIMIT_ENABLED flag is disabled.
     """
-    # Skip entirely while the test suite is running so existing tests that hit
-    # these endpoints repeatedly do not start failing with 429s.
-    if os.environ.get("PYTEST_CURRENT_TEST"):
+    global _calls_since_sweep
+    if _test_bypass_active():
         return
     if not _enabled():
         return
@@ -61,3 +92,8 @@ def enforce_rate_limit(key: str, max_events: int, window_seconds: int) -> None:
                 headers={"Retry-After": str(retry_after)},
             )
         bucket.append(now)
+
+        _calls_since_sweep += 1
+        if _calls_since_sweep >= _SWEEP_EVERY_CALLS:
+            _calls_since_sweep = 0
+            _sweep_stale_buckets_locked(now)

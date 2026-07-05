@@ -17,7 +17,6 @@ DEFAULT_FIB_PAYMENT_STATUS_CALLBACK_URL = (
     "https://mean-lettie-corevia-0bd7cc91.koyeb.app/api/v1/payments/fib/webhook"
 )
 DEFAULT_FIB_PAYMENT_REDIRECT_URI = "tulip://payment/result"
-DEFAULT_TWILIO_VERIFY_BASE_URL = "https://verify.twilio.com"
 
 
 # ---------------------------------------------------------------------------
@@ -69,11 +68,14 @@ class Settings(BaseSettings):
     fib_payment_client_secret: str | None = Field(default=None, alias="FIB_PAYMENT_CLIENT_SECRET")
     fib_payment_webhook_secret: str | None = Field(default=None, alias="FIB_PAYMENT_WEBHOOK_SECRET")
     # Accept the raw secret echoed in X-FIB-WEBHOOK-SECRET as webhook auth.
-    # Default True (it is the currently-deployed auth path); set False once the
-    # caller is migrated to the HMAC-over-body signature, which binds the auth
-    # to the payload instead of being a static replayable bearer value.
+    # Default False → the webhook accepts ONLY the HMAC-over-body signature (which
+    # binds auth to the payload) and rejects the static, replayable plaintext
+    # bearer. Set FIB_WEBHOOK_ALLOW_PLAINTEXT_SECRET=true to re-enable the
+    # plaintext path if FIB still calls the webhook with the raw secret.
+    # NOTE: this ONLY governs webhook-callback auth. FIB payment create + confirm
+    # run via server-side polling and are UNAFFECTED by this flag.
     fib_webhook_allow_plaintext_secret: bool = Field(
-        default=True, alias="FIB_WEBHOOK_ALLOW_PLAINTEXT_SECRET"
+        default=False, alias="FIB_WEBHOOK_ALLOW_PLAINTEXT_SECRET"
     )
     fib_payment_base_url: str = Field(default=DEFAULT_FIB_PAYMENT_BASE_URL, alias="FIB_PAYMENT_BASE_URL")
     fib_payment_status_callback_url: str = Field(
@@ -86,10 +88,6 @@ class Settings(BaseSettings):
     database_url: str = Field(default="sqlite:///./esim_access.db", alias="DATABASE_URL")
     auth_secret_key: str = Field(default=DEFAULT_AUTH_SECRET_KEY, alias="AUTH_SECRET_KEY")
     auth_token_ttl_seconds: int = Field(default=DEFAULT_AUTH_TOKEN_TTL_SECONDS, alias="AUTH_TOKEN_TTL_SECONDS")
-    twilio_account_sid: str | None = Field(default=None, alias="TWILIO_ACCOUNT_SID")
-    twilio_auth_token: str | None = Field(default=None, alias="TWILIO_AUTH_TOKEN")
-    twilio_verify_service_sid: str | None = Field(default=None, alias="TWILIO_VERIFY_SERVICE_SID")
-    twilio_verify_base_url: str = Field(default=DEFAULT_TWILIO_VERIFY_BASE_URL, alias="TWILIO_VERIFY_BASE_URL")
     wings_auth_token: str | None = Field(default=None, alias="WINGS_AUTH_TOKEN")
     wings_base_url: str = Field(default="https://wings.laveen-air.com/RIAM_main/rest/api", alias="WINGS_BASE_URL")
     wings_search_url: str | None = Field(default=None, alias="WINGS_SEARCH_URL")

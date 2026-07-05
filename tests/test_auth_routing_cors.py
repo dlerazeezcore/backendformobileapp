@@ -42,36 +42,30 @@ class AuthRoutingCorsTest(unittest.TestCase):
         get_settings.cache_clear()
 
     def test_canonical_auth_routes_exist(self) -> None:
-        otp_request = self.client.post("/api/v1/auth/user/otp/request", json={"phone": "+9647507343635"})
-        self.assertNotIn(otp_request.status_code, {404, 405})
-
         signup = self.client.post(
             "/api/v1/auth/user/signup",
-            json={"phone": "+9647507343635", "name": "Test User", "otpCode": "123456"},
+            json={"phone": "+9647507343635", "name": "Test User", "password": "StrongPass123"},
         )
         self.assertNotIn(signup.status_code, {404, 405})
 
-        login = self.client.post("/api/v1/auth/user/login", json={"phone": "+9647507343635", "otpCode": "123456"})
-        self.assertNotEqual(login.status_code, 405)
-
-        forgot_reset = self.client.post(
-            "/api/v1/auth/user/password/forgot/reset",
-            json={"phone": "+9647507343635", "otpCode": "123456", "newPassword": "StrongPass123"},
+        login = self.client.post(
+            "/api/v1/auth/user/login",
+            json={"phone": "+9647507343635", "password": "StrongPass123"},
         )
-        self.assertNotIn(forgot_reset.status_code, {404, 405})
+        self.assertNotEqual(login.status_code, 405)
 
         auth_me = self.client.get("/api/v1/auth/me")
         self.assertEqual(auth_me.status_code, 401)
 
     def test_duplicate_prefix_returns_clear_404(self) -> None:
-        response = self.client.post("/api/v1/api/v1/auth/user/otp/request", json={"phone": "+9647507343635"})
+        response = self.client.post("/api/v1/api/v1/auth/user/login", json={"phone": "+9647507343635"})
         self.assertEqual(response.status_code, 404)
         self.assertIn("detail", response.json())
         self.assertIn("duplicate '/api/v1' prefix", str(response.json()["detail"]))
 
     def test_auth_preflight_cors_allows_required_methods_and_headers(self) -> None:
         response = self.client.options(
-            "/api/v1/auth/user/otp/request",
+            "/api/v1/auth/user/login",
             headers={
                 "Origin": "http://localhost:3000",
                 "Access-Control-Request-Method": "POST",
@@ -90,7 +84,7 @@ class AuthRoutingCorsTest(unittest.TestCase):
 
     def test_auth_preflight_allows_production_web_origin(self) -> None:
         response = self.client.options(
-            "/api/v1/auth/user/otp/request",
+            "/api/v1/auth/user/login",
             headers={
                 "Origin": "https://tulipbookings.com",
                 "Access-Control-Request-Method": "POST",
@@ -103,7 +97,7 @@ class AuthRoutingCorsTest(unittest.TestCase):
 
     def test_auth_preflight_rejects_unknown_origin(self) -> None:
         response = self.client.options(
-            "/api/v1/auth/user/otp/request",
+            "/api/v1/auth/user/login",
             headers={
                 "Origin": "https://evil.example.com",
                 "Access-Control-Request-Method": "POST",

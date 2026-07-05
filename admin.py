@@ -667,16 +667,14 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
             .where(ESimProfile.order_item_id.is_(None))
         ) or 0
 
-        recent_order_items = db.scalars(
-            _select(OrderItem)
+        # BE-8: single anti-join instead of one COUNT per recent order item.
+        orders_without_profile = db.scalar(
+            _select(func.count(OrderItem.id))
+            .outerjoin(ESimProfile, ESimProfile.order_item_id == OrderItem.id)
             .where(OrderItem.service_type == "esim")
             .where(OrderItem.created_at >= now - timedelta(days=30))
-        ).all()
-        orders_without_profile = 0
-        for oi in recent_order_items:
-            has_profile = db.scalar(_select(func.count(ESimProfile.id)).where(ESimProfile.order_item_id == oi.id)) or 0
-            if has_profile == 0:
-                orders_without_profile += 1
+            .where(ESimProfile.id.is_(None))
+        ) or 0
 
         # Lifecycle event totals
         total_events = db.scalar(_select(func.count(ESimLifecycleEvent.id))) or 0

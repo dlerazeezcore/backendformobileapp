@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-import inspect
 import logging
 import os
 from pathlib import Path
@@ -33,7 +32,7 @@ from config import (
     read_bool_env as _read_bool_env,
     read_float_env as _read_float_env,
 )
-from dependencies import get_db, get_fib_provider, get_provider, get_push_provider, get_twilio_provider
+from dependencies import get_db, get_fib_provider, get_provider, get_push_provider
 from esim_access_api import (
     ESimAccessAPI,
     ESimAccessAPIError,
@@ -49,7 +48,6 @@ from fib_payment_api import (
 )
 from push_notification import PushNotificationService, register_push_notification_routes
 from supabase_store import create_database
-from twilio_whatsapp import TwilioVerifyAPIError, TwilioVerifyHTTPError, TwilioWhatsAppVerifyAPI
 from users import register_user_routes
 from wings_api import register_wings_routes
 
@@ -82,8 +80,6 @@ DEFAULT_CORS_ALLOW_ORIGIN_REGEX: str | None = None
 FIB_PAYMENT_TIMEOUT_SECONDS = 30.0
 FIB_PAYMENT_RATE_LIMIT_PER_SECOND = 8.0
 PUSH_NOTIFICATION_DEFAULT_CHANNEL_ID = "general"
-TWILIO_VERIFY_TIMEOUT_SECONDS = 20.0
-TWILIO_VERIFY_RATE_LIMIT_PER_SECOND = 5.0
 # Optional hardcoded fallback when env var is not set.
 FIB_PAYMENT_WEBHOOK_SECRET: str | None = None
 LOGGER = logging.getLogger("uvicorn.error")
@@ -242,16 +238,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             service_account_json=cfg.firebase_service_account_json,
             default_channel_id=cfg.push_notification_default_channel_id or PUSH_NOTIFICATION_DEFAULT_CHANNEL_ID,
         )
-        app.state.twilio_whatsapp_api = None
-        if cfg.twilio_account_sid and cfg.twilio_auth_token and cfg.twilio_verify_service_sid:
-            app.state.twilio_whatsapp_api = TwilioWhatsAppVerifyAPI(
-                account_sid=cfg.twilio_account_sid,
-                auth_token=cfg.twilio_auth_token,
-                verify_service_sid=cfg.twilio_verify_service_sid,
-                base_url=cfg.twilio_verify_base_url,
-                timeout=TWILIO_VERIFY_TIMEOUT_SECONDS,
-                rate_limit_per_second=TWILIO_VERIFY_RATE_LIMIT_PER_SECOND,
-            )
         # BE-1: start the background eSIM usage-sync worker here (replaces the
         # deprecated @app.on_event("startup") handler in esim_access_api).
         start_usage_sync = getattr(app.state, "start_esim_usage_sync_worker", None)
@@ -265,13 +251,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await app.state.esim_access_api.close()
         if app.state.fib_payment_api is not None:
             await app.state.fib_payment_api.close()
-        twilio_provider = getattr(app.state, "twilio_whatsapp_api", None)
-        if twilio_provider is not None:
-            close_method = getattr(twilio_provider, "close", None)
-            if callable(close_method):
-                close_result = close_method()
-                if inspect.isawaitable(close_result):
-                    await close_result
         db_session_factory = getattr(app.state, "db_session_factory", None)
         db_engine = getattr(db_session_factory, "kw", {}).get("bind") if db_session_factory is not None else None
         if db_engine is not None:
@@ -440,36 +419,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             },
         )
 
-    @app.exception_handler(TwilioVerifyHTTPError)
-    async def handle_twilio_http_error(request: Request, exc: TwilioVerifyHTTPError) -> JSONResponse:
-        _ = request
-        return JSONResponse(
-            status_code=502,
-            content={
-                "detail": str(exc),
-                "errorCode": "TWILIO_VERIFY_UPSTREAM_UNAVAILABLE",
-                "errorMessage": "Unable to reach Twilio Verify provider.",
-            },
-        )
-
-    @app.exception_handler(TwilioVerifyAPIError)
-    async def handle_twilio_api_error(request: Request, exc: TwilioVerifyAPIError) -> JSONResponse:
-        _ = request
-        mapped_status = exc.status_code if 400 <= exc.status_code < 600 else 502
-        # BE-2: log the raw provider payload server-side only; don't leak it.
-        LOGGER.warning(
-            "Twilio Verify API error (status=%s, code=%s): %s payload=%r",
-            exc.status_code, exc.error_code, exc.error_message, exc.payload,
-        )
-        return JSONResponse(
-            status_code=mapped_status,
-            content={
-                "detail": str(exc),
-                "errorCode": exc.error_code or "TWILIO_VERIFY_ERROR",
-                "errorMessage": exc.error_message or "Twilio Verify request failed.",
-            },
-        )
-
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
@@ -517,7 +466,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return Response(status_code=204)
 
     register_user_routes(app, get_db)
-    register_auth_routes(app, get_db, get_twilio_provider)
+    register_auth_routes(app, get_db)
     register_esim_access_routes(app, get_db, get_provider)
     register_fib_payment_routes(app, get_fib_provider, get_db)
     register_push_notification_routes(app, get_push_provider, get_db)

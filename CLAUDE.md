@@ -2,7 +2,7 @@
 
 Workspace with two independently-versioned apps:
 - `tulip-booking/` — Expo / React Native (+ Web), TypeScript, expo-router, zustand, i18n.
-- `Backend/` — FastAPI + SQLAlchemy + Alembic, Supabase/Postgres, eSIM / FIB / Twilio / Firebase / WINGS integrations.
+- `Backend/` — FastAPI + SQLAlchemy + Alembic, Supabase/Postgres, eSIM / FIB / Firebase / WINGS integrations.
 
 > This file is duplicated in both repos so the conventions travel with whichever repo you clone.
 

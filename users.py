@@ -288,7 +288,10 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
                         if column.name != "password_hash"
                     }
                 )
-            rows = filtered[offset : offset + max(1, min(limit, 500))]
+            # BE-9: a non-admin only ever sees their own single row, so `offset`
+            # would just drop it (and zero the count) for any offset >= 1. Ignore
+            # offset in the self-scoped branch and always return the row.
+            rows = filtered[: max(1, min(limit, 500))]
         normalized_rows = []
         for row in rows:
             user_id = row.get("id")

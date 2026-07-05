@@ -22,16 +22,12 @@ from config import get_settings, read_float_env as _read_float_env
 from phone_utils import normalize_phone, phone_lookup_candidates
 from rate_limit import enforce_rate_limit
 from supabase_store import AdminUser, AppUser, utcnow
-from twilio_whatsapp import TwilioWhatsAppVerifyAPI
 
 
 class LoginPayload(BaseModel):
     phone: str | None = None
     email: str | None = None
     password: str | None = Field(default=None, min_length=8)
-    otp_code: str | None = Field(default=None, alias="otpCode")
-    otp_channel: str | None = Field(default=None, alias="otpChannel")
-    verification_sid: str | None = Field(default=None, alias="verificationSid")
 
     @model_validator(mode="after")
     def validate_auth_factor(self) -> "LoginPayload":
@@ -39,48 +35,16 @@ class LoginPayload(BaseModel):
         has_email = bool(self.email and self.email.strip())
         if not has_phone and not has_email:
             raise ValueError("phone or email is required")
-        # Phone is the default identifier; email is the password-only alternative.
-        if has_email and not has_phone and self.otp_code:
-            raise ValueError("OTP login requires a phone number")
-        if self.password or self.otp_code:
+        # Phone is the default identifier; email is the alternative.
+        if self.password:
             return self
-        raise ValueError("password or otpCode is required")
+        raise ValueError("password is required")
 
 
 class SignupPayload(BaseModel):
     phone: str
     name: str = Field(min_length=2, max_length=255)
-    password: str | None = Field(default=None, min_length=8)
-    otp_code: str | None = Field(default=None, alias="otpCode")
-    otp_channel: str | None = Field(default=None, alias="otpChannel")
-    verification_sid: str | None = Field(default=None, alias="verificationSid")
-
-    @model_validator(mode="after")
-    def validate_signup_factor(self) -> "SignupPayload":
-        if self.password or self.otp_code:
-            return self
-        raise ValueError("password or otpCode is required")
-
-
-class OTPRequestPayload(BaseModel):
-    phone: str
-    channel: str = Field(default="sms")
-
-
-class OTPVerifyPayload(BaseModel):
-    phone: str
-    code: str = Field(min_length=4, max_length=10)
-    name: str | None = Field(default=None, max_length=255)
-    channel: str | None = Field(default=None)
-    verification_sid: str | None = Field(default=None, alias="verificationSid")
-
-
-class OTPPasswordResetPayload(BaseModel):
-    phone: str
-    otp_code: str = Field(min_length=4, max_length=10, alias="otpCode")
-    otp_channel: str | None = Field(default=None, alias="otpChannel")
-    verification_sid: str | None = Field(default=None, alias="verificationSid")
-    new_password: str = Field(min_length=8, max_length=128, alias="newPassword")
+    password: str = Field(min_length=8)
 
 
 class LogoutPayload(BaseModel):
@@ -196,6 +160,15 @@ def decode_access_token(token: str, *, secret_key: str) -> dict[str, Any]:
     if len(parts) != 3:
         raise _api_error(status.HTTP_401_UNAUTHORIZED, "AUTH_INVALID_TOKEN", "Invalid token")
     header_segment, payload_segment, signature_segment = parts
+    # SEC-10: pin the JWT header before doing anything else. We only ever mint
+    # HS256/JWT tokens, so reject any other alg (defends against alg-confusion /
+    # `alg:none` forgeries up front instead of relying solely on the HMAC check).
+    try:
+        header = json.loads(_urlsafe_b64decode(header_segment).decode("utf-8"))
+    except Exception as exc:
+        raise _api_error(status.HTTP_401_UNAUTHORIZED, "AUTH_INVALID_TOKEN_HEADER", "Invalid token header") from exc
+    if not isinstance(header, dict) or header.get("alg") != "HS256" or header.get("typ") != "JWT":
+        raise _api_error(status.HTTP_401_UNAUTHORIZED, "AUTH_INVALID_TOKEN_HEADER", "Unsupported token header")
     signing_input = f"{header_segment}.{payload_segment}".encode("ascii")
     expected_signature = hmac.new(secret_key.encode("utf-8"), signing_input, hashlib.sha256).digest()
     try:
@@ -399,18 +372,6 @@ def _normalize_and_validate_signup_phone(phone: str) -> str:
     return normalized
 
 
-def _normalize_otp_channel(channel: str | None, *, field_name: str) -> str | None:
-    if channel is None:
-        return None
-    normalized_channel = str(channel).strip().lower()
-    if normalized_channel not in {"sms", "whatsapp"}:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=f"Unsupported {field_name}. Allowed values: sms, whatsapp.",
-        )
-    return normalized_channel
-
-
 def _mask_phone(value: str | None) -> str:
     """Mask a phone number for logging — keep only the last 3 digits (SEC-6)."""
     digits = "".join(ch for ch in (value or "") if ch.isdigit())
@@ -424,34 +385,6 @@ def _log_phone_lookup(context: str, raw_phone: str, normalized_phone: str) -> No
     # drop the raw value + candidate list entirely.
     _ = raw_phone
     LOGGER.info("%s phone lookup phone=%s", context, _mask_phone(normalized_phone))
-
-
-async def _verify_twilio_user_otp(
-    *,
-    provider: TwilioWhatsAppVerifyAPI,
-    phone: str,
-    code: str,
-    expected_channel: str | None = None,
-    verification_sid: str | None = None,
-) -> None:
-    result = await provider.check_verification(
-        phone=phone,
-        code=code,
-        verification_sid=verification_sid,
-    )
-    status_value = str(result.get("status") or "").strip().lower()
-    if status_value != "approved":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired OTP code.",
-        )
-    if expected_channel is not None:
-        verified_channel = str(result.get("channel") or "").strip().lower()
-        if verified_channel and verified_channel != expected_channel:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid OTP channel for this verification.",
-            )
 
 
 def _issue_user_session(user_row: AppUser) -> dict[str, Any]:
@@ -506,57 +439,6 @@ def _touch_last_login_if_due(db: Session, row: AppUser | AdminUser) -> None:
     db.commit()
 
 
-def _lookup_login_subject_id(session_factory: Callable[[], Session], phone: str) -> tuple[str, str]:
-    db = session_factory()
-    try:
-        user_row = _lookup_user_by_phone(db, phone)
-        if user_row is not None:
-            if not _is_row_active(user_row):
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="User account exists but is not active. Please contact support.",
-                )
-            return ("user", user_row.id)
-
-        admin_row = _lookup_admin_by_phone(db, phone)
-        if admin_row is not None:
-            if not _is_row_active(admin_row):
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Admin account exists but is not active.",
-                )
-            return ("admin", admin_row.id)
-
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User account not found. Please sign up first.",
-        )
-    finally:
-        db.close()
-
-
-def _issue_login_for_subject_id(
-    session_factory: Callable[[], Session],
-    *,
-    subject_type: str,
-    subject_id: str,
-) -> dict[str, Any]:
-    db = session_factory()
-    try:
-        if subject_type == "admin":
-            row = db.scalar(select(AdminUser).where(AdminUser.id == subject_id))
-        else:
-            row = db.scalar(select(AppUser).where(AppUser.id == subject_id))
-        if row is None:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Auth subject not found")
-        if not _is_row_active(row):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is not active.")
-        _touch_last_login_if_due(db, row)
-        return _issue_subject_session(row, subject_type=subject_type)
-    finally:
-        db.close()
-
-
 def _login_subject_with_password(
     session_factory: Callable[[], Session],
     *,
@@ -604,159 +486,10 @@ def _login_subject_with_password(
 def register_auth_routes(
     app: FastAPI,
     get_db: Callable[..., Any],
-    get_twilio_provider: Callable[..., Any],
 ) -> None:
-    def _get_optional_twilio_provider(request: Request) -> TwilioWhatsAppVerifyAPI | None:
-        return getattr(request.app.state, "twilio_whatsapp_api", None)
-
-    def _require_twilio_provider(provider: TwilioWhatsAppVerifyAPI | None) -> TwilioWhatsAppVerifyAPI:
-        if provider is not None:
-            return provider
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Twilio OTP service is not configured on this deployment.",
-        )
-
     def _client_ip(request: Request) -> str:
         client = request.client
         return client.host if client and client.host else "unknown"
-
-    @app.post("/api/v1/auth/user/otp/request")
-    async def request_user_otp(
-        payload: OTPRequestPayload,
-        request: Request,
-        provider: TwilioWhatsAppVerifyAPI = Depends(get_twilio_provider),
-    ) -> dict[str, Any]:
-        normalized_phone = _normalize_and_validate_signup_phone(payload.phone)
-        enforce_rate_limit(f"otp:phone:{normalized_phone}", max_events=5, window_seconds=600)
-        enforce_rate_limit(f"otp:ip:{_client_ip(request)}", max_events=30, window_seconds=3600)
-        channel = _normalize_otp_channel(payload.channel or "sms", field_name="channel") or "sms"
-        _log_phone_lookup("auth.user.otp.request", payload.phone, normalized_phone)
-        result = await provider.start_verification(phone=normalized_phone, channel=channel)
-        return {
-            "success": True,
-            "data": {
-                "to": normalized_phone,
-                "channel": channel,
-                "status": str(result.get("status") or "pending"),
-                "sid": result.get("sid"),
-            },
-        }
-
-    @app.post("/api/v1/auth/user/otp/verify")
-    async def verify_user_otp(
-        payload: OTPVerifyPayload,
-        request: Request,
-        db: Session = Depends(get_db),
-        provider: TwilioWhatsAppVerifyAPI = Depends(get_twilio_provider),
-    ) -> dict[str, Any]:
-        normalized_phone = _normalize_and_validate_signup_phone(payload.phone)
-        requested_channel = _normalize_otp_channel(payload.channel, field_name="channel")
-        # BE-5: rate-limit OTP verification (brute-force protection on the code),
-        # mirroring the request/reset/login endpoints.
-        enforce_rate_limit(f"otpverify:phone:{normalized_phone}", max_events=10, window_seconds=600)
-        enforce_rate_limit(f"otpverify:ip:{_client_ip(request)}", max_events=30, window_seconds=3600)
-        _log_phone_lookup("auth.user.otp.verify", payload.phone, normalized_phone)
-        await _verify_twilio_user_otp(
-            provider=provider,
-            phone=normalized_phone,
-            code=payload.code,
-            expected_channel=requested_channel,
-            verification_sid=payload.verification_sid,
-        )
-
-        def _work() -> dict[str, Any]:
-            user_row = _lookup_user_by_phone(db, normalized_phone)
-            if user_row is None:
-                existing_admin = _lookup_admin_by_phone(db, normalized_phone)
-                if existing_admin is not None:
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail="This phone is already used by an admin account.",
-                    )
-                normalized_name = str(payload.name or "").strip()
-                if len(normalized_name) < 2:
-                    raise HTTPException(
-                        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                        detail="Name must be at least 2 characters for first-time signup.",
-                    )
-                user_row = AppUser(
-                    phone=normalized_phone,
-                    name=normalized_name,
-                    status="active",
-                    password_hash=None,
-                    last_login_at=utcnow(),
-                )
-                db.add(user_row)
-                try:
-                    db.commit()
-                except IntegrityError as exc:
-                    db.rollback()
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail="User account already exists for this phone. Please try again.",
-                    ) from exc
-                db.refresh(user_row)
-                return _issue_user_session(user_row)
-
-            if not _is_row_active(user_row):
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="User account exists but is not active. Please contact support.",
-                )
-            user_row.last_login_at = utcnow()
-            db.commit()
-            return _issue_user_session(user_row)
-
-        return await asyncio.to_thread(_work)
-
-    @app.post("/api/v1/auth/user/password/forgot/reset")
-    @app.post("/api/v1/auth/user/password/reset")
-    async def reset_user_password_with_otp(
-        payload: OTPPasswordResetPayload,
-        request: Request,
-        db: Session = Depends(get_db),
-        provider: TwilioWhatsAppVerifyAPI = Depends(get_twilio_provider),
-    ) -> dict[str, Any]:
-        normalized_phone = _normalize_and_validate_signup_phone(payload.phone)
-        enforce_rate_limit(f"pwreset:phone:{normalized_phone}", max_events=5, window_seconds=600)
-        enforce_rate_limit(f"pwreset:ip:{_client_ip(request)}", max_events=30, window_seconds=3600)
-        requested_channel = _normalize_otp_channel(payload.otp_channel, field_name="otpChannel")
-        _log_phone_lookup("auth.user.password.reset", payload.phone, normalized_phone)
-
-        def _lookup_work() -> AppUser:
-            user_row = _lookup_user_by_phone(db, normalized_phone)
-            if user_row is None:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="User account not found. Please sign up first.",
-                )
-            if not _is_row_active(user_row):
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="User account exists but is not active. Please contact support.",
-                )
-            return user_row
-
-        user_row = await asyncio.to_thread(_lookup_work)
-
-        await _verify_twilio_user_otp(
-            provider=provider,
-            phone=normalized_phone,
-            code=payload.otp_code,
-            expected_channel=requested_channel,
-            verification_sid=payload.verification_sid,
-        )
-
-        def _persist_work() -> dict[str, Any]:
-            user_row.password_hash = hash_password(payload.new_password)
-            user_row.updated_at = utcnow()
-            user_row.last_login_at = utcnow()
-            db.commit()
-            db.refresh(user_row)
-            return _issue_subject_session(user_row, subject_type="user")
-
-        return await asyncio.to_thread(_persist_work)
 
     @app.post("/api/v1/auth/admin/login")
     def admin_login(payload: LoginPayload, request: Request, db: Session = Depends(get_db)) -> dict[str, Any]:
@@ -777,11 +510,10 @@ def register_auth_routes(
     async def user_login(
         payload: LoginPayload,
         request: Request,
-        provider: TwilioWhatsAppVerifyAPI | None = Depends(_get_optional_twilio_provider),
     ) -> dict[str, Any]:
         enforce_rate_limit(f"login:ip:{_client_ip(request)}", max_events=15, window_seconds=300)
         session_factory = request.app.state.db_session_factory
-        # Email is the password-only alternative identifier (phone stays default).
+        # Email is the alternative identifier (phone stays the default).
         if payload.email and not payload.phone:
             if payload.password is None:
                 raise HTTPException(
@@ -796,30 +528,8 @@ def register_auth_routes(
             )
         normalized_phone = _normalize_and_validate_signup_phone(payload.phone)
         _log_phone_lookup("auth.user.login", payload.phone, normalized_phone)
-        if payload.otp_code:
-            requested_channel = _normalize_otp_channel(payload.otp_channel, field_name="otpChannel")
-            subject_type, subject_id = await _run_login_db_worker(
-                _lookup_login_subject_id,
-                session_factory,
-                normalized_phone,
-            )
-            required_provider = _require_twilio_provider(provider)
-            await _verify_twilio_user_otp(
-                provider=required_provider,
-                phone=normalized_phone,
-                code=payload.otp_code,
-                expected_channel=requested_channel,
-                verification_sid=payload.verification_sid,
-            )
-            return await _run_login_db_worker(
-                _issue_login_for_subject_id,
-                session_factory,
-                subject_type=subject_type,
-                subject_id=subject_id,
-            )
-
         if payload.password is None:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="password or otpCode is required")
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="password is required")
 
         return await _run_login_db_worker(
             _login_subject_with_password,
@@ -833,7 +543,6 @@ def register_auth_routes(
     async def user_signup(
         payload: SignupPayload,
         db: Session = Depends(get_db),
-        provider: TwilioWhatsAppVerifyAPI | None = Depends(_get_optional_twilio_provider),
     ) -> dict[str, Any]:
         normalized_phone = _normalize_and_validate_signup_phone(payload.phone)
         _log_phone_lookup("auth.user.signup", payload.phone, normalized_phone)
@@ -866,28 +575,12 @@ def register_auth_routes(
 
         await asyncio.to_thread(_lookup_work)
 
-        if payload.otp_code:
-            required_provider = _require_twilio_provider(provider)
-            requested_channel = _normalize_otp_channel(payload.otp_channel, field_name="otpChannel")
-            await _verify_twilio_user_otp(
-                provider=required_provider,
-                phone=normalized_phone,
-                code=payload.otp_code,
-                expected_channel=requested_channel,
-                verification_sid=payload.verification_sid,
-            )
-        elif payload.password is None:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail="password or otpCode is required",
-            )
-
         def _persist_work() -> dict[str, Any]:
             user_row = AppUser(
                 phone=normalized_phone,
                 name=normalized_name,
                 status="active",
-                password_hash=hash_password(payload.password) if payload.password else None,
+                password_hash=hash_password(payload.password),
                 last_login_at=utcnow(),
             )
             db.add(user_row)

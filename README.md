@@ -598,69 +598,17 @@ These routes are intended for mobile app read flows and do not require admin sco
 - `POST /api/v1/esim-access/profiles/install/my` (user/admin token, ownership checks)
 - `POST /api/v1/esim-access/profiles/activate/my` (user/admin token, ownership checks)
 
-### Passwordless OTP auth routes (SMS default)
+### User auth routes (password)
 
-These routes support passwordless mobile auth using Twilio Verify. Existing password-based login/signup remains supported and backward-compatible.
-Backend now defaults OTP delivery channel to `sms` when channel is not provided.
+Mobile auth is password-based. The default identifier is the phone number; email is
+an alternative identifier for login. Passwords are hashed with scrypt server-side.
 
-- `POST /api/v1/auth/user/otp/request`
-- `POST /api/v1/auth/user/otp/verify`
-- `POST /api/v1/auth/user/password/forgot/reset` (OTP + new password reset)
-- `POST /api/v1/auth/user/login` now accepts `otpCode` as an alternative to `password`
-- `POST /api/v1/auth/user/signup` now accepts `otpCode` as an alternative to `password`
+- `POST /api/v1/auth/user/signup` (phone + name + password)
+- `POST /api/v1/auth/user/login` (phone + password, or email + password)
+- `POST /api/v1/auth/admin/login` (admin phone/email + password)
+- `GET /api/v1/auth/me` · `PATCH /api/v1/auth/me` · `DELETE /api/v1/auth/me`
 
-Required env vars:
-
-- `TWILIO_ACCOUNT_SID`
-- `TWILIO_AUTH_TOKEN`
-- `TWILIO_VERIFY_SERVICE_SID`
-
-Optional env vars:
-
-- none for Verify transport tuning. Backend hardcodes:
-  - `TWILIO_VERIFY_BASE_URL=https://verify.twilio.com`
-  - `TWILIO_VERIFY_TIMEOUT_SECONDS=20`
-  - `TWILIO_VERIFY_RATE_LIMIT_PER_SECOND=5`
-
-Request OTP example:
-
-```bash
-curl -X POST "$BASE_URL/api/v1/auth/user/otp/request" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "phone": "+9647507343635",
-    "channel": "sms"
-  }'
-```
-
-Twilio Verify service recommendation:
-
-- set Verify Service Friendly Name to `Tulip Booking` so the OTP message brand label matches the app.
-
-Verify OTP and create/login user session:
-
-```bash
-curl -X POST "$BASE_URL/api/v1/auth/user/otp/verify" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "phone": "+9647507343635",
-    "code": "123456",
-    "name": "Laveen"
-  }'
-```
-
-Login with OTP (existing user):
-
-```bash
-curl -X POST "$BASE_URL/api/v1/auth/user/login" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "phone": "+9647507343635",
-    "otpCode": "123456"
-  }'
-```
-
-Signup with OTP (passwordless):
+Signup example:
 
 ```bash
 curl -X POST "$BASE_URL/api/v1/auth/user/signup" \
@@ -668,19 +616,18 @@ curl -X POST "$BASE_URL/api/v1/auth/user/signup" \
   -d '{
     "phone": "+9647507343635",
     "name": "Laveen",
-    "otpCode": "123456"
+    "password": "StrongPass123"
   }'
 ```
 
-Forgot password reset with OTP:
+Login example (phone or email):
 
 ```bash
-curl -X POST "$BASE_URL/api/v1/auth/user/password/forgot/reset" \
+curl -X POST "$BASE_URL/api/v1/auth/user/login" \
   -H "Content-Type: application/json" \
   -d '{
     "phone": "+9647507343635",
-    "otpCode": "123456",
-    "newPassword": "StrongPass123"
+    "password": "StrongPass123"
   }'
 ```
 

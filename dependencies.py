@@ -8,7 +8,6 @@ from fastapi import HTTPException, Request, status
 from esim_access_api import ESimAccessAPI
 from fib_payment_api import FIBPaymentAPI
 from push_notification import PushNotificationService
-from twilio_whatsapp import TwilioWhatsAppVerifyAPI
 
 LOGGER = logging.getLogger(__name__)
 
@@ -50,15 +49,5 @@ def get_push_provider(request: Request) -> PushNotificationService:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Push notification service is not configured on this deployment.",
-        )
-    return provider
-
-
-def get_twilio_provider(request: Request) -> TwilioWhatsAppVerifyAPI:
-    provider: TwilioWhatsAppVerifyAPI | None = getattr(request.app.state, "twilio_whatsapp_api", None)
-    if provider is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Twilio OTP service is not configured on this deployment.",
         )
     return provider
