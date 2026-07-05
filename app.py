@@ -238,6 +238,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             service_account_json=cfg.firebase_service_account_json,
             default_channel_id=cfg.push_notification_default_channel_id or PUSH_NOTIFICATION_DEFAULT_CHANNEL_ID,
         )
+        # Fail-fast: surface a misconfigured Firebase credential in the boot logs
+        # instead of silently deferring the failure to the first admin send. This
+        # never crashes the app — push is optional (unconfigured => 503).
+        if getattr(cfg, "firebase_validate_on_startup", True):
+            app.state.push_notification_service.validate_configuration()
         # BE-1: start the background eSIM usage-sync worker here (replaces the
         # deprecated @app.on_event("startup") handler in esim_access_api).
         start_usage_sync = getattr(app.state, "start_esim_usage_sync_worker", None)

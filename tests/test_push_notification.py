@@ -786,6 +786,143 @@ class PushNotificationRoutesTest(unittest.TestCase):
             self.assertIn("subjectType", sample)
             self.assertIn("updatedAt", sample)
 
+    # ---- Push hardening: retry / startup validation / rate limit / GC ----
+
+    def test_retryable_error_classification(self) -> None:
+        cls = PushNotificationService
+        # Transient / unknown → retryable.
+        self.assertTrue(cls._is_retryable_error(RuntimeError("temporarily unavailable")))
+        self.assertTrue(cls._is_retryable_error(RuntimeError("connection reset by peer")))
+        self.assertTrue(cls._is_retryable_error(RuntimeError("some brand new 5xx blip")))
+        # Auth / credential → permanent, never retried.
+        self.assertFalse(cls._is_retryable_error(RuntimeError("unauthenticated")))
+        self.assertFalse(cls._is_retryable_error(RuntimeError("invalid credential supplied")))
+        # Token-validity errors are handled per-token, not whole-call retried.
+        self.assertFalse(cls._is_retryable_error(RuntimeError("Requested entity was not found")))
+
+    def test_send_multicast_retries_transient_then_succeeds(self) -> None:
+        import push_notification as pushmod
+
+        calls = {"n": 0}
+        sentinel = object()
+
+        class _FakeMessaging:
+            @staticmethod
+            def send_each_for_multicast(message: Any, app: Any = None) -> Any:
+                calls["n"] += 1
+                if calls["n"] < 3:
+                    raise RuntimeError("temporarily unavailable, please retry")
+                return sentinel
+
+        original = pushmod.messaging
+        pushmod.messaging = _FakeMessaging
+        try:
+            svc = PushNotificationService(max_send_attempts=3, retry_base_delay=0.0, sleep=lambda _: None)
+            result = svc._send_multicast_with_retry(object(), app=object())
+            self.assertIs(result, sentinel)
+            self.assertEqual(calls["n"], 3)
+        finally:
+            pushmod.messaging = original
+
+    def test_send_multicast_does_not_retry_permanent_error(self) -> None:
+        import push_notification as pushmod
+
+        calls = {"n": 0}
+
+        class _FakeMessaging:
+            @staticmethod
+            def send_each_for_multicast(message: Any, app: Any = None) -> Any:
+                calls["n"] += 1
+                raise RuntimeError("unauthenticated: invalid credential")
+
+        original = pushmod.messaging
+        pushmod.messaging = _FakeMessaging
+        try:
+            svc = PushNotificationService(max_send_attempts=3, retry_base_delay=0.0, sleep=lambda _: None)
+            with self.assertRaises(RuntimeError):
+                svc._send_multicast_with_retry(object(), app=object())
+            self.assertEqual(calls["n"], 1)  # permanent → attempted exactly once
+        finally:
+            pushmod.messaging = original
+
+    def test_validate_configuration_reports_unconfigured(self) -> None:
+        svc = PushNotificationService()  # no Firebase creds
+        self.assertEqual(
+            svc.validate_configuration(),
+            {"configured": False, "valid": None, "error": None},
+        )
+
+    def test_cleanup_stale_anonymous_push_devices(self) -> None:
+        from datetime import timedelta
+
+        from supabase_store import utcnow
+
+        old = utcnow() - timedelta(days=200)
+        recent = utcnow() - timedelta(days=5)
+        with self.session_factory() as session:
+            session.add(PushDevice(token="anon-old", platform="ios", last_seen_at=old, created_at=old, updated_at=old))
+            session.add(PushDevice(token="anon-recent", platform="ios", last_seen_at=recent, created_at=recent, updated_at=recent))
+            session.add(
+                PushDevice(
+                    token="owned-old",
+                    platform="ios",
+                    user_id=self.user_id,
+                    last_seen_at=old,
+                    created_at=old,
+                    updated_at=old,
+                )
+            )
+            session.commit()
+
+        with self.session_factory() as session:
+            store = SupabaseStore(session)
+            self.assertEqual(store.count_stale_anonymous_push_devices(older_than_days=90), 1)
+            deleted = store.delete_stale_anonymous_push_devices(older_than_days=90)
+            session.commit()
+            self.assertEqual(deleted, 1)
+            # Non-positive window is a guarded no-op.
+            self.assertEqual(store.delete_stale_anonymous_push_devices(older_than_days=0), 0)
+
+        with self.session_factory() as session:
+            remaining = set(session.scalars(select(PushDevice.token)).all())
+            # anon-old deleted; anon-recent (fresh) and owned-old (has an owner)
+            # survive. "blocked-token" comes from the fixture and is owned by the
+            # blocked user, so it must also survive (owned devices are never GC'd).
+            self.assertEqual(remaining, {"anon-recent", "owned-old", "blocked-token"})
+
+    def test_admin_send_is_rate_limited(self) -> None:
+        import rate_limit
+
+        prev_bypass = os.environ.get("RATE_LIMIT_BYPASS_IN_TESTS")
+        os.environ["RATE_LIMIT_BYPASS_IN_TESTS"] = "false"
+        os.environ["PUSH_SEND_RATE_LIMIT_MAX"] = "2"
+        os.environ["PUSH_SEND_RATE_LIMIT_WINDOW_SECONDS"] = "3600"
+        get_settings.cache_clear()
+        rate_limit.reset()
+        try:
+            self.client.post(
+                "/api/v1/push-notifications/devices/register",
+                json={"token": "rl-token", "platform": "android"},
+                headers=self.user_headers,
+            )
+            body = {"title": "t", "body": "b", "sendToAllActive": True}
+            codes = [
+                self.client.post(
+                    "/api/v1/admin/push-notifications/send", json=body, headers=self.admin_headers
+                ).status_code
+                for _ in range(3)
+            ]
+            self.assertEqual(codes, [200, 200, 429])
+        finally:
+            rate_limit.reset()
+            os.environ.pop("PUSH_SEND_RATE_LIMIT_MAX", None)
+            os.environ.pop("PUSH_SEND_RATE_LIMIT_WINDOW_SECONDS", None)
+            if prev_bypass is None:
+                os.environ.pop("RATE_LIMIT_BYPASS_IN_TESTS", None)
+            else:
+                os.environ["RATE_LIMIT_BYPASS_IN_TESTS"] = prev_bypass
+            get_settings.cache_clear()
+
 
 if __name__ == "__main__":
     unittest.main()

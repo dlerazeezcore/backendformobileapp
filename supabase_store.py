@@ -25,6 +25,7 @@ from sqlalchemy import (
     UniqueConstraint,
     Uuid,
     create_engine,
+    delete,
     func,
     or_,
     select,
@@ -1759,6 +1760,36 @@ class SupabaseStore:
             row.last_seen_at = utcnow()
         self.session.flush()
         return len(rows)
+
+    def _stale_anonymous_push_device_filters(self, *, older_than_days: int, now: datetime | None = None) -> list[Any]:
+        """Rows owned by nobody (no user, no admin) that have not been seen since
+        the cutoff. Owned devices are NEVER matched — they belong to a real
+        account and re-register on their own cadence."""
+        cutoff = (now or utcnow()) - timedelta(days=older_than_days)
+        return [
+            PushDevice.user_id.is_(None),
+            PushDevice.admin_user_id.is_(None),
+            PushDevice.last_seen_at < cutoff,
+        ]
+
+    def count_stale_anonymous_push_devices(self, *, older_than_days: int, now: datetime | None = None) -> int:
+        if older_than_days <= 0:
+            return 0
+        filters = self._stale_anonymous_push_device_filters(older_than_days=older_than_days, now=now)
+        return int(
+            self.session.scalar(select(func.count()).select_from(PushDevice).where(*filters)) or 0
+        )
+
+    def delete_stale_anonymous_push_devices(self, *, older_than_days: int, now: datetime | None = None) -> int:
+        """Hard-delete stale anonymous push devices (DB housekeeping). Returns the
+        number of rows removed. Guarded: a non-positive retention window deletes
+        nothing. Caller owns the commit."""
+        if older_than_days <= 0:
+            return 0
+        filters = self._stale_anonymous_push_device_filters(older_than_days=older_than_days, now=now)
+        result = self.session.execute(delete(PushDevice).where(*filters))
+        self.session.flush()
+        return int(result.rowcount or 0)
 
     def list_push_devices_for_user(
         self,

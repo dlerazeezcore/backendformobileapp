@@ -85,6 +85,13 @@ class Settings(BaseSettings):
     firebase_service_account_file: str | None = Field(default=None, alias="FIREBASE_SERVICE_ACCOUNT_FILE")
     firebase_service_account_json: str | None = Field(default=None, alias="FIREBASE_SERVICE_ACCOUNT_JSON")
     push_notification_default_channel_id: str = Field(default="general", alias="PUSH_NOTIFICATION_DEFAULT_CHANNEL_ID")
+    # Push hardening. Validate Firebase creds at boot (fail-fast log) instead of
+    # only on the first admin send; cap how often a single admin can fire sends;
+    # retention window used by scripts/cleanup_anonymous_push_devices.py.
+    firebase_validate_on_startup: bool = Field(default=True, alias="FIREBASE_VALIDATE_ON_STARTUP")
+    push_send_rate_limit_max: int = Field(default=30, alias="PUSH_SEND_RATE_LIMIT_MAX")
+    push_send_rate_limit_window_seconds: int = Field(default=3600, alias="PUSH_SEND_RATE_LIMIT_WINDOW_SECONDS")
+    push_anonymous_device_retention_days: int = Field(default=90, alias="PUSH_ANONYMOUS_DEVICE_RETENTION_DAYS")
     database_url: str = Field(default="sqlite:///./esim_access.db", alias="DATABASE_URL")
     auth_secret_key: str = Field(default=DEFAULT_AUTH_SECRET_KEY, alias="AUTH_SECRET_KEY")
     auth_token_ttl_seconds: int = Field(default=DEFAULT_AUTH_TOKEN_TTL_SECONDS, alias="AUTH_TOKEN_TTL_SECONDS")

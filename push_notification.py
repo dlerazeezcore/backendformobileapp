@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from functools import lru_cache
 from typing import Any, Callable, Iterable
 
@@ -13,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from auth import decode_access_token, extract_bearer_token, get_token_claims, require_active_subject
 from config import get_settings
+from rate_limit import enforce_rate_limit
 from push_localization import (
     SUPPORTED_LANGS,
     APP_UPDATE_MESSAGES,
@@ -42,13 +44,39 @@ class PushNotificationService:
         service_account_file: str | None = None,
         service_account_json: str | None = None,
         default_channel_id: str = "general",
+        max_send_attempts: int = 3,
+        retry_base_delay: float = 0.5,
+        sleep: Callable[[float], None] | None = None,
     ) -> None:
         self.service_account_file = (service_account_file or "").strip()
         self.service_account_json = (service_account_json or "").strip()
         self.default_channel_id = default_channel_id.strip() or "general"
+        # Whole-call retry (transient FCM/network failures only — per-token
+        # failures are already reported inside the multicast response and never
+        # retried). 1 == retries disabled.
+        self.max_send_attempts = max(1, int(max_send_attempts))
+        self.retry_base_delay = max(0.0, float(retry_base_delay))
+        self._sleep = sleep or time.sleep
 
     def is_configured(self) -> bool:
         return bool(firebase_admin and (self.service_account_file or self.service_account_json))
+
+    def validate_configuration(self) -> dict[str, Any]:
+        """Best-effort credential check run at startup. Never raises — push is an
+        optional subsystem (unconfigured deployments answer sends with 503), so a
+        bad Firebase credential must NOT take down booking/eSIM/auth. Instead we
+        surface it loudly in the boot logs so ops catches it immediately rather
+        than on the first admin send."""
+        if not self.is_configured():
+            logger.info("push.config firebase push provider not configured; sends will return 503.")
+            return {"configured": False, "valid": None, "error": None}
+        try:
+            self._get_firebase_app()
+        except Exception as exc:  # pragma: no cover - exercised via unit test with a bad cert
+            logger.error("push.config firebase credentials are INVALID (%s): %s", type(exc).__name__, exc)
+            return {"configured": True, "valid": False, "error": str(exc)}
+        logger.info("push.config firebase push provider initialized OK.")
+        return {"configured": True, "valid": True, "error": None}
 
     def _load_credential_object(self) -> Any:
         if credentials is None:
@@ -145,6 +173,60 @@ class PushNotificationService:
             return True
         return any(marker in error_text for marker in invalid_text_markers)
 
+    @classmethod
+    def _is_retryable_error(cls, error: Any) -> bool:
+        """A whole-multicast-call failure is retryable UNLESS it is clearly
+        permanent (auth/credential/invalid-argument or a token-validity error).
+        Defaulting unknown failures to retryable maximises resilience against the
+        long tail of transient FCM/network hiccups, which are hard to enumerate."""
+        if cls._is_inactive_token_error(error):
+            return False
+        error_code = cls._exception_code(error)
+        error_text = str(error or "").strip().lower()
+        permanent_codes = {
+            "unauthenticated",
+            "permission-denied",
+            "permissiondeniederror",
+            "invalid-argument",
+            "invalidargumenterror",
+        }
+        permanent_text_markers = (
+            "unauthenticated",
+            "permission denied",
+            "invalid credential",
+            "invalid_grant",
+            "could not refresh access token",
+        )
+        if error_code in permanent_codes:
+            return False
+        return not any(marker in error_text for marker in permanent_text_markers)
+
+    def _send_multicast_with_retry(self, message: Any, *, app: Any) -> Any:
+        """Send one multicast batch, retrying the whole call with exponential
+        backoff on transient failures. Per-token failures do not raise (they come
+        back inside the response), so they are never retried here."""
+        assert messaging is not None
+        last_exc: Exception | None = None
+        for attempt in range(1, self.max_send_attempts + 1):
+            try:
+                return messaging.send_each_for_multicast(message, app=app)
+            except Exception as exc:  # noqa: BLE001 - classified below
+                last_exc = exc
+                if attempt >= self.max_send_attempts or not self._is_retryable_error(exc):
+                    raise
+                delay = self.retry_base_delay * (2 ** (attempt - 1))
+                logger.warning(
+                    "push.send.retry attempt=%s/%s delay=%.2fs error=%s",
+                    attempt,
+                    self.max_send_attempts,
+                    delay,
+                    exc,
+                )
+                if delay > 0:
+                    self._sleep(delay)
+        # Loop always returns or raises; this satisfies type-checkers.
+        raise last_exc  # type: ignore[misc]  # pragma: no cover
+
     def send_push_notification(
         self,
         *,
@@ -201,7 +283,7 @@ class PushNotificationService:
                     ),
                 ),
             )
-            response = messaging.send_each_for_multicast(message, app=app)
+            response = self._send_multicast_with_retry(message, app=app)
             success_count += int(response.success_count)
             failure_count += int(response.failure_count)
             for index, item in enumerate(response.responses):
@@ -601,6 +683,17 @@ def register_push_notification_routes(
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin user cannot send push notifications")
         return row
 
+    def _enforce_send_rate_limit(admin_user: AdminUser) -> None:
+        """Per-admin cap on outbound sends, to protect the FCM quota from a
+        runaway loop or a compromised admin session. Read endpoints (list /
+        summary / diagnostics) are deliberately not limited. No-ops under the
+        pytest bypass and when RATE_LIMIT_ENABLED is off (see rate_limit.py)."""
+        settings = get_settings()
+        max_events = int(getattr(settings, "push_send_rate_limit_max", 0) or 0)
+        window_seconds = int(getattr(settings, "push_send_rate_limit_window_seconds", 0) or 0)
+        if max_events > 0 and window_seconds > 0:
+            enforce_rate_limit(f"push_send:admin:{admin_user.id}", max_events, window_seconds)
+
     @app.post("/api/v1/push-notifications/devices/register")
     def register_push_device(
         payload: RegisterPushDevicePayload,
@@ -690,6 +783,7 @@ def register_push_notification_routes(
         db: Session = Depends(get_db),
         admin_user: AdminUser = Depends(_require_admin_sender),
     ) -> Any:
+        _enforce_send_rate_limit(admin_user)
         store = SupabaseStore(db)
         normalized_data, is_app_update = _merge_app_update_fields(
             data=payload.data,
@@ -1031,6 +1125,7 @@ def register_push_notification_routes(
         db: Session = Depends(get_db),
         admin_user: AdminUser = Depends(_require_admin_sender),
     ) -> Any:
+        _enforce_send_rate_limit(admin_user)
         # Fall back to the app_release_info singleton row when the admin omits
         # either store URL (most common case — admin set them once via the
         # version-info endpoint and doesn't want to re-enter them on every send).
