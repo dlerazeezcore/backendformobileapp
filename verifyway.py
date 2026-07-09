@@ -4,18 +4,19 @@ import hashlib
 import hmac
 import logging
 import secrets
-import threading
-import time
-from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from config import get_settings
 from phone_utils import normalize_phone
 from rate_limit import enforce_rate_limit
+from supabase_store import OtpCode
 
 LOGGER = logging.getLogger("uvicorn.error")
 
@@ -27,11 +28,10 @@ LOGGER = logging.getLogger("uvicorn.error")
 # and stores only an HMAC digest of it. POST /api/v1/otp/verify checks the code
 # with attempt caps and TTL. Codes are single-use.
 #
-# The pending-code store is process-local and in-memory (same trade-off as
-# rate_limit.py): it is an auth-code cache with a 5-minute lifetime, not
-# durable state, so it needs no migration. If the deployment ever runs
-# multiple worker processes behind one load balancer, move this store to the
-# database or Redis so send/verify can land on different workers.
+# State lives in the ``otp_codes`` table (one row per normalized phone,
+# migration 0049) — NOT in process memory. Production runs uvicorn with
+# multiple workers, so send and verify routinely land on different processes;
+# only shared storage makes the flow reliable.
 # ---------------------------------------------------------------------------
 
 _VERIFIED_TTL_SECONDS = 600  # window in which a successful verify can be consumed
@@ -41,32 +41,9 @@ class VerifyWayError(Exception):
     pass
 
 
-@dataclass
-class _OtpState:
-    code_digest: str
-    expires_at: float  # time.monotonic() basis
-    attempts_left: int
-    last_sent_at: float
-
-
-_LOCK = threading.Lock()
-_PENDING: dict[str, _OtpState] = {}
-# phone -> monotonic timestamp of last successful verification. Lets a future
-# auth flow (signup/login/phone-change in auth.py) confirm "this phone was just
-# proven" via consume_recent_verification() without re-plumbing OTP state.
-_VERIFIED_AT: dict[str, float] = {}
-
-
-def reset() -> None:
-    """Clear all OTP state. Intended for tests."""
-    with _LOCK:
-        _PENDING.clear()
-        _VERIFIED_AT.clear()
-
-
 # ---------------------------------------------------------------------------
 # Code generation & hashing. Only the HMAC digest is stored, keyed with the
-# deployment auth secret, so a memory dump or stray log never exposes a live
+# deployment auth secret, so a DB leak or stray log never exposes a live
 # code. The plaintext code exists only in the outbound VerifyWay request.
 # ---------------------------------------------------------------------------
 def _generate_code(length: int) -> str:
@@ -83,15 +60,33 @@ def _to_recipient(normalized_phone: str) -> str:
     return normalized_phone.lstrip("+")
 
 
-def consume_recent_verification(phone: str) -> bool:
+def _utcnow() -> datetime:
+    # This module writes/compares in plain UTC (NOT supabase_store.utcnow's
+    # GMT+3): SQLite drops the offset on write, so any non-UTC zone would skew
+    # every reread timestamp by the offset. Postgres timestamptz is unaffected.
+    return datetime.now(timezone.utc)
+
+
+def _as_aware(value: datetime | None) -> datetime | None:
+    # SQLite returns naive datetimes even for DateTime(timezone=True); Postgres
+    # returns aware ones. Normalize so comparisons never raise.
+    if value is not None and value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def consume_recent_verification(db: Session, phone: str) -> bool:
     """Return True (once) if ``phone`` completed OTP verification within the
     last _VERIFIED_TTL_SECONDS. Consuming clears the flag so a single verify
     cannot authorize two separate sensitive actions."""
     normalized = normalize_phone(phone)
-    now = time.monotonic()
-    with _LOCK:
-        verified_at = _VERIFIED_AT.pop(normalized, None)
-    return verified_at is not None and (now - verified_at) <= _VERIFIED_TTL_SECONDS
+    row = db.get(OtpCode, normalized)
+    verified_at = _as_aware(row.verified_at) if row is not None else None
+    if verified_at is None:
+        return False
+    row.verified_at = None
+    db.commit()
+    return (_utcnow() - verified_at) <= timedelta(seconds=_VERIFIED_TTL_SECONDS)
 
 
 # ---------------------------------------------------------------------------
@@ -171,9 +166,7 @@ def _normalized_or_400(phone: str) -> str:
 # ---------------------------------------------------------------------------
 # Routes.
 # ---------------------------------------------------------------------------
-def register_verifyway_routes(app: FastAPI, get_db: Callable[..., Any] | None = None) -> None:
-    _ = get_db  # OTP state is not DB-backed (see module header); kept for wiring symmetry.
-
+def register_verifyway_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
     def _client_ip(request: Request) -> str:
         client = request.client
         return client.host if client and client.host else "unknown"
@@ -192,7 +185,11 @@ def register_verifyway_routes(app: FastAPI, get_db: Callable[..., Any] | None = 
         }
 
     @app.post("/api/v1/otp/send")
-    async def otp_send(payload: OtpSendRequest, request: Request) -> dict[str, Any]:
+    async def otp_send(
+        payload: OtpSendRequest,
+        request: Request,
+        db: Session = Depends(get_db),
+    ) -> dict[str, Any]:
         settings = get_settings()
         normalized = _normalized_or_400(payload.phone)
 
@@ -201,29 +198,42 @@ def register_verifyway_routes(app: FastAPI, get_db: Callable[..., Any] | None = 
         enforce_rate_limit(f"otp:send:ip:{_client_ip(request)}", max_events=10, window_seconds=3600)
         enforce_rate_limit(f"otp:send:phone:{normalized}", max_events=5, window_seconds=3600)
 
-        now = time.monotonic()
+        now = _utcnow()
         cooldown = settings.verifyway_otp_resend_cooldown_seconds
-        with _LOCK:
-            existing = _PENDING.get(normalized)
-            if existing is not None and (now - existing.last_sent_at) < cooldown:
-                retry_after = max(1, int(cooldown - (now - existing.last_sent_at)) + 1)
+        row = db.get(OtpCode, normalized)
+        last_sent_at = _as_aware(row.last_sent_at) if row is not None else None
+        if last_sent_at is not None:
+            elapsed = (now - last_sent_at).total_seconds()
+            if elapsed < cooldown:
                 raise HTTPException(
                     status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                     detail="A code was just sent. Please wait before requesting another.",
-                    headers={"Retry-After": str(retry_after)},
+                    headers={"Retry-After": str(max(1, int(cooldown - elapsed) + 1))},
                 )
 
         code = _generate_code(settings.verifyway_otp_length)
         await _post_otp(_to_recipient(normalized), code)
 
-        # Store only after a successful upstream send so a delivery failure
+        # Persist only after a successful upstream send so a delivery failure
         # never burns the resend cooldown.
-        with _LOCK:
-            _PENDING[normalized] = _OtpState(
-                code_digest=_code_digest(normalized, code),
-                expires_at=now + settings.verifyway_otp_ttl_seconds,
-                attempts_left=settings.verifyway_otp_max_attempts,
-                last_sent_at=now,
+        if row is None:
+            row = OtpCode(phone=normalized)
+            db.add(row)
+        row.code_digest = _code_digest(normalized, code)
+        row.expires_at = now + timedelta(seconds=settings.verifyway_otp_ttl_seconds)
+        row.attempts_left = settings.verifyway_otp_max_attempts
+        row.last_sent_at = now
+        row.verified_at = None
+        try:
+            db.commit()
+        except IntegrityError:
+            # Two concurrent first-sends raced on the same phone; the other
+            # request's code is live, so surface the cooldown response.
+            db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="A code was just sent. Please wait before requesting another.",
+                headers={"Retry-After": str(cooldown)},
             )
 
         return {
@@ -234,29 +244,36 @@ def register_verifyway_routes(app: FastAPI, get_db: Callable[..., Any] | None = 
         }
 
     @app.post("/api/v1/otp/verify")
-    async def otp_verify(payload: OtpVerifyRequest, request: Request) -> dict[str, Any]:
+    async def otp_verify(
+        payload: OtpVerifyRequest,
+        request: Request,
+        db: Session = Depends(get_db),
+    ) -> dict[str, Any]:
         normalized = _normalized_or_400(payload.phone)
         enforce_rate_limit(f"otp:verify:ip:{_client_ip(request)}", max_events=30, window_seconds=3600)
 
         submitted = payload.code.strip()
-        now = time.monotonic()
+        now = _utcnow()
         invalid = HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid or expired code. Please request a new one.",
         )
 
-        with _LOCK:
-            state = _PENDING.get(normalized)
-            if state is None or now >= state.expires_at:
-                _PENDING.pop(normalized, None)
-                raise invalid
-            if not hmac.compare_digest(state.code_digest, _code_digest(normalized, submitted)):
-                state.attempts_left -= 1
-                if state.attempts_left <= 0:
-                    del _PENDING[normalized]
-                raise invalid
-            # Success: single-use — drop the pending code, record the proof.
-            del _PENDING[normalized]
-            _VERIFIED_AT[normalized] = now
+        row = db.get(OtpCode, normalized)
+        expires_at = _as_aware(row.expires_at) if row is not None else None
+        if row is None or not row.code_digest or expires_at is None or now >= expires_at:
+            raise invalid
+        if not hmac.compare_digest(row.code_digest, _code_digest(normalized, submitted)):
+            row.attempts_left -= 1
+            if row.attempts_left <= 0:
+                row.code_digest = None
+                row.expires_at = None
+            db.commit()
+            raise invalid
+        # Success: single-use — clear the pending code, record the proof.
+        row.code_digest = None
+        row.expires_at = None
+        row.verified_at = now
+        db.commit()
 
         return {"ok": True, "verified": True, "phone": normalized}

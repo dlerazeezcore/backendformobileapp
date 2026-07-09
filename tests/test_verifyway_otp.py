@@ -3,13 +3,17 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 import verifyway
 from app import create_app
 from config import get_settings
+from supabase_store import Base, OtpCode, normalize_database_url
 
 
 class VerifyWayOtpTest(unittest.TestCase):
@@ -23,14 +27,21 @@ class VerifyWayOtpTest(unittest.TestCase):
         os.environ["AUTH_SECRET_KEY"] = "test-auth-secret"
         os.environ["VERIFYWAY_API_KEY"] = "test-verifyway-key"
         get_settings.cache_clear()
-        verifyway.reset()
+
+        self.engine = create_engine(
+            normalize_database_url(os.environ["DATABASE_URL"]),
+            connect_args={"check_same_thread": False},
+            future=True,
+        )
+        Base.metadata.create_all(self.engine)
+        self.session_factory = sessionmaker(bind=self.engine, autoflush=False, autocommit=False, future=True)
 
     def tearDown(self) -> None:
+        self.engine.dispose()
         os.environ.pop("VERIFYWAY_API_KEY", None)
         if os.path.exists(self.db_path):
             os.remove(self.db_path)
         get_settings.cache_clear()
-        verifyway.reset()
 
     def _send(self, client: TestClient, phone: str) -> tuple[dict, str]:
         """POST /otp/send with the upstream call mocked; returns (json, sent code)."""
@@ -83,8 +94,10 @@ class VerifyWayOtpTest(unittest.TestCase):
     def test_expired_code_is_rejected(self) -> None:
         with TestClient(create_app()) as client:
             _, code = self._send(client, "+9647507343635")
-            with verifyway._LOCK:
-                verifyway._PENDING["+9647507343635"].expires_at = 0.0
+            with self.session_factory() as session:
+                row = session.get(OtpCode, "+9647507343635")
+                row.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+                session.commit()
             verify = client.post("/api/v1/otp/verify", json={"phone": "+9647507343635", "code": code})
             self.assertEqual(verify.status_code, 400)
 
@@ -125,8 +138,10 @@ class VerifyWayOtpTest(unittest.TestCase):
         with TestClient(create_app()) as client:
             _, code = self._send(client, "+9647507343635")
             client.post("/api/v1/otp/verify", json={"phone": "+9647507343635", "code": code})
-        self.assertTrue(verifyway.consume_recent_verification("07507343635"))
-        self.assertFalse(verifyway.consume_recent_verification("07507343635"))
+        with self.session_factory() as session:
+            self.assertTrue(verifyway.consume_recent_verification(session, "07507343635"))
+        with self.session_factory() as session:
+            self.assertFalse(verifyway.consume_recent_verification(session, "07507343635"))
 
     def test_health_reports_configuration(self) -> None:
         with TestClient(create_app()) as client:
