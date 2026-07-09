@@ -17,6 +17,7 @@ DEFAULT_FIB_PAYMENT_STATUS_CALLBACK_URL = (
     "https://mean-lettie-corevia-0bd7cc91.koyeb.app/api/v1/payments/fib/webhook"
 )
 DEFAULT_FIB_PAYMENT_REDIRECT_URI = "tulip://payment/result"
+DEFAULT_VERIFYWAY_BASE_URL = "https://api.verifyway.com/api/v1/"
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +96,19 @@ class Settings(BaseSettings):
     database_url: str = Field(default="sqlite:///./esim_access.db", alias="DATABASE_URL")
     auth_secret_key: str = Field(default=DEFAULT_AUTH_SECRET_KEY, alias="AUTH_SECRET_KEY")
     auth_token_ttl_seconds: int = Field(default=DEFAULT_AUTH_TOKEN_TTL_SECONDS, alias="AUTH_TOKEN_TTL_SECONDS")
+    # VerifyWay OTP delivery (WhatsApp/SMS). Endpoints return 503 until the API
+    # key is configured. OTP tunables are env-overridable but ship with sane
+    # defaults: 4-digit code, 5-minute validity, 60s resend cooldown, 5 attempts.
+    verifyway_api_key: str | None = Field(default=None, alias="VERIFYWAY_API_KEY")
+    verifyway_base_url: str = Field(default=DEFAULT_VERIFYWAY_BASE_URL, alias="VERIFYWAY_BASE_URL")
+    verifyway_channel: str = Field(default="whatsapp", alias="VERIFYWAY_CHANNEL")
+    verifyway_timeout_seconds: float = Field(default=30.0, alias="VERIFYWAY_TIMEOUT_SECONDS")
+    verifyway_otp_length: int = Field(default=4, ge=4, le=8, alias="VERIFYWAY_OTP_LENGTH")
+    verifyway_otp_ttl_seconds: int = Field(default=300, ge=60, alias="VERIFYWAY_OTP_TTL_SECONDS")
+    verifyway_otp_resend_cooldown_seconds: int = Field(
+        default=60, ge=0, alias="VERIFYWAY_OTP_RESEND_COOLDOWN_SECONDS"
+    )
+    verifyway_otp_max_attempts: int = Field(default=5, ge=1, alias="VERIFYWAY_OTP_MAX_ATTEMPTS")
     wings_auth_token: str | None = Field(default=None, alias="WINGS_AUTH_TOKEN")
     wings_base_url: str = Field(default="https://wings.laveen-air.com/RIAM_main/rest/api", alias="WINGS_BASE_URL")
     wings_search_url: str | None = Field(default=None, alias="WINGS_SEARCH_URL")

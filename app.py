@@ -49,6 +49,7 @@ from fib_payment_api import (
 from push_notification import PushNotificationService, register_push_notification_routes
 from supabase_store import create_database
 from users import register_user_routes
+from verifyway import register_verifyway_routes
 from wings_api import register_wings_routes
 
 DEFAULT_CORS_ALLOWED_ORIGINS = [
@@ -285,9 +286,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.exception_handler(HTTPException)
     async def handle_http_exception(request: Request, exc: HTTPException) -> JSONResponse:
         _ = request
+        # Preserve exc.headers (Retry-After on 429s, WWW-Authenticate on 401s):
+        # re-wrapping into the error envelope must not strip them.
         return JSONResponse(
             status_code=exc.status_code,
             content=_error_envelope(status_code=exc.status_code, detail=exc.detail),
+            headers=exc.headers,
         )
 
     @app.exception_handler(SQLAlchemyTimeoutError)
@@ -478,6 +482,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     register_admin_routes(app, get_db)
     register_app_meta_routes(app, get_db)
     register_wings_routes(app, get_db)
+    register_verifyway_routes(app, get_db)
 
     return app
 
