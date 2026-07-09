@@ -3,17 +3,13 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
 
 import verifyway
 from app import create_app
 from config import get_settings
-from supabase_store import Base, OtpCode, normalize_database_url
 
 
 class VerifyWayOtpTest(unittest.TestCase):
@@ -28,82 +24,82 @@ class VerifyWayOtpTest(unittest.TestCase):
         os.environ["VERIFYWAY_API_KEY"] = "test-verifyway-key"
         get_settings.cache_clear()
 
-        self.engine = create_engine(
-            normalize_database_url(os.environ["DATABASE_URL"]),
-            connect_args={"check_same_thread": False},
-            future=True,
-        )
-        Base.metadata.create_all(self.engine)
-        self.session_factory = sessionmaker(bind=self.engine, autoflush=False, autocommit=False, future=True)
-
     def tearDown(self) -> None:
-        self.engine.dispose()
         os.environ.pop("VERIFYWAY_API_KEY", None)
         if os.path.exists(self.db_path):
             os.remove(self.db_path)
         get_settings.cache_clear()
 
-    def _send(self, client: TestClient, phone: str) -> tuple[dict, str]:
-        """POST /otp/send with the upstream call mocked; returns (json, sent code)."""
+    def _send(self, client: TestClient, phone: str) -> tuple[str, str]:
+        """POST /otp/send with the upstream call mocked; returns (challenge, sent code)."""
         with patch.object(verifyway, "_post_otp", new=AsyncMock(return_value={"status": "success"})) as mock_post:
             response = client.post("/api/v1/otp/send", json={"phone": phone})
         self.assertEqual(response.status_code, 200, response.text)
         recipient, code = mock_post.await_args.args
         self.assertFalse(recipient.startswith("+"))
-        return response.json(), code
+        body = response.json()
+        self.assertTrue(body["ok"])
+        self.assertNotIn(code, body["challenge"])  # code must never appear in the token
+        return body["challenge"], code
+
+    def _verify(self, client: TestClient, phone: str, code: str, challenge: str):
+        return client.post(
+            "/api/v1/otp/verify",
+            json={"phone": phone, "code": code, "challenge": challenge},
+        )
 
     def test_send_and_verify_happy_path(self) -> None:
         with TestClient(create_app()) as client:
-            body, code = self._send(client, "07507343635")
-            self.assertTrue(body["ok"])
-            self.assertEqual(body["channel"], "whatsapp")
-
-            verify = client.post("/api/v1/otp/verify", json={"phone": "07507343635", "code": code})
+            challenge, code = self._send(client, "07507343635")
+            verify = self._verify(client, "07507343635", code, challenge)
             self.assertEqual(verify.status_code, 200, verify.text)
-            self.assertTrue(verify.json()["verified"])
+            body = verify.json()
+            self.assertTrue(body["verified"])
             # Normalized Iraqi E.164 comes back so the FE can persist it.
-            self.assertEqual(verify.json()["phone"], "+9647507343635")
+            self.assertEqual(body["phone"], "+9647507343635")
+            self.assertTrue(body["verificationToken"])
 
-    def test_code_is_single_use(self) -> None:
+    def test_wrong_code_is_rejected(self) -> None:
         with TestClient(create_app()) as client:
-            _, code = self._send(client, "+9647507343635")
-            first = client.post("/api/v1/otp/verify", json={"phone": "+9647507343635", "code": code})
-            self.assertEqual(first.status_code, 200)
-            second = client.post("/api/v1/otp/verify", json={"phone": "+9647507343635", "code": code})
-            self.assertEqual(second.status_code, 400)
-
-    def test_wrong_code_burns_attempts_until_invalidated(self) -> None:
-        with TestClient(create_app()) as client:
-            _, code = self._send(client, "+9647507343635")
+            challenge, code = self._send(client, "+9647507343635")
             wrong = "0000" if code != "0000" else "1111"
-            for _ in range(get_settings().verifyway_otp_max_attempts):
-                attempt = client.post("/api/v1/otp/verify", json={"phone": "+9647507343635", "code": wrong})
-                self.assertEqual(attempt.status_code, 400)
-            # Attempts exhausted: even the correct code is now rejected.
-            final = client.post("/api/v1/otp/verify", json={"phone": "+9647507343635", "code": code})
-            self.assertEqual(final.status_code, 400)
-
-    def test_resend_within_cooldown_is_throttled(self) -> None:
-        with TestClient(create_app()) as client:
-            self._send(client, "+9647507343635")
-            with patch.object(verifyway, "_post_otp", new=AsyncMock(return_value={"status": "success"})):
-                retry = client.post("/api/v1/otp/send", json={"phone": "+9647507343635"})
-            self.assertEqual(retry.status_code, 429)
-            self.assertIn("Retry-After", retry.headers)
-
-    def test_expired_code_is_rejected(self) -> None:
-        with TestClient(create_app()) as client:
-            _, code = self._send(client, "+9647507343635")
-            with self.session_factory() as session:
-                row = session.get(OtpCode, "+9647507343635")
-                row.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
-                session.commit()
-            verify = client.post("/api/v1/otp/verify", json={"phone": "+9647507343635", "code": code})
+            verify = self._verify(client, "+9647507343635", wrong, challenge)
             self.assertEqual(verify.status_code, 400)
+            # The correct code still verifies afterwards.
+            ok = self._verify(client, "+9647507343635", code, challenge)
+            self.assertEqual(ok.status_code, 200)
+
+    def test_expired_challenge_is_rejected(self) -> None:
+        with TestClient(create_app()) as client:
+            with patch.object(verifyway, "_post_otp", new=AsyncMock(return_value={"status": "success"})):
+                client.post("/api/v1/otp/send", json={"phone": "+9647507343635"})
+            expired = verifyway._build_challenge("+9647507343635", "1234", ttl_seconds=-1)
+            verify = self._verify(client, "+9647507343635", "1234", expired)
+            self.assertEqual(verify.status_code, 400)
+
+    def test_challenge_is_bound_to_phone(self) -> None:
+        with TestClient(create_app()) as client:
+            challenge, code = self._send(client, "+9647507343635")
+            verify = self._verify(client, "+9647501112233", code, challenge)
+            self.assertEqual(verify.status_code, 400)
+
+    def test_tampered_challenge_is_rejected(self) -> None:
+        with TestClient(create_app()) as client:
+            challenge, code = self._send(client, "+9647507343635")
+            payload_segment, signature = challenge.split(".")
+            forged = verifyway._urlsafe_b64encode(
+                verifyway._json_dumps(
+                    {"typ": "otp-challenge", "phone": "+9647507343635", "iat": 0, "exp": 2**31, "nonce": "00"}
+                )
+            )
+            verify = self._verify(client, "+9647507343635", code, f"{forged}.{signature}")
+            self.assertEqual(verify.status_code, 400)
+            garbage = self._verify(client, "+9647507343635", code, "not-a-real-challenge-token")
+            self.assertEqual(garbage.status_code, 400)
 
     def test_verify_without_send_is_rejected(self) -> None:
         with TestClient(create_app()) as client:
-            verify = client.post("/api/v1/otp/verify", json={"phone": "+9647507343635", "code": "1234"})
+            verify = self._verify(client, "+9647507343635", "1234", "bogus.challenge-that-was-never-issued")
             self.assertEqual(verify.status_code, 400)
 
     def test_invalid_phone_is_rejected(self) -> None:
@@ -121,27 +117,14 @@ class VerifyWayOtpTest(unittest.TestCase):
             response = client.post("/api/v1/otp/send", json={"phone": "+9647507343635"})
         self.assertEqual(response.status_code, 503)
 
-    def test_upstream_failure_does_not_burn_cooldown(self) -> None:
+    def test_verification_token_roundtrip(self) -> None:
         with TestClient(create_app()) as client:
-            from fastapi import HTTPException
-
-            failing = AsyncMock(side_effect=HTTPException(status_code=502, detail="down"))
-            with patch.object(verifyway, "_post_otp", new=failing):
-                first = client.post("/api/v1/otp/send", json={"phone": "+9647507343635"})
-            self.assertEqual(first.status_code, 502)
-            # Delivery failed, so an immediate retry must NOT hit the cooldown.
-            _, code = self._send(client, "+9647507343635")
-            verify = client.post("/api/v1/otp/verify", json={"phone": "+9647507343635", "code": code})
-            self.assertEqual(verify.status_code, 200)
-
-    def test_recent_verification_is_consumable_once(self) -> None:
-        with TestClient(create_app()) as client:
-            _, code = self._send(client, "+9647507343635")
-            client.post("/api/v1/otp/verify", json={"phone": "+9647507343635", "code": code})
-        with self.session_factory() as session:
-            self.assertTrue(verifyway.consume_recent_verification(session, "07507343635"))
-        with self.session_factory() as session:
-            self.assertFalse(verifyway.consume_recent_verification(session, "07507343635"))
+            challenge, code = self._send(client, "+9647507343635")
+            verify = self._verify(client, "+9647507343635", code, challenge)
+            token = verify.json()["verificationToken"]
+        self.assertTrue(verifyway.validate_verification_token(token, "07507343635"))
+        self.assertFalse(verifyway.validate_verification_token(token, "+9647501112233"))
+        self.assertFalse(verifyway.validate_verification_token("garbage.token", "+9647507343635"))
 
     def test_health_reports_configuration(self) -> None:
         with TestClient(create_app()) as client:
@@ -150,7 +133,7 @@ class VerifyWayOtpTest(unittest.TestCase):
         body = response.json()
         self.assertTrue(body["ok"])
         self.assertTrue(body["api_key_configured"])
-        self.assertEqual(body["channel"], "whatsapp")
+        self.assertTrue(body["stateless"])
 
 
 if __name__ == "__main__":

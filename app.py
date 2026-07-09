@@ -482,7 +482,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     register_admin_routes(app, get_db)
     register_app_meta_routes(app, get_db)
     register_wings_routes(app, get_db)
-    register_verifyway_routes(app, get_db)
+    register_verifyway_routes(app)
 
     return app
 

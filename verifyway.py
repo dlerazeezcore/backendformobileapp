@@ -1,40 +1,49 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
+import json
 import logging
 import secrets
-from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+import time
+from typing import Any
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, Field
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
 
 from config import get_settings
 from phone_utils import normalize_phone
 from rate_limit import enforce_rate_limit
-from supabase_store import OtpCode
 
 LOGGER = logging.getLogger("uvicorn.error")
 
 # ---------------------------------------------------------------------------
-# VerifyWay OTP domain module.
+# VerifyWay OTP domain module — fully STATELESS (no DB, no process memory).
 #
-# Flow: POST /api/v1/otp/send generates a random numeric code server-side,
-# delivers it to the caller-supplied phone via VerifyWay (WhatsApp by default),
-# and stores only an HMAC digest of it. POST /api/v1/otp/verify checks the code
-# with attempt caps and TTL. Codes are single-use.
+# Send: generate a random numeric code, deliver it via VerifyWay (WhatsApp by
+# default), and return a signed "challenge" token to the client. The code is
+# NOT inside the token — it is mixed into the token's HMAC signature, so the
+# server can re-derive validity later without storing anything.
 #
-# State lives in the ``otp_codes`` table (one row per normalized phone,
-# migration 0049) — NOT in process memory. Production runs uvicorn with
-# multiple workers, so send and verify routinely land on different processes;
-# only shared storage makes the flow reliable.
+# Verify: client returns {phone, code, challenge}. We check the challenge's
+# expiry + phone binding, then recompute the HMAC with the submitted code; a
+# match proves this exact code was the one sent for this phone. On success we
+# mint a short-lived "phone verification" token (same HS256 shape as auth.py's
+# session JWTs) that login/signup/forgot-password flows can require as proof
+# of phone ownership via validate_verification_token().
+#
+# Statelessness works on any number of uvicorn workers. Known trade-off: a
+# (code, challenge) pair stays re-verifiable until the challenge expires
+# (single-use bookkeeping needs storage); TTL + per-phone rate limits keep
+# that window small, and an attacker still needs BOTH the WhatsApp code and
+# the challenge held by the requesting device.
 # ---------------------------------------------------------------------------
 
-_VERIFIED_TTL_SECONDS = 600  # window in which a successful verify can be consumed
+_CHALLENGE_TYP = "otp-challenge"
+_VERIFICATION_TYP = "phone-verification"
+_VERIFICATION_TTL_SECONDS = 600
 
 
 class VerifyWayError(Exception):
@@ -42,17 +51,24 @@ class VerifyWayError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Code generation & hashing. Only the HMAC digest is stored, keyed with the
-# deployment auth secret, so a DB leak or stray log never exposes a live
-# code. The plaintext code exists only in the outbound VerifyWay request.
+# Token plumbing (same stdlib-HMAC style as auth.py; local copies keep the
+# domain self-contained per the one-file-per-domain rule).
 # ---------------------------------------------------------------------------
+def _urlsafe_b64encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _urlsafe_b64decode(raw: str) -> bytes:
+    padding = "=" * (-len(raw) % 4)
+    return base64.urlsafe_b64decode((raw + padding).encode("ascii"))
+
+
+def _json_dumps(payload: dict[str, Any]) -> bytes:
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
 def _generate_code(length: int) -> str:
     return f"{secrets.randbelow(10 ** length):0{length}d}"
-
-
-def _code_digest(phone: str, code: str) -> str:
-    key = get_settings().auth_secret_key.encode("utf-8")
-    return hmac.new(key, f"{phone}:{code}".encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def _to_recipient(normalized_phone: str) -> str:
@@ -60,33 +76,90 @@ def _to_recipient(normalized_phone: str) -> str:
     return normalized_phone.lstrip("+")
 
 
-def _utcnow() -> datetime:
-    # This module writes/compares in plain UTC (NOT supabase_store.utcnow's
-    # GMT+3): SQLite drops the offset on write, so any non-UTC zone would skew
-    # every reread timestamp by the offset. Postgres timestamptz is unaffected.
-    return datetime.now(timezone.utc)
+def _challenge_signature(payload_segment: str, code: str) -> bytes:
+    # The submitted code is part of the MAC input, NOT the token payload:
+    # possession of the challenge alone reveals nothing about the code.
+    key = get_settings().auth_secret_key.encode("utf-8")
+    return hmac.new(key, f"{payload_segment}.{code}".encode("utf-8"), hashlib.sha256).digest()
 
 
-def _as_aware(value: datetime | None) -> datetime | None:
-    # SQLite returns naive datetimes even for DateTime(timezone=True); Postgres
-    # returns aware ones. Normalize so comparisons never raise.
-    if value is not None and value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value
+def _build_challenge(phone: str, code: str, ttl_seconds: int) -> str:
+    now = int(time.time())
+    payload_segment = _urlsafe_b64encode(
+        _json_dumps(
+            {
+                "typ": _CHALLENGE_TYP,
+                "phone": phone,
+                "iat": now,
+                "exp": now + ttl_seconds,
+                "nonce": secrets.token_hex(8),
+            }
+        )
+    )
+    return f"{payload_segment}.{_urlsafe_b64encode(_challenge_signature(payload_segment, code))}"
 
 
-def consume_recent_verification(db: Session, phone: str) -> bool:
-    """Return True (once) if ``phone`` completed OTP verification within the
-    last _VERIFIED_TTL_SECONDS. Consuming clears the flag so a single verify
-    cannot authorize two separate sensitive actions."""
-    normalized = normalize_phone(phone)
-    row = db.get(OtpCode, normalized)
-    verified_at = _as_aware(row.verified_at) if row is not None else None
-    if verified_at is None:
+def _check_challenge(challenge: str, phone: str, code: str) -> bool:
+    parts = challenge.split(".")
+    if len(parts) != 2:
         return False
-    row.verified_at = None
-    db.commit()
-    return (_utcnow() - verified_at) <= timedelta(seconds=_VERIFIED_TTL_SECONDS)
+    payload_segment, signature_segment = parts
+    try:
+        payload = json.loads(_urlsafe_b64decode(payload_segment).decode("utf-8"))
+        provided_signature = _urlsafe_b64decode(signature_segment)
+    except Exception:
+        return False
+    if not isinstance(payload, dict) or payload.get("typ") != _CHALLENGE_TYP:
+        return False
+    if payload.get("phone") != phone:
+        return False
+    exp = payload.get("exp")
+    if not isinstance(exp, int) or exp <= int(time.time()):
+        return False
+    return hmac.compare_digest(provided_signature, _challenge_signature(payload_segment, code))
+
+
+def _mint_verification_token(phone: str) -> str:
+    now = int(time.time())
+    payload_segment = _urlsafe_b64encode(
+        _json_dumps(
+            {
+                "typ": _VERIFICATION_TYP,
+                "phone": phone,
+                "iat": now,
+                "exp": now + _VERIFICATION_TTL_SECONDS,
+            }
+        )
+    )
+    key = get_settings().auth_secret_key.encode("utf-8")
+    signature = hmac.new(key, payload_segment.encode("ascii"), hashlib.sha256).digest()
+    return f"{payload_segment}.{_urlsafe_b64encode(signature)}"
+
+
+def validate_verification_token(token: str, phone: str) -> bool:
+    """True when ``token`` is an unexpired proof that ``phone`` passed OTP
+    verification. For auth flows (login/signup/password reset) to call once
+    they are wired to require phone proof."""
+    normalized = normalize_phone(phone)
+    parts = (token or "").split(".")
+    if len(parts) != 2:
+        return False
+    payload_segment, signature_segment = parts
+    key = get_settings().auth_secret_key.encode("utf-8")
+    expected = hmac.new(key, payload_segment.encode("ascii"), hashlib.sha256).digest()
+    try:
+        provided = _urlsafe_b64decode(signature_segment)
+        payload = json.loads(_urlsafe_b64decode(payload_segment).decode("utf-8"))
+    except Exception:
+        return False
+    if not hmac.compare_digest(provided, expected):
+        return False
+    if not isinstance(payload, dict) or payload.get("typ") != _VERIFICATION_TYP:
+        return False
+    if payload.get("phone") != normalized:
+        return False
+    exp = payload.get("exp")
+    return isinstance(exp, int) and exp > int(time.time())
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +223,7 @@ class OtpSendRequest(BaseModel):
 class OtpVerifyRequest(BaseModel):
     phone: str
     code: str = Field(..., min_length=4, max_length=8)
+    challenge: str = Field(..., min_length=16, description="Opaque token returned by /otp/send")
 
 
 def _normalized_or_400(phone: str) -> str:
@@ -166,7 +240,7 @@ def _normalized_or_400(phone: str) -> str:
 # ---------------------------------------------------------------------------
 # Routes.
 # ---------------------------------------------------------------------------
-def register_verifyway_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
+def register_verifyway_routes(app: FastAPI) -> None:
     def _client_ip(request: Request) -> str:
         client = request.client
         return client.host if client and client.host else "unknown"
@@ -182,98 +256,58 @@ def register_verifyway_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
             "api_key_configured": bool(settings.verifyway_api_key),
             "code_length": settings.verifyway_otp_length,
             "ttl_seconds": settings.verifyway_otp_ttl_seconds,
+            "stateless": True,
         }
 
     @app.post("/api/v1/otp/send")
-    async def otp_send(
-        payload: OtpSendRequest,
-        request: Request,
-        db: Session = Depends(get_db),
-    ) -> dict[str, Any]:
+    async def otp_send(payload: OtpSendRequest, request: Request) -> dict[str, Any]:
         settings = get_settings()
         normalized = _normalized_or_400(payload.phone)
 
-        # Abuse brakes: per-IP and per-phone sliding windows, plus a hard
-        # resend cooldown so one phone cannot be flooded with WhatsApp messages.
+        # Abuse brakes (process-local sliding windows, same trade-off as the
+        # login limiter): hourly caps per IP and per phone, plus a 1-per-cooldown
+        # window per phone standing in for a resend cooldown.
         enforce_rate_limit(f"otp:send:ip:{_client_ip(request)}", max_events=10, window_seconds=3600)
         enforce_rate_limit(f"otp:send:phone:{normalized}", max_events=5, window_seconds=3600)
-
-        now = _utcnow()
         cooldown = settings.verifyway_otp_resend_cooldown_seconds
-        row = db.get(OtpCode, normalized)
-        last_sent_at = _as_aware(row.last_sent_at) if row is not None else None
-        if last_sent_at is not None:
-            elapsed = (now - last_sent_at).total_seconds()
-            if elapsed < cooldown:
-                raise HTTPException(
-                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    detail="A code was just sent. Please wait before requesting another.",
-                    headers={"Retry-After": str(max(1, int(cooldown - elapsed) + 1))},
-                )
+        if cooldown > 0:
+            enforce_rate_limit(f"otp:send:cooldown:{normalized}", max_events=1, window_seconds=cooldown)
 
         code = _generate_code(settings.verifyway_otp_length)
         await _post_otp(_to_recipient(normalized), code)
-
-        # Persist only after a successful upstream send so a delivery failure
-        # never burns the resend cooldown.
-        if row is None:
-            row = OtpCode(phone=normalized)
-            db.add(row)
-        row.code_digest = _code_digest(normalized, code)
-        row.expires_at = now + timedelta(seconds=settings.verifyway_otp_ttl_seconds)
-        row.attempts_left = settings.verifyway_otp_max_attempts
-        row.last_sent_at = now
-        row.verified_at = None
-        try:
-            db.commit()
-        except IntegrityError:
-            # Two concurrent first-sends raced on the same phone; the other
-            # request's code is live, so surface the cooldown response.
-            db.rollback()
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="A code was just sent. Please wait before requesting another.",
-                headers={"Retry-After": str(cooldown)},
-            )
 
         return {
             "ok": True,
             "channel": settings.verifyway_channel,
             "expiresInSeconds": settings.verifyway_otp_ttl_seconds,
             "resendInSeconds": cooldown,
+            "challenge": _build_challenge(normalized, code, settings.verifyway_otp_ttl_seconds),
         }
 
     @app.post("/api/v1/otp/verify")
-    async def otp_verify(
-        payload: OtpVerifyRequest,
-        request: Request,
-        db: Session = Depends(get_db),
-    ) -> dict[str, Any]:
+    async def otp_verify(payload: OtpVerifyRequest, request: Request) -> dict[str, Any]:
+        settings = get_settings()
         normalized = _normalized_or_400(payload.phone)
-        enforce_rate_limit(f"otp:verify:ip:{_client_ip(request)}", max_events=30, window_seconds=3600)
 
-        submitted = payload.code.strip()
-        now = _utcnow()
-        invalid = HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid or expired code. Please request a new one.",
+        # Brute-force brakes: the per-phone window doubles as the attempt cap
+        # (max_attempts tries per code lifetime).
+        enforce_rate_limit(f"otp:verify:ip:{_client_ip(request)}", max_events=30, window_seconds=3600)
+        enforce_rate_limit(
+            f"otp:verify:phone:{normalized}",
+            max_events=settings.verifyway_otp_max_attempts,
+            window_seconds=settings.verifyway_otp_ttl_seconds,
         )
 
-        row = db.get(OtpCode, normalized)
-        expires_at = _as_aware(row.expires_at) if row is not None else None
-        if row is None or not row.code_digest or expires_at is None or now >= expires_at:
-            raise invalid
-        if not hmac.compare_digest(row.code_digest, _code_digest(normalized, submitted)):
-            row.attempts_left -= 1
-            if row.attempts_left <= 0:
-                row.code_digest = None
-                row.expires_at = None
-            db.commit()
-            raise invalid
-        # Success: single-use — clear the pending code, record the proof.
-        row.code_digest = None
-        row.expires_at = None
-        row.verified_at = now
-        db.commit()
+        if not _check_challenge(payload.challenge, normalized, payload.code.strip()):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid or expired code. Please request a new one.",
+            )
 
-        return {"ok": True, "verified": True, "phone": normalized}
+        return {
+            "ok": True,
+            "verified": True,
+            "phone": normalized,
+            "verificationToken": _mint_verification_token(normalized),
+            "verificationExpiresInSeconds": _VERIFICATION_TTL_SECONDS,
+        }

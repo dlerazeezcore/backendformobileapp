@@ -501,25 +501,6 @@ class AdminUser(TimeMixin, Base):
     )
 
 
-class OtpCode(TimeMixin, Base):
-    """Pending VerifyWay OTP state, one row per normalized phone (verifyway.py).
-
-    DB-backed (migration 0049) because production runs uvicorn with multiple
-    workers — an in-memory store would make verify fail whenever it lands on a
-    different worker than send. ``code_digest`` holds an HMAC of the code (never
-    plaintext); it is cleared on successful verify while ``verified_at`` stays
-    briefly so auth flows can consume the "phone was just proven" fact.
-    """
-
-    __tablename__ = "otp_codes"
-    phone: Mapped[str] = mapped_column(String(64), primary_key=True)
-    code_digest: Mapped[str | None] = mapped_column(String(128))
-    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    attempts_left: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    last_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-
-
 # Case-insensitive partial unique email indexes (created in migration 0035).
 # Declared at module level so the column attributes exist; keeps models in sync
 # with the DB so autogenerate does not try to drop them.
