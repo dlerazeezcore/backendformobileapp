@@ -6,7 +6,7 @@ import unittest
 
 from fastapi.testclient import TestClient
 
-from app import create_app
+from app import _get_cors_allow_origin_regex, create_app
 from config import get_settings
 
 
@@ -92,6 +92,30 @@ class CorsPreflightTest(unittest.TestCase):
                     self.assertEqual(response.headers.get("access-control-allow-origin"), origin)
                     # Credentialed CORS must echo the specific origin (never "*").
                     self.assertEqual(response.headers.get("access-control-allow-credentials"), "true")
+
+    def test_unanchored_origin_regex_with_credentials_refuses_startup(self) -> None:
+        # Audit #13: an unanchored regex under allow_credentials=True is a hard
+        # security misconfiguration ("https://app.example.com" also matches
+        # "https://app.example.com.evil.io") — the app must fail fast.
+        os.environ["CORS_ALLOW_ORIGIN_REGEX"] = "https://app\\.example\\.com"
+        try:
+            with self.assertRaises(RuntimeError):
+                _get_cors_allow_origin_regex(allow_credentials=True)
+            with self.assertRaises(RuntimeError):
+                create_app()
+            # Without credentials the unanchored pattern stays a warning-only path.
+            self.assertEqual(
+                _get_cors_allow_origin_regex(allow_credentials=False),
+                "https://app\\.example\\.com",
+            )
+            # Properly anchored patterns are accepted with credentials enabled.
+            os.environ["CORS_ALLOW_ORIGIN_REGEX"] = "^https://app\\.example\\.com$"
+            self.assertEqual(
+                _get_cors_allow_origin_regex(allow_credentials=True),
+                "^https://app\\.example\\.com$",
+            )
+        finally:
+            os.environ.pop("CORS_ALLOW_ORIGIN_REGEX", None)
 
     def test_unknown_origins_are_not_reflected(self) -> None:
         unknown_origins = [

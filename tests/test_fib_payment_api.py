@@ -81,6 +81,10 @@ class FIBPaymentAPITest(unittest.IsolatedAsyncioTestCase):
 
 class _FakeProvider:
     webhook_secret = "whsec"
+    # The route's plaintext-secret fallback is now secure-by-default (False),
+    # mirroring FIB_WEBHOOK_ALLOW_PLAINTEXT_SECRET in config.py. These tests
+    # exercise the X-FIB-WEBHOOK-SECRET header path, so opt in explicitly.
+    webhook_allow_plaintext_secret = True
 
     async def create_payment(self, payload: CreatePaymentRequest) -> CreatePaymentResponse:
         _ = payload

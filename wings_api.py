@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any, Callable
 
 import httpx
@@ -15,6 +16,22 @@ from config import get_settings
 from supabase_store import AdminUser, AppUser
 
 LOGGER = logging.getLogger("uvicorn.error")
+
+_DIGIT_RUN = re.compile(r"\d{7,}")
+_LOG_BODY_MAX_CHARS = 500
+
+
+def _scrub_digits(value: object, *, max_chars: int = _LOG_BODY_MAX_CHARS) -> str:
+    """Redact long digit runs (7+) and truncate before logging upstream bodies.
+
+    Mirrors verifyway._scrub_phone_digits (kept local — one-file-per-domain):
+    WINGS error payloads can echo passenger phone numbers / document numbers,
+    which must not land verbatim in the logs (audit #11).
+    """
+    scrubbed = _DIGIT_RUN.sub("***", str(value))
+    if len(scrubbed) > max_chars:
+        return scrubbed[:max_chars] + "...[truncated]"
+    return scrubbed
 
 
 def _wings_search_url() -> str:
@@ -155,10 +172,12 @@ async def _post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
     except Exception:
         body = {"raw_text": resp.text}
     if resp.status_code >= 400:
+        # Scrubbed + truncated summary only — never the full upstream body
+        # (it can echo passenger PII and provider internals; audit #11).
         LOGGER.error(
             "WINGS upstream availability request failed: status=%s body=%s",
             resp.status_code,
-            body,
+            _scrub_digits(body),
         )
         raise HTTPException(
             status_code=502,

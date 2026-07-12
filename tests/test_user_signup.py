@@ -11,7 +11,22 @@ from sqlalchemy.orm import sessionmaker
 from app import create_app
 from auth import hash_password, verify_password
 from config import get_settings
+from phone_utils import normalize_phone
 from supabase_store import AdminUser, AppUser, Base, normalize_database_url
+from verifyway import _mint_verification_token
+
+
+def _vtoken(phone: str) -> str:
+    """Mint a valid WhatsApp-OTP verification token for ``phone``.
+
+    Signup now requires a proof-of-phone token (auth.SignupPayload). The token
+    binds to normalize_phone(phone); validate_verification_token re-normalizes
+    the phone it is checked against, so an already-E.164 number is idempotent.
+    Call this from inside a test method — i.e. AFTER setUp has set
+    AUTH_SECRET_KEY and cleared the settings cache — so the mint secret matches
+    the app's.
+    """
+    return _mint_verification_token(normalize_phone(phone))
 
 
 class PublicUserSignupTest(unittest.TestCase):
@@ -68,6 +83,7 @@ class PublicUserSignupTest(unittest.TestCase):
                     "phone": "+9647700000100",
                     "name": "New Customer",
                     "password": "StrongPass123",
+                    "verificationToken": _vtoken("+9647700000100"),
                 },
             )
             self.assertEqual(response.status_code, 200)
@@ -131,6 +147,7 @@ class PublicUserSignupTest(unittest.TestCase):
                     "phone": "+9647700000101",
                     "name": "Alias User",
                     "password": "StrongPass123",
+                    "verificationToken": _vtoken("+9647700000101"),
                 },
             )
             self.assertEqual(response.status_code, 200)
@@ -146,6 +163,7 @@ class PublicUserSignupTest(unittest.TestCase):
                     "phone": "+9647700000002",
                     "name": "Duplicate User",
                     "password": "StrongPass123",
+                    "verificationToken": _vtoken("+9647700000002"),
                 },
             )
             self.assertEqual(response.status_code, 409)
@@ -159,6 +177,7 @@ class PublicUserSignupTest(unittest.TestCase):
                     "phone": "+9647700000001",
                     "name": "Conflicting User",
                     "password": "StrongPass123",
+                    "verificationToken": _vtoken("+9647700000001"),
                 },
             )
             self.assertEqual(response.status_code, 409)
@@ -172,9 +191,62 @@ class PublicUserSignupTest(unittest.TestCase):
                     "phone": "0770000123",
                     "name": "Invalid Phone",
                     "password": "StrongPass123",
+                    # Field must be present to clear pydantic; the phone 422s
+                    # before the token is ever validated, so a dummy is fine.
+                    "verificationToken": _vtoken("0770000123"),
                 },
             )
             self.assertEqual(response.status_code, 422)
+
+    def test_signup_requires_verification_token(self) -> None:
+        with TestClient(create_app()) as client:
+            # Present but invalid token → handler rejects with 400 AUTH_OTP_REQUIRED.
+            invalid_token = client.post(
+                "/api/v1/auth/user/signup",
+                json={
+                    "phone": "+9647700000150",
+                    "name": "No OTP User",
+                    "password": "StrongPass123",
+                    "verificationToken": "not-a-real-token",
+                },
+            )
+            self.assertEqual(invalid_token.status_code, 400)
+            self.assertEqual(
+                (invalid_token.json().get("detail") or {}).get("code"),
+                "AUTH_OTP_REQUIRED",
+            )
+
+            # A valid token minted for a DIFFERENT phone must not pass either.
+            wrong_phone_token = client.post(
+                "/api/v1/auth/user/signup",
+                json={
+                    "phone": "+9647700000150",
+                    "name": "No OTP User",
+                    "password": "StrongPass123",
+                    "verificationToken": _vtoken("+9647700000151"),
+                },
+            )
+            self.assertEqual(wrong_phone_token.status_code, 400)
+            self.assertEqual(
+                (wrong_phone_token.json().get("detail") or {}).get("code"),
+                "AUTH_OTP_REQUIRED",
+            )
+
+            # Field absent entirely → pydantic rejects with 422 before the handler.
+            missing_token = client.post(
+                "/api/v1/auth/user/signup",
+                json={
+                    "phone": "+9647700000150",
+                    "name": "No OTP User",
+                    "password": "StrongPass123",
+                },
+            )
+            self.assertEqual(missing_token.status_code, 422)
+
+        # Nothing was persisted for the rejected signups.
+        with self.session_factory() as session:
+            row = session.scalar(select(AppUser).where(AppUser.phone == "+9647700000150"))
+            self.assertIsNone(row)
 
     def test_authenticated_user_can_self_delete(self) -> None:
         with TestClient(create_app()) as client:
@@ -184,6 +256,7 @@ class PublicUserSignupTest(unittest.TestCase):
                     "phone": "+9647700000199",
                     "name": "Delete Me",
                     "password": "StrongPass123",
+                    "verificationToken": _vtoken("+9647700000199"),
                 },
             )
             self.assertEqual(signup_response.status_code, 200)
@@ -228,6 +301,7 @@ class PublicUserSignupTest(unittest.TestCase):
                     "phone": "+9647700000201",
                     "name": "Before Name",
                     "password": "StrongPass123",
+                    "verificationToken": _vtoken("+9647700000201"),
                 },
             )
             self.assertEqual(signup_response.status_code, 200)
@@ -265,6 +339,7 @@ class PublicUserSignupTest(unittest.TestCase):
                     "phone": "+9647700000202",
                     "name": "Email User",
                     "password": "StrongPass123",
+                    "verificationToken": _vtoken("+9647700000202"),
                 },
             )
             self.assertEqual(signup_response.status_code, 200)
@@ -308,6 +383,7 @@ class PublicUserSignupTest(unittest.TestCase):
                     "phone": "+9647700000203",
                     "name": "Invalid Email User",
                     "password": "StrongPass123",
+                    "verificationToken": _vtoken("+9647700000203"),
                 },
             )
             self.assertEqual(signup_response.status_code, 200)
@@ -368,6 +444,93 @@ class PublicUserSignupTest(unittest.TestCase):
             with self.session_factory() as session:
                 row = session.scalar(select(AppUser).where(AppUser.phone == "+9647700000002"))
                 self.assertEqual(row.app_version, "2.0.1")
+
+    def test_stamp_app_version_does_not_commit_unrelated_pending_state(self) -> None:
+        # Audit #10: the stamp is an isolated write in its own short-lived
+        # session — it must not flush/commit other pending changes sitting in
+        # the request session of an otherwise read-only handler.
+        from auth import _stamp_app_version
+
+        with self.session_factory() as db:
+            user = db.scalar(select(AppUser).where(AppUser.phone == "+9647700000002"))
+            admin = db.scalar(select(AdminUser).where(AdminUser.phone == "+9647700000001"))
+            self.assertIsNotNone(user)
+            self.assertIsNotNone(admin)
+            assert user is not None and admin is not None
+            admin.name = "Pending Rename"  # unrelated dirty state, never committed
+
+            _stamp_app_version(db, user, "3.1.4")
+
+            # The loaded row reflects the stamp without being marked dirty.
+            self.assertEqual(user.app_version, "3.1.4")
+            self.assertNotIn(user, db.dirty)
+
+        with self.session_factory() as session:
+            stamped = session.scalar(select(AppUser).where(AppUser.phone == "+9647700000002"))
+            assert stamped is not None
+            self.assertEqual(stamped.app_version, "3.1.4")
+            self.assertIsNotNone(stamped.app_version_updated_at)
+            untouched = session.scalar(select(AdminUser).where(AdminUser.phone == "+9647700000001"))
+            assert untouched is not None
+            self.assertEqual(untouched.name, "Admin User")
+
+    def test_auth_me_patch_changes_password_for_user(self) -> None:
+        # Audit #11: self-service password change moved from the retired
+        # non-admin branch of POST /admin/users to PATCH /auth/me.
+        with TestClient(create_app()) as client:
+            login = client.post(
+                "/api/v1/auth/user/login",
+                json={"phone": "+9647700000002", "password": "StrongPass123"},
+            )
+            self.assertEqual(login.status_code, 200)
+            headers = {"Authorization": f"Bearer {login.json()['accessToken']}"}
+
+            too_short = client.patch(
+                "/api/v1/auth/me",
+                headers=headers,
+                json={"password": "short", "currentPassword": "StrongPass123"},
+            )
+            self.assertEqual(too_short.status_code, 422)
+
+            # SEC hardening: a bearer token alone must not be able to re-key
+            # the account — the current password is required and verified.
+            missing_current = client.patch(
+                "/api/v1/auth/me",
+                headers=headers,
+                json={"password": "NewStrongPass456"},
+            )
+            self.assertEqual(missing_current.status_code, 401)
+
+            wrong_current = client.patch(
+                "/api/v1/auth/me",
+                headers=headers,
+                json={"password": "NewStrongPass456", "currentPassword": "WrongPass999"},
+            )
+            self.assertEqual(wrong_current.status_code, 401)
+
+            update = client.patch(
+                "/api/v1/auth/me",
+                headers=headers,
+                json={"password": "NewStrongPass456", "currentPassword": "StrongPass123"},
+            )
+            self.assertEqual(update.status_code, 200, update.text)
+
+            relogin_old = client.post(
+                "/api/v1/auth/user/login",
+                json={"phone": "+9647700000002", "password": "StrongPass123"},
+            )
+            self.assertEqual(relogin_old.status_code, 401)
+
+            relogin_new = client.post(
+                "/api/v1/auth/user/login",
+                json={"phone": "+9647700000002", "password": "NewStrongPass456"},
+            )
+            self.assertEqual(relogin_new.status_code, 200)
+
+        with self.session_factory() as session:
+            row = session.scalar(select(AppUser).where(AppUser.phone == "+9647700000002"))
+            assert row is not None
+            self.assertTrue(verify_password("NewStrongPass456", row.password_hash))
 
 
 if __name__ == "__main__":

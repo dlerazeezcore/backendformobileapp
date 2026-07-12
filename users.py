@@ -189,42 +189,17 @@ def register_user_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
     def save_user(
         payload: UserPayload,
         db: Session = Depends(get_db),
-        actor: AdminUser | AppUser = Depends(_require_active_actor),
+        _: AdminUser = Depends(_require_permission("can_manage_users")),
     ) -> dict[str, Any]:
+        # Audit #11: this /admin/-prefixed route is admin-only now. The old
+        # non-admin self-profile branch (name/email/password, phone-ownership
+        # checked) moved to PATCH /auth/me in auth.py, which owns all
+        # self-service profile updates; self-delete is DELETE /auth/me.
         data = payload.model_dump(by_alias=False)
         password = data.pop("password", None)
         if password is not None:
             data["password_hash"] = hash_password(password)
-
-        if isinstance(actor, AppUser):
-            actor_row = db.scalar(select(AppUser).where(AppUser.id == actor.id))
-            if actor_row is None:
-                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Auth subject not found")
-            requested_phone = str(data.get("phone") or "").strip()
-            if actor_row.phone not in phone_lookup_candidates(requested_phone):
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="You can only update your own user profile.",
-                )
-
-            actor_row.name = data.get("name") or actor_row.name
-            # M2: only touch email when the client actually sent the field —
-            # an omitted email must not wipe the stored address (null still clears).
-            if "email" in payload.model_fields_set:
-                actor_row.email = data.get("email")
-            if "password_hash" in data:
-                actor_row.password_hash = data["password_hash"]
-
-            requested_status = str(data.get("status") or "").strip().lower()
-            if requested_status == "deleted":
-                actor_row.status = "deleted"
-                actor_row.deleted_at = actor_row.deleted_at or utcnow()
-
-            actor_row.updated_at = utcnow()
-            user = actor_row
-        else:
-            _ensure_admin_permission(actor, "can_manage_users")
-            user = SupabaseStore(db).ensure_user(**data)
+        user = SupabaseStore(db).ensure_user(**data)
 
         try:
             db.commit()

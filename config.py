@@ -11,11 +11,15 @@ DEFAULT_ESIM_ACCESS_BASE_URL = "https://api.esimaccess.com"
 DEFAULT_ESIM_ACCESS_TIMEOUT_SECONDS = 30.0
 DEFAULT_ESIM_ACCESS_RATE_LIMIT_PER_SECOND = 8.0
 DEFAULT_AUTH_SECRET_KEY = "change-me-before-production"
-DEFAULT_AUTH_TOKEN_TTL_SECONDS = 24 * 60 * 60
+# Session lifetime. The old 24h default silently signed users out roughly daily
+# ("signed out after time"). Sessions are meant to be durable: the client rolls
+# the token forward on every app open via POST /auth/refresh, so an active user
+# effectively never has to re-authenticate. 60 days is the hard ceiling for a
+# user who does not open the app at all in that window. Override with
+# AUTH_TOKEN_TTL_SECONDS. NOTE: these bearer tokens are not individually
+# revocable — rotating AUTH_SECRET_KEY invalidates all sessions at once.
+DEFAULT_AUTH_TOKEN_TTL_SECONDS = 60 * 24 * 60 * 60
 DEFAULT_FIB_PAYMENT_BASE_URL = "https://fib.prod.fib.iq"
-DEFAULT_FIB_PAYMENT_STATUS_CALLBACK_URL = (
-    "https://mean-lettie-corevia-0bd7cc91.koyeb.app/api/v1/payments/fib/webhook"
-)
 DEFAULT_FIB_PAYMENT_REDIRECT_URI = "tulip://payment/result"
 DEFAULT_VERIFYWAY_BASE_URL = "https://api.verifyway.com/api/v1/"
 
@@ -62,6 +66,11 @@ def read_int_env(name: str, default: int, *, minimum: int = 0) -> int:
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
+    # Serve the interactive API docs (/docs, /redoc, /openapi.json). Default True
+    # so local development is unchanged; set API_DOCS_ENABLED=false in production
+    # because the docs enumerate the full admin/payment surface to anonymous
+    # visitors (audit finding #14).
+    api_docs_enabled: bool = Field(default=True, alias="API_DOCS_ENABLED")
     esim_access_access_code: str = Field(alias="ESIM_ACCESS_ACCESS_CODE")
     esim_access_secret_key: str = Field(alias="ESIM_ACCESS_SECRET_KEY")
     esim_access_webhook_secret: str | None = Field(default=None, alias="ESIM_ACCESS_WEBHOOK_SECRET")
@@ -79,8 +88,12 @@ class Settings(BaseSettings):
         default=False, alias="FIB_WEBHOOK_ALLOW_PLAINTEXT_SECRET"
     )
     fib_payment_base_url: str = Field(default=DEFAULT_FIB_PAYMENT_BASE_URL, alias="FIB_PAYMENT_BASE_URL")
-    fib_payment_status_callback_url: str = Field(
-        default=DEFAULT_FIB_PAYMENT_STATUS_CALLBACK_URL, alias="FIB_PAYMENT_STATUS_CALLBACK_URL"
+    # Deployment-specific webhook URL FIB calls back with payment status. No
+    # hardcoded default (audit #6) — set FIB_PAYMENT_STATUS_CALLBACK_URL per
+    # deployment. When unset, payment creation omits statusCallbackUrl and
+    # confirmation relies on server-side status polling (startup logs an ERROR).
+    fib_payment_status_callback_url: str | None = Field(
+        default=None, alias="FIB_PAYMENT_STATUS_CALLBACK_URL"
     )
     fib_payment_redirect_uri: str = Field(default=DEFAULT_FIB_PAYMENT_REDIRECT_URI, alias="FIB_PAYMENT_REDIRECT_URI")
     firebase_service_account_file: str | None = Field(default=None, alias="FIREBASE_SERVICE_ACCOUNT_FILE")

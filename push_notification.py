@@ -810,10 +810,21 @@ def register_push_notification_routes(
             audience_user_ids: list[str] = []
             recipient_scope = "direct_tokens"
             if audience:
+                audience_token_fetch_limit = 20000
                 audience_tokens, audience_user_ids = store.list_push_tokens_for_audience(
                     audience=audience,
-                    limit=20000,
+                    limit=audience_token_fetch_limit,
                 )
+                # Audit #14: the fetch is capped, not paginated. If we got exactly
+                # `limit` tokens back the audience almost certainly exceeds the cap
+                # and the overflow devices will silently miss this push — say so.
+                if len(audience_tokens) >= audience_token_fetch_limit:
+                    logger.warning(
+                        "push.send.audience_token_fetch_hit_cap audience=%s limit=%s — "
+                        "token fetch hit the cap; some devices may not receive this push",
+                        audience,
+                        audience_token_fetch_limit,
+                    )
                 recipient_scope = f"audience:{audience}"
 
             store_tokens: list[str] = []

@@ -10,7 +10,6 @@ seeded by Alembic migration 0040.
 """
 from __future__ import annotations
 
-import asyncio
 from typing import Any, Callable
 
 from fastapi import Depends, FastAPI, HTTPException, Response, status
@@ -59,16 +58,26 @@ def _serialize(row: AppReleaseInfo) -> dict[str, Any]:
     }
 
 
+def _default_row() -> AppReleaseInfo:
+    """Transient (never persisted here) instance carrying the in-code defaults.
+
+    Used by the public GET to answer read-only when the singleton row is absent,
+    and by ``_get_or_create`` (admin PUT path) as the row to persist."""
+    return AppReleaseInfo(
+        id=1,
+        latest_version="1.0.0",
+        min_supported_version="1.0.0",
+        app_store_url=DEFAULT_APP_STORE_URL,
+        play_store_url=DEFAULT_PLAY_STORE_URL,
+    )
+
+
 def _get_or_create(db: Session) -> AppReleaseInfo:
+    """Admin-PUT-only helper: creates the singleton if migration 0040's seed row
+    is missing. The public GET must NOT call this — it stays read-only (AUDIT-8)."""
     row = db.scalar(select(AppReleaseInfo).where(AppReleaseInfo.id == 1))
     if row is None:
-        row = AppReleaseInfo(
-            id=1,
-            latest_version="1.0.0",
-            min_supported_version="1.0.0",
-            app_store_url=DEFAULT_APP_STORE_URL,
-            play_store_url=DEFAULT_PLAY_STORE_URL,
-        )
+        row = _default_row()
         db.add(row)
         db.flush()
     return row
@@ -100,8 +109,16 @@ def register_app_meta_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
 
     @app.get("/api/v1/app/version-info")
     def get_version_info(db: Session = Depends(get_db)) -> dict[str, Any]:
-        row = _get_or_create(db)
-        db.commit()
+        # AUDIT-8: public + unauthenticated, so this endpoint is strictly
+        # read-only. If migration 0040's seed row is somehow absent, answer with
+        # the in-code defaults instead of INSERTing (which raced concurrent
+        # boot-time callers into a PK collision on the id=1 singleton). Only the
+        # admin PUT below may create the row.
+        row = db.scalar(select(AppReleaseInfo).where(AppReleaseInfo.id == 1))
+        if row is None:
+            # Transient instance — never added to the session; `updatedAt` is
+            # null because nothing has ever been published.
+            row = _default_row()
         return _serialize(row)
 
     @app.get("/api/v1/currencies")

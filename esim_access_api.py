@@ -20,7 +20,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Res
 from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session, joinedload, selectinload
+from sqlalchemy.orm import Session, selectinload
 
 from auth import get_token_claims, require_active_subject
 from config import get_settings, read_bool_env as _read_bool_env, read_float_env, read_int_env
@@ -2476,16 +2476,13 @@ def register_esim_access_routes(
         # detail-screen recover poll fill activation data as the provider
         # materializes it.
         if profile_sync_triggered and hasattr(provider, "query_profiles"):
-            import asyncio as _asyncio
-            from supabase_store import ESimProfile as _ESimProfile
-            from sqlalchemy import select as _select
             backoffs = (0.0,)
             order_item_id = order_item.id
             provider_order_no_snapshot = order_item.provider_order_no
             for attempt_index, delay in enumerate(backoffs):
                 profile_sync_attempts = attempt_index + 1
                 if delay > 0:
-                    await _asyncio.sleep(delay)
+                    await asyncio.sleep(delay)
                 try:
                     # Release the pool slot during the provider round-trip,
                     # same pattern as /profiles/{id}/recover.
@@ -2507,7 +2504,7 @@ def register_esim_access_routes(
                         # Refetch from a fresh session — the original order_item
                         # is detached after db.close().
                         refetched_order_item = db.scalar(
-                            _select(OrderItem).where(OrderItem.id == order_item_id)
+                            select(OrderItem).where(OrderItem.id == order_item_id)
                         )
                         refetched_customer_order = (
                             refetched_order_item.customer_order
@@ -2516,7 +2513,7 @@ def register_esim_access_routes(
                         )
                         # Did we actually get activation data for our profile?
                         refreshed_profile = db.scalar(
-                            _select(_ESimProfile).where(_ESimProfile.order_item_id == refetched_order_item.id)
+                            select(ESimProfile).where(ESimProfile.order_item_id == refetched_order_item.id)
                         )
                         local_error: str | None = profile_sync_error
                         should_break = False
@@ -2558,7 +2555,7 @@ def register_esim_access_routes(
                         # The original ORM objects are detached after db.close().
                         # Refetch by primary key from a fresh session.
                         recovered_order_item = db.scalar(
-                            _select(OrderItem).where(OrderItem.id == order_item_id)
+                            select(OrderItem).where(OrderItem.id == order_item_id)
                         )
                         recovered_customer_order = customer_order
                         if recovered_order_item is not None:
@@ -3156,7 +3153,9 @@ def register_esim_access_routes(
         claims: dict[str, Any] = Depends(get_token_claims),
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
-        status: str | None = Query(default=None),
+        # Named status_filter (not `status`) so it does not shadow the
+        # module-level `fastapi.status` import inside this handler (audit #10).
+        status_filter: str | None = Query(default=None, alias="status"),
         installed: bool | None = Query(default=None),
         user_id: str | None = Query(default=None, alias="userId"),
         include_terminal: bool = Query(default=False, alias="includeTerminal"),
@@ -3202,7 +3201,7 @@ def register_esim_access_routes(
                 user_id=target_user_id,
                 limit=limit,
                 offset=offset,
-                status_filter=status,
+                status_filter=status_filter,
                 installed_filter=installed,
                 include_terminal=include_terminal,
             )
@@ -3283,25 +3282,36 @@ def register_esim_access_routes(
         # FastAPI runs it in a worker thread instead of blocking the event loop.
         actor = require_active_subject(db, claims=claims)
         target_user_id = _resolve_target_user_id(actor=actor, claims=claims, requested_user_id=user_id)
+        # Count orders (not joined rows) in SQL, then page in SQL as well.
+        # selectinload keeps the LIMIT/OFFSET on the orders table itself instead
+        # of a row-multiplying join, mirroring /api/v1/admin/orders/detailed.
+        total = int(
+            db.scalar(
+                select(func.count())
+                .select_from(CustomerOrder)
+                .where(CustomerOrder.user_id == target_user_id)
+            )
+            or 0
+        )
         rows = (
             db.scalars(
                 select(CustomerOrder)
-                .options(joinedload(CustomerOrder.order_items))
+                .options(selectinload(CustomerOrder.order_items))
                 .where(CustomerOrder.user_id == target_user_id)
                 .order_by(
                     func.coalesce(CustomerOrder.booked_at, CustomerOrder.created_at).desc(),
                     CustomerOrder.id.desc(),
                 )
+                .limit(limit)
+                .offset(offset)
             )
             .unique()
             .all()
         )
-        total = len(rows)
-        paged = rows[offset : offset + limit]
         return {
             "success": True,
             "data": {
-                "orders": [_serialize_order(order) for order in paged],
+                "orders": [_serialize_order(order) for order in rows],
                 "total": total,
                 "limit": limit,
                 "offset": offset,
@@ -3374,7 +3384,9 @@ def register_esim_access_routes(
         claims: dict[str, Any] = Depends(get_token_claims),
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
-        status: str | None = Query(default=None),
+        # Named status_filter (not `status`) so it does not shadow the
+        # module-level `fastapi.status` import inside this handler (audit #10).
+        status_filter: str | None = Query(default=None, alias="status"),
         installed: bool | None = Query(default=None),
         user_id: str | None = Query(default=None, alias="userId"),
         include_terminal: bool = Query(default=False, alias="includeTerminal"),
@@ -3392,7 +3404,7 @@ def register_esim_access_routes(
             user_id=target_user_id,
             limit=limit,
             offset=offset,
-            status_filter=status,
+            status_filter=status_filter,
             installed_filter=installed,
             include_terminal=include_terminal,
         )

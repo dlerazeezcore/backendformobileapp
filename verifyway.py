@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import secrets
 import time
 from typing import Any
@@ -74,6 +75,27 @@ def _generate_code(length: int) -> str:
 def _to_recipient(normalized_phone: str) -> str:
     # VerifyWay expects digits without the leading "+" (e.g. "9647507343635").
     return normalized_phone.lstrip("+")
+
+
+def _mask_phone(value: str | None) -> str:
+    """Mask a phone number for logging — keep only the last 3 digits (SEC-6).
+
+    Local replica of auth.py's ``_mask_phone`` (same rule); kept in-module per
+    the one-file-per-domain convention."""
+    digits = "".join(ch for ch in (value or "") if ch.isdigit())
+    if len(digits) <= 3:
+        return "***"
+    return f"***{digits[-3:]}"
+
+
+_PHONE_DIGIT_RUN = re.compile(r"\d{7,}")
+
+
+def _scrub_phone_digits(value: object) -> str:
+    """Redact long digit runs (7+) before logging provider payloads — VerifyWay
+    error bodies can echo the recipient MSISDN, which would defeat the SEC-6
+    masking applied to the ``recipient`` field."""
+    return _PHONE_DIGIT_RUN.sub("***", str(value))
 
 
 def _challenge_signature(payload_segment: str, code: str) -> bytes:
@@ -199,12 +221,14 @@ async def _post_otp(recipient: str, code: str) -> dict[str, Any]:
     except Exception:
         body = {"raw_text": resp.text}
     if resp.status_code >= 400:
-        # Log status + body for operators; never log the code itself.
+        # Log status + body for operators; never log the code itself, and mask
+        # the recipient phone (SEC-6: no full phone numbers in logs). The body
+        # is scrubbed too — provider error payloads can echo the MSISDN.
         LOGGER.error(
             "VerifyWay OTP send failed: status=%s recipient=%s body=%s",
             resp.status_code,
-            recipient,
-            body,
+            _mask_phone(recipient),
+            _scrub_phone_digits(body),
         )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,

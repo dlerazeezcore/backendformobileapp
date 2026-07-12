@@ -183,7 +183,7 @@ class FIBPaymentAPI:
         default_status_callback_url: str | None = None,
         default_redirect_uri: str | None = None,
         webhook_secret: str | None = None,
-        webhook_allow_plaintext_secret: bool = True,
+        webhook_allow_plaintext_secret: bool = False,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.client_id = client_id
@@ -1163,7 +1163,9 @@ def register_fib_payment_routes(
                 message="Invalid checkout payload.",
                 provider_message=str(exc),
             )
-        except Exception as exc:
+        except (FIBPaymentAPIError, FIBPaymentHTTPError) as exc:
+            # Provider failures only — DB/logic errors propagate to the global
+            # handlers instead of being disguised as provider responses.
             return _map_fib_exception(exc)
 
     @app.get("/api/v1/payments/fib/{payment_id}")
@@ -1449,11 +1451,11 @@ def register_fib_payment_routes(
             expected = hmac.new(provider.webhook_secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
             signature = _extract_webhook_signature({k.lower(): v for k, v in request.headers.items()})
             # Plaintext-secret auth is a static bearer value with none of the
-            # body-binding the HMAC gives (audit M5). It stays available behind
-            # FIB_WEBHOOK_ALLOW_PLAINTEXT_SECRET (default on — it is the
-            # currently-deployed path) so it can be retired by config once the
-            # caller sends the HMAC signature.
-            allow_plaintext = bool(getattr(provider, "webhook_allow_plaintext_secret", True))
+            # body-binding the HMAC gives (audit M5). Secure by default: it is
+            # OFF unless FIB_WEBHOOK_ALLOW_PLAINTEXT_SECRET=true explicitly
+            # re-enables it (matching config.py's default), for deployments
+            # where FIB still calls the webhook with the raw secret.
+            allow_plaintext = bool(getattr(provider, "webhook_allow_plaintext_secret", False))
             secret_matches = bool(
                 allow_plaintext
                 and x_fib_webhook_secret

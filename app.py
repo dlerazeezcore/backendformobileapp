@@ -99,19 +99,31 @@ def _get_cors_allowed_origins() -> list[str]:
     return DEFAULT_CORS_ALLOWED_ORIGINS
 
 
-def _get_cors_allow_origin_regex() -> str | None:
+def _get_cors_allow_origin_regex(*, allow_credentials: bool) -> str | None:
     configured = os.getenv("CORS_ALLOW_ORIGIN_REGEX")
     if configured is not None:
         stripped = configured.strip()
         # With allow_credentials=True a loose regex enables credentialed
         # cross-origin reads. An unanchored pattern is the classic foot-gun
         # ("https://app.example.com" also matches "https://app.example.com.evil.io"),
-        # so demand explicit ^...$ anchoring and warn loudly when it's missing.
+        # so demand explicit ^...$ anchoring. Under credentials this is a hard
+        # security misconfiguration — refuse to boot (audit #13); without
+        # credentials it stays a loud warning.
         if stripped and (not stripped.startswith("^") or not stripped.endswith("$")):
+            if allow_credentials:
+                raise RuntimeError(
+                    "CORS_ALLOW_ORIGIN_REGEX is not anchored (^...$): "
+                    f"{stripped!r}. With CORS_ALLOW_CREDENTIALS enabled an unanchored "
+                    "pattern can match attacker-controlled origins "
+                    "(e.g. 'https://app.example.com' also matches "
+                    "'https://app.example.com.evil.io') and expose credentialed "
+                    "responses cross-origin. Anchor the pattern explicitly "
+                    "(start with '^' and end with '$') or disable credentials."
+                )
             logging.getLogger("uvicorn.error").warning(
                 "CORS_ALLOW_ORIGIN_REGEX is not anchored (^...$): %r. "
-                "Unanchored patterns can match attacker-controlled origins under "
-                "allow_credentials=True — anchor the pattern explicitly.",
+                "Unanchored patterns can match attacker-controlled origins — "
+                "anchor the pattern explicitly.",
                 stripped,
             )
         return stripped or None
@@ -234,6 +246,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "FIB_PAYMENT_WEBHOOK_SECRET is not set, so the /webhook endpoint is disabled; "
                     "payment confirmation relies on polling the FIB status endpoint."
                 )
+            # Audit #6: the callback URL is deployment-specific and no longer has a
+            # hardcoded default. Missing it is a degraded-but-working state (FIB never
+            # calls our webhook; confirmation falls back to status polling), so log an
+            # ERROR instead of crashing the app.
+            if not cfg.fib_payment_status_callback_url:
+                LOGGER.error(
+                    "FIB payments configured but FIB_PAYMENT_STATUS_CALLBACK_URL is not set — "
+                    "webhook confirmation disabled, relying on status polling. Set it to "
+                    "https://<your-host>/api/v1/payments/fib/webhook for this deployment."
+                )
         app.state.push_notification_service = PushNotificationService(
             service_account_file=cfg.firebase_service_account_file,
             service_account_json=cfg.firebase_service_account_json,
@@ -262,12 +284,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if db_engine is not None:
             db_engine.dispose()
 
-    app = FastAPI(title="backendformobileapp", version="0.1.0", lifespan=lifespan)
+    # Audit finding #14: /docs, /redoc and /openapi.json enumerate the full
+    # admin/payment surface, so production must be able to switch them off via
+    # API_DOCS_ENABLED=false (default True keeps local dev unchanged). Resolved
+    # defensively: create_app() must stay importable without the full env
+    # (Settings validation still happens at lifespan startup), so a failed
+    # Settings() load falls back to reading the process-env flag directly.
+    if settings is not None:
+        docs_enabled = settings.api_docs_enabled
+    else:
+        try:
+            docs_enabled = get_settings().api_docs_enabled
+        except Exception:
+            docs_enabled = _read_bool_env("API_DOCS_ENABLED", default=True)
+
+    app = FastAPI(
+        title="backendformobileapp",
+        version="0.1.0",
+        lifespan=lifespan,
+        docs_url="/docs" if docs_enabled else None,
+        redoc_url="/redoc" if docs_enabled else None,
+        openapi_url="/openapi.json" if docs_enabled else None,
+    )
+    cors_allow_credentials = _read_bool_env("CORS_ALLOW_CREDENTIALS", default=True)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=_get_cors_allowed_origins(),
-        allow_origin_regex=_get_cors_allow_origin_regex(),
-        allow_credentials=_read_bool_env("CORS_ALLOW_CREDENTIALS", default=True),
+        allow_origin_regex=_get_cors_allow_origin_regex(allow_credentials=cors_allow_credentials),
+        allow_credentials=cors_allow_credentials,
         allow_methods=CORS_ALLOWED_METHODS,
         allow_headers=CORS_ALLOWED_HEADERS,
         max_age=86400,

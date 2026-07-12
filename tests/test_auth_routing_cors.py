@@ -9,7 +9,16 @@ from sqlalchemy import create_engine
 
 from app import create_app
 from config import get_settings
+from phone_utils import normalize_phone
 from supabase_store import Base, normalize_database_url
+from verifyway import _mint_verification_token
+
+
+def _vtoken(phone: str) -> str:
+    """Mint a valid OTP verification token bound to ``phone`` (signup now
+    requires phone proof). Call from inside a test, after setUp has set
+    AUTH_SECRET_KEY and cleared the settings cache."""
+    return _mint_verification_token(normalize_phone(phone))
 
 
 class AuthRoutingCorsTest(unittest.TestCase):
@@ -44,7 +53,12 @@ class AuthRoutingCorsTest(unittest.TestCase):
     def test_canonical_auth_routes_exist(self) -> None:
         signup = self.client.post(
             "/api/v1/auth/user/signup",
-            json={"phone": "+9647507343635", "name": "Test User", "password": "StrongPass123"},
+            json={
+                "phone": "+9647507343635",
+                "name": "Test User",
+                "password": "StrongPass123",
+                "verificationToken": _vtoken("+9647507343635"),
+            },
         )
         self.assertNotIn(signup.status_code, {404, 405})
 

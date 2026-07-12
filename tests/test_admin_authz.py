@@ -219,7 +219,9 @@ class AdminAuthorizationTest(unittest.TestCase):
             self.assertEqual(me_response.status_code, 200)
             self.assertEqual(me_response.json().get("email"), "admin@example.com")
 
-    def test_users_save_with_user_token_updates_only_self(self) -> None:
+    def test_users_save_rejects_user_token_and_self_update_moves_to_auth_me(self) -> None:
+        # Audit #11: POST /admin/users is admin-only now; the old non-admin
+        # self-profile branch lives at PATCH /auth/me.
         token = create_access_token(
             subject_id="22222222-2222-2222-2222-222222222222",
             phone="+9647700000002",
@@ -238,10 +240,18 @@ class AdminAuthorizationTest(unittest.TestCase):
                     "status": "active",
                 },
             )
-            self.assertEqual(response.status_code, 200)
-            payload = response.json()
-            self.assertEqual(payload["user"]["id"], "22222222-2222-2222-2222-222222222222")
-            self.assertEqual(payload["user"]["name"], "Updated Name")
+            self.assertEqual(response.status_code, 403)
+
+            self_update = client.patch(
+                "/api/v1/auth/me",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"name": "Updated Name", "email": "updated@example.com"},
+            )
+            self.assertEqual(self_update.status_code, 200, self_update.text)
+            payload = self_update.json()
+            self.assertEqual(payload.get("id"), "22222222-2222-2222-2222-222222222222")
+            self.assertEqual(payload.get("name"), "Updated Name")
+            self.assertEqual(payload.get("email"), "updated@example.com")
 
     def test_users_list_with_user_token_returns_only_self(self) -> None:
         token = create_access_token(
@@ -584,8 +594,9 @@ class AdminAuthorizationTest(unittest.TestCase):
             self.assertEqual(owner_ok.status_code, 200, owner_ok.text)
             self.assertEqual(owner_ok.json()["latestVersion"], "2.0.1")
 
-    def test_users_save_omitted_email_preserves_stored_email(self) -> None:
-        # M2: a profile save without the email field must not wipe the address.
+    def test_auth_me_patch_omitted_email_preserves_stored_email(self) -> None:
+        # M2 (now on the self-service route, audit #11): a profile save without
+        # the email field must not wipe the address.
         token = create_access_token(
             subject_id="22222222-2222-2222-2222-222222222222",
             phone="+9647700000002",
@@ -595,17 +606,17 @@ class AdminAuthorizationTest(unittest.TestCase):
         )
         headers = {"Authorization": f"Bearer {token}"}
         with TestClient(create_app()) as client:
-            seeded = client.post(
-                "/api/v1/admin/users",
+            seeded = client.patch(
+                "/api/v1/auth/me",
                 headers=headers,
-                json={"phone": "+9647700000002", "name": "Standard User", "email": "keepme@example.com"},
+                json={"name": "Standard User", "email": "keepme@example.com"},
             )
             self.assertEqual(seeded.status_code, 200, seeded.text)
 
-            no_email = client.post(
-                "/api/v1/admin/users",
+            no_email = client.patch(
+                "/api/v1/auth/me",
                 headers=headers,
-                json={"phone": "+9647700000002", "name": "Renamed User"},
+                json={"name": "Renamed User"},
             )
             self.assertEqual(no_email.status_code, 200, no_email.text)
 
@@ -616,8 +627,9 @@ class AdminAuthorizationTest(unittest.TestCase):
                 self.assertEqual(row.email, "keepme@example.com")
                 self.assertEqual(row.name, "Renamed User")
 
-    def test_users_save_duplicate_email_returns_409(self) -> None:
-        # M2: unique CI email index must surface as a conflict, not a 500.
+    def test_auth_me_patch_duplicate_email_returns_409(self) -> None:
+        # M2 (now on the self-service route, audit #11): a duplicate email must
+        # surface as a conflict, not a 500.
         token = create_access_token(
             subject_id="22222222-2222-2222-2222-222222222222",
             phone="+9647700000002",
@@ -626,10 +638,10 @@ class AdminAuthorizationTest(unittest.TestCase):
             ttl_seconds=3600,
         )
         with TestClient(create_app()) as client:
-            response = client.post(
-                "/api/v1/admin/users",
+            response = client.patch(
+                "/api/v1/auth/me",
                 headers={"Authorization": f"Bearer {token}"},
-                json={"phone": "+9647700000002", "name": "Standard User", "email": "alice@example.com"},
+                json={"email": "alice@example.com"},
             )
             self.assertEqual(response.status_code, 409, response.text)
 

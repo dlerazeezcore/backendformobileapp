@@ -5,6 +5,7 @@ from datetime import datetime
 import hmac
 import logging
 import os
+import threading
 from time import monotonic
 from typing import Any, Callable
 
@@ -38,6 +39,10 @@ from supabase_store import (
 from esim_access_api import ActionContext
 
 LOGGER = logging.getLogger("uvicorn.error")
+# Process-local cache shared across FastAPI threadpool workers; guard every
+# read/write with this lock (same pattern as rate_limit.py). Never hold the
+# lock across DB I/O.
+_PUBLIC_FEATURED_LOCATIONS_LOCK = threading.Lock()
 _PUBLIC_FEATURED_LOCATIONS_CACHE: dict[str, list[dict[str, Any]]] = {}
 _PUBLIC_FEATURED_LOCATIONS_RETRY_AFTER: dict[str, float] = {}
 _PUBLIC_DB_FAILURE_BACKOFF_SECONDS = max(float(os.getenv("PUBLIC_DB_FAILURE_BACKOFF_SECONDS", "15")), 0.0)
@@ -943,8 +948,9 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
     ) -> dict[str, Any]:
         row = SupabaseStore(db).save_featured_location(payload.model_dump(by_alias=False))
         cache_key = _featured_locations_cache_key(payload.service_type)
-        _PUBLIC_FEATURED_LOCATIONS_CACHE.pop(cache_key, None)
-        _PUBLIC_FEATURED_LOCATIONS_RETRY_AFTER.pop(cache_key, None)
+        with _PUBLIC_FEATURED_LOCATIONS_LOCK:
+            _PUBLIC_FEATURED_LOCATIONS_CACHE.pop(cache_key, None)
+            _PUBLIC_FEATURED_LOCATIONS_RETRY_AFTER.pop(cache_key, None)
         return {"location": {"id": row.id}}
 
     @app.get("/api/v1/admin/featured-locations")
@@ -965,8 +971,9 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
     ) -> dict[str, Any]:
         deleted = SupabaseStore(db).delete_featured_location(location_id)
         # Bust public caches across all service types so the change shows immediately.
-        _PUBLIC_FEATURED_LOCATIONS_CACHE.clear()
-        _PUBLIC_FEATURED_LOCATIONS_RETRY_AFTER.clear()
+        with _PUBLIC_FEATURED_LOCATIONS_LOCK:
+            _PUBLIC_FEATURED_LOCATIONS_CACHE.clear()
+            _PUBLIC_FEATURED_LOCATIONS_RETRY_AFTER.clear()
         if not deleted:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Featured location not found")
         return {"deleted": True, "id": location_id}
@@ -978,8 +985,10 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         service_type: str = Query(default="esim", alias="serviceType"),
     ) -> dict[str, Any]:
         cache_key = _featured_locations_cache_key(service_type)
-        cached_locations = _PUBLIC_FEATURED_LOCATIONS_CACHE.get(cache_key)
-        if monotonic() < _PUBLIC_FEATURED_LOCATIONS_RETRY_AFTER.get(cache_key, 0.0):
+        with _PUBLIC_FEATURED_LOCATIONS_LOCK:
+            cached_locations = _PUBLIC_FEATURED_LOCATIONS_CACHE.get(cache_key)
+            retry_after_deadline = _PUBLIC_FEATURED_LOCATIONS_RETRY_AFTER.get(cache_key, 0.0)
+        if monotonic() < retry_after_deadline:
             return {
                 "success": True,
                 "data": {
@@ -990,7 +999,8 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
         try:
             locations = SupabaseStore(db).list_public_featured_locations(service_type=service_type)
         except SQLAlchemyError as exc:
-            _PUBLIC_FEATURED_LOCATIONS_RETRY_AFTER[cache_key] = monotonic() + _PUBLIC_DB_FAILURE_BACKOFF_SECONDS
+            with _PUBLIC_FEATURED_LOCATIONS_LOCK:
+                _PUBLIC_FEATURED_LOCATIONS_RETRY_AFTER[cache_key] = monotonic() + _PUBLIC_DB_FAILURE_BACKOFF_SECONDS
             if cached_locations is not None:
                 LOGGER.warning(
                     "featured_locations.public_db_unavailable cache=stale service_type=%s detail=%s",
@@ -1011,8 +1021,10 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
             )
             return {"success": True, "data": {"locations": [], "cacheStatus": "db_unavailable"}}
 
-        _PUBLIC_FEATURED_LOCATIONS_CACHE[cache_key] = _clone_featured_locations(locations)
-        _PUBLIC_FEATURED_LOCATIONS_RETRY_AFTER.pop(cache_key, None)
+        fresh_snapshot = _clone_featured_locations(locations)
+        with _PUBLIC_FEATURED_LOCATIONS_LOCK:
+            _PUBLIC_FEATURED_LOCATIONS_CACHE[cache_key] = fresh_snapshot
+            _PUBLIC_FEATURED_LOCATIONS_RETRY_AFTER.pop(cache_key, None)
         return {"success": True, "data": {"locations": locations, "cacheStatus": "fresh"}}
 
     @app.post("/api/v1/admin/exchange-rates")

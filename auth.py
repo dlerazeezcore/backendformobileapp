@@ -14,14 +14,16 @@ from typing import Any, Callable
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field, model_validator
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import set_committed_value
 
 from config import get_settings, read_float_env as _read_float_env
 from phone_utils import normalize_phone, phone_lookup_candidates
 from rate_limit import enforce_rate_limit
 from supabase_store import AdminUser, AppUser, utcnow
+from verifyway import validate_verification_token
 
 
 class LoginPayload(BaseModel):
@@ -44,7 +46,31 @@ class LoginPayload(BaseModel):
 class SignupPayload(BaseModel):
     phone: str
     name: str = Field(min_length=2, max_length=255)
-    password: str = Field(min_length=8)
+    # max_length bounds the scrypt input so an oversized payload can't be used
+    # to burn CPU on password hashing.
+    password: str = Field(min_length=8, max_length=128)
+    # Proof of WhatsApp OTP ownership of `phone`, minted by POST /otp/verify.
+    # Signup requires a verified phone (product rule: sign up with password + OTP).
+    verification_token: str = Field(alias="verificationToken")
+
+    model_config = {"populate_by_name": True}
+
+
+class OtpLoginPayload(BaseModel):
+    """Passwordless login for an existing account, proven by a WhatsApp OTP."""
+    phone: str
+    verification_token: str = Field(alias="verificationToken")
+
+    model_config = {"populate_by_name": True}
+
+
+class ResetPasswordPayload(BaseModel):
+    """Set a new password using a WhatsApp OTP proof (no old password needed)."""
+    phone: str
+    verification_token: str = Field(alias="verificationToken")
+    new_password: str = Field(min_length=8, max_length=128, alias="newPassword")
+
+    model_config = {"populate_by_name": True}
 
 
 class LogoutPayload(BaseModel):
@@ -54,6 +80,12 @@ class LogoutPayload(BaseModel):
 class AuthMeUpdatePayload(BaseModel):
     name: str | None = Field(default=None, max_length=255)
     email: str | None = Field(default=None, max_length=255)
+    # Audit #11: self-service password change lives here now (it used to ride
+    # on the retired non-admin branch of POST /admin/users). AppUser only,
+    # same minimum length as signup. SEC: changing the password requires the
+    # current one, so a leaked bearer token alone can't re-key the account.
+    password: str | None = Field(default=None, min_length=8, max_length=128)
+    current_password: str | None = Field(default=None, max_length=128, alias="currentPassword")
     preferred_language: str | None = Field(default=None, max_length=8, alias="preferredLanguage")
     preferred_currency: str | None = Field(default=None, max_length=8, alias="preferredCurrency")
     notifications_enabled: bool | None = Field(default=None, alias="notificationsEnabled")
@@ -227,14 +259,29 @@ def _stamp_app_version(db: Session, row: AppUser | AdminUser, reported_version: 
     read-only. Called from ``/auth/me`` (fires on every launch) and from
     ``require_active_subject`` (any authenticated user request), so the admin
     panel's per-user version column fills in from normal app usage.
+
+    Audit #10: the stamp runs as an isolated UPDATE in its own short-lived
+    session on the same bind. Committing on the request session here would
+    also commit any unrelated pending state a handler accumulated mid-request
+    (these are otherwise read-only endpoints).
     """
     if not isinstance(row, AppUser):
         return
     reported = (reported_version or "").strip()[:32]
-    if reported and reported != (row.app_version or ""):
-        row.app_version = reported
-        row.app_version_updated_at = utcnow()
-        db.commit()
+    if not reported or reported == (row.app_version or ""):
+        return
+    stamped_at = utcnow()
+    with Session(bind=db.get_bind()) as stamp_db:
+        stamp_db.execute(
+            update(AppUser)
+            .where(AppUser.id == row.id)
+            .values(app_version=reported, app_version_updated_at=stamped_at)
+        )
+        stamp_db.commit()
+    # Mirror the persisted values onto the already-loaded row WITHOUT dirtying
+    # the request session (set_committed_value == "as if freshly loaded").
+    set_committed_value(row, "app_version", reported)
+    set_committed_value(row, "app_version_updated_at", stamped_at)
 
 
 def require_active_subject(
@@ -302,7 +349,7 @@ def _lookup_admin_by_phone(db: Session, phone: str) -> AdminUser | None:
         return None
     row = _lookup_row_by_compact_phone(db, AdminUser, candidates)
     if row is not None:
-        LOGGER.info(
+        LOGGER.debug(
             "auth.lookup.admin fallback-compact-match canonical=%s stored=%s",
             _mask_phone(canonical),
             _mask_phone(row.phone),
@@ -321,7 +368,7 @@ def _lookup_user_by_phone(db: Session, phone: str) -> AppUser | None:
         return None
     row = _lookup_row_by_compact_phone(db, AppUser, candidates)
     if row is not None:
-        LOGGER.info(
+        LOGGER.debug(
             "auth.lookup.user fallback-compact-match canonical=%s stored=%s",
             _mask_phone(canonical),
             _mask_phone(row.phone),
@@ -552,6 +599,14 @@ def register_auth_routes(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Name must be at least 2 characters.",
             )
+        # Require a valid WhatsApp-OTP proof for this phone (product rule: sign up
+        # with password + OTP). validate_verification_token re-normalizes the phone.
+        if not validate_verification_token(payload.verification_token, normalized_phone):
+            raise _api_error(
+                status.HTTP_400_BAD_REQUEST,
+                "AUTH_OTP_REQUIRED",
+                "Phone verification is required. Please verify the code sent to your phone.",
+            )
 
         def _lookup_work() -> None:
             existing_user = _lookup_user_by_phone(db, normalized_phone)
@@ -597,6 +652,94 @@ def register_auth_routes(
             return _issue_user_session(user_row)
 
         return await asyncio.to_thread(_persist_work)
+
+    @app.post("/api/v1/auth/user/otp-login")
+    @app.post("/auth/user/otp-login")
+    def user_otp_login(
+        payload: OtpLoginPayload,
+        request: Request,
+        db: Session = Depends(get_db),
+    ) -> dict[str, Any]:
+        """Passwordless login for an existing account via a verified WhatsApp OTP."""
+        enforce_rate_limit(f"login:ip:{_client_ip(request)}", max_events=15, window_seconds=300)
+        normalized_phone = _normalize_and_validate_signup_phone(payload.phone)
+        _log_phone_lookup("auth.user.otp-login", payload.phone, normalized_phone)
+        if not validate_verification_token(payload.verification_token, normalized_phone):
+            raise _api_error(
+                status.HTTP_400_BAD_REQUEST,
+                "AUTH_OTP_INVALID",
+                "Phone verification failed. Please request a new code.",
+            )
+        row = _lookup_user_by_phone(db, normalized_phone)
+        if row is None:
+            raise _api_error(
+                status.HTTP_404_NOT_FOUND,
+                "AUTH_NO_ACCOUNT",
+                "No account found for this phone. Please sign up first.",
+            )
+        if not _is_row_active(row):
+            raise _api_error(
+                status.HTTP_403_FORBIDDEN,
+                "AUTH_ACCOUNT_INACTIVE",
+                "User account exists but is not active. Please contact support.",
+            )
+        _touch_last_login_if_due(db, row)
+        return _issue_user_session(row)
+
+    @app.post("/api/v1/auth/user/reset-password")
+    @app.post("/auth/user/reset-password")
+    def user_reset_password(
+        payload: ResetPasswordPayload,
+        request: Request,
+        db: Session = Depends(get_db),
+    ) -> dict[str, Any]:
+        """Set a new password using a verified WhatsApp OTP (forgot-password flow).
+
+        The OTP already proves phone ownership, so we auto-issue a session on
+        success — the user lands signed in with their new password."""
+        enforce_rate_limit(f"login:ip:{_client_ip(request)}", max_events=15, window_seconds=300)
+        normalized_phone = _normalize_and_validate_signup_phone(payload.phone)
+        _log_phone_lookup("auth.user.reset-password", payload.phone, normalized_phone)
+        if not validate_verification_token(payload.verification_token, normalized_phone):
+            raise _api_error(
+                status.HTTP_400_BAD_REQUEST,
+                "AUTH_OTP_INVALID",
+                "Phone verification failed. Please request a new code.",
+            )
+        row = _lookup_user_by_phone(db, normalized_phone)
+        if row is None:
+            raise _api_error(
+                status.HTTP_404_NOT_FOUND,
+                "AUTH_NO_ACCOUNT",
+                "No account found for this phone. Please sign up first.",
+            )
+        if not _is_row_active(row):
+            raise _api_error(
+                status.HTTP_403_FORBIDDEN,
+                "AUTH_ACCOUNT_INACTIVE",
+                "User account exists but is not active. Please contact support.",
+            )
+        row.password_hash = hash_password(payload.new_password)
+        row.last_login_at = utcnow()
+        db.commit()
+        db.refresh(row)
+        return _issue_user_session(row)
+
+    @app.post("/api/v1/auth/refresh")
+    @app.post("/auth/refresh")
+    def auth_refresh(
+        claims: dict[str, Any] = Depends(get_token_claims),
+        db: Session = Depends(get_db),
+    ) -> dict[str, Any]:
+        """Roll a still-valid session forward so active users never hit the TTL.
+
+        The client calls this on every app open. require_active_subject rejects a
+        token whose subject was deleted/deactivated; get_token_claims rejects an
+        expired or forged token (401), in which case the client keeps its cached
+        session and simply retries next launch."""
+        row = require_active_subject(db, claims=claims)
+        subject_type = "admin" if isinstance(row, AdminUser) else "user"
+        return _issue_subject_session(row, subject_type=subject_type)
 
     # The unprefixed `/auth/*` paths are intentional back-compat aliases for older
     # app builds that called the API without the `/api/v1` prefix. New clients use
@@ -718,6 +861,21 @@ def register_auth_routes(
 
         if "notifications_enabled" in provided_fields and isinstance(row, AppUser):
             row.notifications_enabled = bool(payload.notifications_enabled)
+
+        # Audit #11: password change moved here from the retired non-admin
+        # branch of POST /admin/users. Same scope as before: AppUser only
+        # (AppUser-only fields are silently skipped for admin subjects, like
+        # the preference fields above); a null password is a no-op.
+        # SEC hardening: the current password must be presented and verified,
+        # so a stolen bearer token can't be parlayed into a permanent takeover.
+        if "password" in provided_fields and payload.password and isinstance(row, AppUser):
+            if not verify_password(payload.current_password or "", row.password_hash):
+                raise _api_error(
+                    status.HTTP_401_UNAUTHORIZED,
+                    "AUTH_INVALID_CURRENT_PASSWORD",
+                    "Current password is incorrect",
+                )
+            row.password_hash = hash_password(payload.password)
 
         row.updated_at = utcnow()
         db.commit()
