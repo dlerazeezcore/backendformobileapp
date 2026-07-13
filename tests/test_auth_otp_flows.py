@@ -12,7 +12,7 @@ from app import create_app
 from auth import hash_password, verify_password
 from config import get_settings
 from phone_utils import normalize_phone
-from supabase_store import AppUser, Base, normalize_database_url
+from supabase_store import AdminUser, AppUser, Base, normalize_database_url
 from verifyway import _mint_verification_token
 
 
@@ -33,6 +33,8 @@ def _vtoken(phone: str) -> str:
 ACTIVE_PHONE = "+9647700000300"
 ACTIVE_PASSWORD = "StrongPass123"
 INACTIVE_PHONE = "+9647700000301"
+ADMIN_PHONE = "+9647700000305"
+ADMIN_PASSWORD = "StrongPass123"
 UNKNOWN_PHONE = "+9647700000399"
 
 
@@ -70,6 +72,16 @@ class AuthOtpFlowsTest(unittest.TestCase):
                     name="Inactive User",
                     status="disabled",
                     password_hash=hash_password(ACTIVE_PASSWORD),
+                )
+            )
+            session.add(
+                AdminUser(
+                    phone=ADMIN_PHONE,
+                    name="Admin User",
+                    status="active",
+                    role="admin",
+                    can_send_push=True,
+                    password_hash=hash_password(ADMIN_PASSWORD),
                 )
             )
             session.commit()
@@ -134,6 +146,29 @@ class AuthOtpFlowsTest(unittest.TestCase):
             self.assertEqual(response.status_code, 403)
             self.assertEqual((response.json().get("detail") or {}).get("code"), "AUTH_ACCOUNT_INACTIVE")
 
+    def test_otp_login_admin_account_returns_admin_session(self) -> None:
+        # Admins authenticate through the same /auth/user/* endpoints as users
+        # (password login already does), so OTP login must find the admin row
+        # too and issue an ADMIN session — not 404.
+        with TestClient(create_app()) as client:
+            response = client.post(
+                "/api/v1/auth/user/otp-login",
+                json={"phone": ADMIN_PHONE, "verificationToken": _vtoken(ADMIN_PHONE)},
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            payload = response.json()
+            self.assertTrue(payload.get("accessToken"))
+            self.assertEqual(payload.get("subjectType"), "admin")
+            self.assertEqual(payload.get("isAdmin"), True)
+            self.assertEqual(payload.get("phone"), ADMIN_PHONE)
+
+            me = client.get(
+                "/api/v1/auth/me",
+                headers={"Authorization": f"Bearer {payload['accessToken']}"},
+            )
+            self.assertEqual(me.status_code, 200)
+            self.assertEqual(me.json().get("subjectType"), "admin")
+
     # ------------------------------------------------------------------
     # reset-password
     # ------------------------------------------------------------------
@@ -181,6 +216,40 @@ class AuthOtpFlowsTest(unittest.TestCase):
             assert row is not None
             self.assertTrue(verify_password(new_password, row.password_hash))
             self.assertFalse(verify_password(ACTIVE_PASSWORD, row.password_hash))
+
+    def test_reset_password_rotates_admin_credentials(self) -> None:
+        new_password = "AdminNewPass789"
+        with TestClient(create_app()) as client:
+            reset = client.post(
+                "/api/v1/auth/user/reset-password",
+                json={
+                    "phone": ADMIN_PHONE,
+                    "verificationToken": _vtoken(ADMIN_PHONE),
+                    "newPassword": new_password,
+                },
+            )
+            self.assertEqual(reset.status_code, 200, reset.text)
+            self.assertEqual(reset.json().get("subjectType"), "admin")
+
+            # New admin password works via the shared login endpoint; old fails.
+            self.assertEqual(
+                client.post(
+                    "/api/v1/auth/user/login",
+                    json={"phone": ADMIN_PHONE, "password": ADMIN_PASSWORD},
+                ).status_code,
+                401,
+            )
+            new_login = client.post(
+                "/api/v1/auth/user/login",
+                json={"phone": ADMIN_PHONE, "password": new_password},
+            )
+            self.assertEqual(new_login.status_code, 200)
+            self.assertEqual(new_login.json().get("subjectType"), "admin")
+
+        with self.session_factory() as session:
+            row = session.scalar(select(AdminUser).where(AdminUser.phone == ADMIN_PHONE))
+            assert row is not None
+            self.assertTrue(verify_password(new_password, row.password_hash))
 
     def test_reset_password_unknown_phone_returns_404(self) -> None:
         with TestClient(create_app()) as client:

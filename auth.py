@@ -486,6 +486,22 @@ def _touch_last_login_if_due(db: Session, row: AppUser | AdminUser) -> None:
     db.commit()
 
 
+def _lookup_subject_by_phone(db: Session, phone: str) -> tuple[AppUser | AdminUser | None, str]:
+    """Find an account by phone, preferring an AppUser then an AdminUser.
+
+    This mirrors the dual lookup password login uses (`_login_subject_with_password`)
+    so OTP login and password reset work for admin accounts too — admins
+    authenticate through the same `/auth/user/*` endpoints. Returns (row, subject_type);
+    (None, "") when no account matches."""
+    user_row = _lookup_user_by_phone(db, phone)
+    if user_row is not None:
+        return user_row, "user"
+    admin_row = _lookup_admin_by_phone(db, phone)
+    if admin_row is not None:
+        return admin_row, "admin"
+    return None, ""
+
+
 def _login_subject_with_password(
     session_factory: Callable[[], Session],
     *,
@@ -670,7 +686,7 @@ def register_auth_routes(
                 "AUTH_OTP_INVALID",
                 "Phone verification failed. Please request a new code.",
             )
-        row = _lookup_user_by_phone(db, normalized_phone)
+        row, subject_type = _lookup_subject_by_phone(db, normalized_phone)
         if row is None:
             raise _api_error(
                 status.HTTP_404_NOT_FOUND,
@@ -681,10 +697,10 @@ def register_auth_routes(
             raise _api_error(
                 status.HTTP_403_FORBIDDEN,
                 "AUTH_ACCOUNT_INACTIVE",
-                "User account exists but is not active. Please contact support.",
+                "This account is not active. Please contact support.",
             )
         _touch_last_login_if_due(db, row)
-        return _issue_user_session(row)
+        return _issue_subject_session(row, subject_type=subject_type)
 
     @app.post("/api/v1/auth/user/reset-password")
     @app.post("/auth/user/reset-password")
@@ -706,7 +722,7 @@ def register_auth_routes(
                 "AUTH_OTP_INVALID",
                 "Phone verification failed. Please request a new code.",
             )
-        row = _lookup_user_by_phone(db, normalized_phone)
+        row, subject_type = _lookup_subject_by_phone(db, normalized_phone)
         if row is None:
             raise _api_error(
                 status.HTTP_404_NOT_FOUND,
@@ -717,13 +733,13 @@ def register_auth_routes(
             raise _api_error(
                 status.HTTP_403_FORBIDDEN,
                 "AUTH_ACCOUNT_INACTIVE",
-                "User account exists but is not active. Please contact support.",
+                "This account is not active. Please contact support.",
             )
         row.password_hash = hash_password(payload.new_password)
         row.last_login_at = utcnow()
         db.commit()
         db.refresh(row)
-        return _issue_user_session(row)
+        return _issue_subject_session(row, subject_type=subject_type)
 
     @app.post("/api/v1/auth/refresh")
     @app.post("/auth/refresh")
