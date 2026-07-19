@@ -431,6 +431,64 @@ def register_admin_routes(app: FastAPI, get_db: Callable[..., Any]) -> None:
 
         return await _perform_active_usage_refresh(db=db, provider=provider, source="cron")
 
+    @app.post("/api/v1/internal/cron/finalize-unprovisioned-orders")
+    async def cron_finalize_unprovisioned_orders(
+        request: Request,
+        limit: int = 50,
+        graceSeconds: int | None = None,
+        db: Session = Depends(get_db),
+        provider: Any = Depends(get_esim_provider),
+    ) -> dict[str, Any]:
+        """Background job: deliver FIB payments that were confirmed paid but
+        never fulfilled — eSIM orders that never reached /orders/managed and
+        top-ups that never reached /topups/managed.
+
+        Without this, a customer whose app is killed between paying and checkout
+        is charged with nothing delivered — and we do not refund. Every payment
+        is re-verified against FIB and single-use claimed before any provider
+        spend, so repeat runs cannot double-provision or double-apply.
+
+        Auth: same shared CRON_TOKEN contract as refresh-active-usage.
+        """
+        from esim_access_api import (
+            DEFAULT_ORDER_FINALIZE_GRACE_SECONDS,
+            sweep_unprovisioned_fib_orders,
+        )
+
+        expected = (os.environ.get("CRON_TOKEN") or "").strip()
+        provided = (request.headers.get("X-Cron-Token") or "").strip()
+        if not provided:
+            auth_header = request.headers.get("Authorization") or ""
+            if auth_header.lower().startswith("bearer "):
+                provided = auth_header[7:].strip()
+        if not expected:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="CRON_TOKEN env var is not configured on this deployment",
+            )
+        # SEC-5: constant-time compare to avoid leaking the token via timing.
+        if not hmac.compare_digest(provided, expected):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Provide a valid X-Cron-Token header (or Bearer <CRON_TOKEN>)",
+            )
+
+        fib_provider = getattr(request.app.state, "fib_payment_api", None)
+        if fib_provider is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="FIB payments are not configured on this deployment.",
+            )
+        return await sweep_unprovisioned_fib_orders(
+            esim_provider=provider,
+            fib_provider=fib_provider,
+            db=db,
+            grace_seconds=(
+                DEFAULT_ORDER_FINALIZE_GRACE_SECONDS if graceSeconds is None else max(0, graceSeconds)
+            ),
+            limit=limit,
+        )
+
     async def _perform_active_usage_refresh(
         *, db: Session, provider: Any, source: str
     ) -> dict[str, Any]:

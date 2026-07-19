@@ -1752,6 +1752,559 @@ def _release_order_claim(db: Session, attempt_id: str, order_transaction_id: str
             LOGGER.warning("order.claim_release_rollback_failed attempt=%s", attempt_id, exc_info=True)
 
 
+# ---------------------------------------------------------------------------
+# Paid-but-unprovisioned recovery (FIB)
+# ---------------------------------------------------------------------------
+# A confirmed FIB payment only becomes an eSIM when the app calls
+# /orders/managed. If the app is killed (or simply never comes back) between
+# paying and that call, the customer is charged and nothing is delivered — and
+# we do not refund. The helpers below provision such a payment server-side.
+#
+# They deliberately reuse the SAME gate as the client path
+# (_verify_fib_payment_for_managed_order: re-verify against FIB, server
+# recomputed amount match, account ownership, single-use claim), so a recovered
+# order can never be provisioned for an unpaid or mis-priced payment, nor
+# double-spend one a client already used.
+#
+# The order details the provider call needs (package, period, provider price,
+# country) do not live on the payment row, so the app persists them as an
+# "orderIntent" in the checkout metadata. That metadata rides the checkout
+# context onto the payment_attempt when it turns paid (see
+# fib_payment_api._upsert_successful_attempt_from_provider_status).
+#
+# The intent carries the SAME provider transactionId the app uses for its own
+# /orders/managed call. That is what makes the two paths converge rather than
+# race: _ensure_attempt_free_for_order treats a matching transactionId as an
+# idempotent resubmit, and the provider dedupes the order by it.
+ORDER_INTENT_METADATA_KEY = "orderIntent"
+
+# Grace period before an unprovisioned paid payment is recovered, so a live app
+# still finishing its own /orders/managed call is never raced.
+DEFAULT_ORDER_FINALIZE_GRACE_SECONDS = 300
+
+
+def _order_intent_from_attempt(attempt: Any) -> dict[str, Any] | None:
+    """The app's persisted order intent, or None when this payment is not a
+    recoverable eSIM order checkout."""
+    intent = (attempt.metadata_payload or {}).get(ORDER_INTENT_METADATA_KEY)
+    if not isinstance(intent, dict):
+        return None
+    if not str(intent.get("transactionId") or "").strip():
+        return None
+    if not str(intent.get("packageCode") or "").strip():
+        return None
+    try:
+        if int(intent.get("providerPriceMinor") or 0) <= 0:
+            return None
+    except (TypeError, ValueError):
+        return None
+    return intent
+
+
+def _managed_order_payload_from_intent(
+    intent: dict[str, Any], *, user_snapshot: dict[str, Any], provider_payment_id: str
+) -> ManagedOrderPayload:
+    """Rebuild the exact /orders/managed payload the app would have sent, so a
+    recovered order goes through byte-identical verification and persistence."""
+    package_info: dict[str, Any] = {
+        "packageCode": str(intent["packageCode"]).strip(),
+        "count": int(intent.get("count") or 1),
+        "price": int(intent["providerPriceMinor"]),
+    }
+    period_num = intent.get("periodNum")
+    if period_num is not None:
+        package_info["periodNum"] = int(period_num)
+    return ManagedOrderPayload.model_validate(
+        {
+            "providerRequest": {
+                "transactionId": str(intent["transactionId"]).strip(),
+                "packageInfoList": [package_info],
+            },
+            # PII comes from the authenticated owner row, never from metadata.
+            "user": {
+                "phone": user_snapshot.get("phone") or "",
+                "name": user_snapshot.get("name") or "",
+                "email": user_snapshot.get("email"),
+            },
+            "platformCode": str(intent.get("platformCode") or "tulip-mobile-app"),
+            "platformName": intent.get("platformName") or "Tulip Mobile App",
+            "currencyCode": intent.get("currencyCode") or "IQD",
+            "providerCurrencyCode": intent.get("providerCurrencyCode") or "USD",
+            "salePriceMinor": intent.get("salePriceMinor"),
+            "countryCode": intent.get("countryCode"),
+            "countryName": intent.get("countryName"),
+            "packageCode": str(intent["packageCode"]).strip(),
+            "packageSlug": intent.get("packageSlug"),
+            "packageName": intent.get("packageName"),
+            "paymentMethod": "fib",
+            "paymentProvider": "fib",
+            # The reference _verify_fib_payment_for_managed_order re-checks against
+            # FIB. It comes from the payment row, never from the client metadata.
+            "paymentProviderPaymentId": provider_payment_id,
+        }
+    )
+
+
+async def finalize_paid_fib_order(
+    *,
+    attempt_id: str,
+    esim_provider: Any,
+    fib_provider: Any,
+    db: Session,
+    grace_seconds: int = DEFAULT_ORDER_FINALIZE_GRACE_SECONDS,
+) -> str | None:
+    """Provision the eSIM for ONE confirmed-paid FIB payment that never became an
+    order. Returns the provider order number when it provisions, or None when the
+    payment is not (or no longer) eligible. Ineligible payments are skipped
+    quietly; only genuine provider/DB failures raise."""
+
+    def _load() -> tuple[dict[str, Any], dict[str, Any], str, str] | None:
+        store = SupabaseStore(db)
+        attempt = store.get_payment_attempt_by_id(attempt_id)
+        if attempt is None:
+            return None
+        if (attempt.payment_method or "").strip().lower() != "fib":
+            return None
+        provider_payment_id = (attempt.provider_payment_id or "").strip()
+        if not provider_payment_id:
+            # Nothing to re-verify against FIB — never provision on our row alone.
+            return None
+        if (attempt.status or "").strip().lower() != "paid":
+            return None
+        # Already turned into an order — nothing to recover. Re-provisioning a
+        # bound attempt would place a SECOND provider order.
+        if attempt.customer_order_id is not None or attempt.order_item_id is not None:
+            return None
+        if (attempt.metadata_payload or {}).get("topupClaim"):
+            return None
+        intent = _order_intent_from_attempt(attempt)
+        if intent is None:
+            return None
+        # Grace: let a live app finish its own checkout before stepping in.
+        paid_at = attempt.paid_at
+        if grace_seconds > 0 and paid_at is not None:
+            reference = paid_at if paid_at.tzinfo is not None else paid_at.replace(tzinfo=timezone.utc)
+            if utcnow() - reference < timedelta(seconds=grace_seconds):
+                return None
+        if not attempt.user_id:
+            return None
+        user = db.scalar(select(AppUser).where(AppUser.id == attempt.user_id))
+        if user is None:
+            return None
+        user_snapshot = {
+            "phone": user.phone,
+            "name": user.name,
+            "email": user.email,
+            "status": user.status,
+            "is_loyalty": user.is_loyalty,
+            "notes": user.notes,
+        }
+        auth_user_id = user.id
+        # Release the pool slot before the provider round-trips below.
+        db.close()
+        return intent, user_snapshot, auth_user_id, provider_payment_id
+
+    loaded = await asyncio.to_thread(_load)
+    if loaded is None:
+        return None
+    intent, user_snapshot, auth_user_id, provider_payment_id = loaded
+    payload = _managed_order_payload_from_intent(
+        intent, user_snapshot=user_snapshot, provider_payment_id=provider_payment_id
+    )
+    order_transaction_id = payload.provider_request.transaction_id
+
+    # The same gate the client path uses: re-verify against FIB, match the
+    # server-recomputed total, confirm ownership, then claim the payment.
+    verified_attempt_id, verified_fib_status = await _verify_fib_payment_for_managed_order(
+        fib_provider=fib_provider,
+        db=db,
+        payload=payload,
+        auth_user_id=auth_user_id,
+    )
+
+    try:
+        provider_response = await esim_provider.order_profiles(payload.provider_request)
+    except Exception:
+        # Free the claim so the customer (or the next sweep) can retry with the
+        # same, still-unspent payment.
+        await asyncio.to_thread(_release_order_claim, db, verified_attempt_id, order_transaction_id)
+        raise
+    if not bool(getattr(provider_response, "success", True)):
+        await asyncio.to_thread(_release_order_claim, db, verified_attempt_id, order_transaction_id)
+        soft_error_code = getattr(provider_response, "error_code", None)
+        soft_error_msg = getattr(provider_response, "error_msg", None)
+        raise ESimAccessAPIError(
+            error_code=(
+                str(soft_error_code)
+                if soft_error_code not in (None, "")
+                else "ESIM_ORDER_PROVIDER_REJECTED"
+            ),
+            error_message=soft_error_msg,
+            status_code=None,
+            provider_message=soft_error_msg,
+            request_id=None,
+        )
+
+    provider_request_payload = payload.provider_request.model_dump(by_alias=True, exclude_none=True)
+    provider_response_payload = provider_response.model_dump(by_alias=True, exclude_none=True)
+
+    def _persist() -> str | None:
+        from fib_payment_api import _apply_verified_status
+
+        store = SupabaseStore(db)
+        try:
+            customer_order, order_item = store.save_managed_order(
+                user_data=user_snapshot,
+                platform_code=payload.platform_code,
+                platform_name=payload.platform_name,
+                order_request=provider_request_payload,
+                provider_response=provider_response_payload,
+                currency_code=payload.currency_code,
+                provider_currency_code=payload.provider_currency_code,
+                exchange_rate=payload.exchange_rate,
+                sale_price_minor=payload.sale_price_minor,
+                # SEC-2: never trust a client-supplied provider cost; the store
+                # falls back to the price we actually ordered at.
+                provider_price_minor=None,
+                country_code=payload.country_code,
+                country_name=payload.country_name,
+                package_code=payload.package_code,
+                package_slug=payload.package_slug,
+                package_name=payload.package_name,
+                payment_method="fib",
+                payment_provider="fib",
+                custom_fields=payload.custom_fields,
+                auto_commit=False,
+            )
+            payment_attempt = store.get_payment_attempt_by_id(verified_attempt_id, for_update=True)
+            if payment_attempt is None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Verified payment could not be finalized.",
+                )
+            if (
+                payment_attempt.customer_order_id is not None
+                and payment_attempt.customer_order_id != customer_order.id
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="This payment has already been used for another order.",
+                )
+            _apply_verified_status(
+                store=store,
+                row=payment_attempt,
+                provider_payment_id=payment_attempt.provider_payment_id,
+                provider_status=verified_fib_status,
+            )
+            store.link_payment_attempt_to_order(
+                payment_attempt=payment_attempt,
+                customer_order=customer_order,
+                order_item=order_item,
+            )
+            order_item.payment_method = payment_attempt.payment_method
+            order_item.payment_provider = payment_attempt.provider
+            customer_order.payment_method = payment_attempt.payment_method
+            customer_order.payment_provider = payment_attempt.provider
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        return order_item.provider_order_no
+
+    provider_order_no = await asyncio.to_thread(_persist)
+    LOGGER.info(
+        "order.finalized_unprovisioned attempt=%s transaction=%s providerOrderNo=%s",
+        verified_attempt_id,
+        order_transaction_id,
+        provider_order_no,
+    )
+    return provider_order_no
+
+
+# A top-up is "buying again" from the customer's point of view (choose plan ->
+# pay with FIB -> applied), so it has exactly the same abandonment gap as an
+# order and gets the same recovery. The differences from the order path:
+#   * a top-up never binds to a customer_order, so the completion marker is the
+#     topupClaim in the payment metadata, not order_item_id;
+#   * the price is re-quoted from the provider's own TOPUP catalog rather than
+#     from an intent field, so no client number is ever trusted.
+TOPUP_INTENT_METADATA_KEY = "topupIntent"
+
+
+def _topup_intent_from_attempt(attempt: Any) -> dict[str, Any] | None:
+    """The app's persisted top-up intent, or None when this payment is not a
+    recoverable top-up."""
+    intent = (attempt.metadata_payload or {}).get(TOPUP_INTENT_METADATA_KEY)
+    if not isinstance(intent, dict):
+        return None
+    if not str(intent.get("transactionId") or "").strip():
+        return None
+    if not str(intent.get("packageCode") or "").strip():
+        return None
+    # The provider needs one of these to identify the eSIM being topped up.
+    if not str(intent.get("iccid") or "").strip() and not str(intent.get("esimTranNo") or "").strip():
+        return None
+    return intent
+
+
+async def finalize_paid_fib_topup(
+    *,
+    attempt_id: str,
+    esim_provider: Any,
+    fib_provider: Any,
+    db: Session,
+    grace_seconds: int = DEFAULT_ORDER_FINALIZE_GRACE_SECONDS,
+) -> str | None:
+    """Apply the top-up for ONE confirmed-paid FIB payment that never reached
+    /topups/managed. Returns the top-up transaction id when it applies, or None
+    when the payment is not (or no longer) eligible."""
+
+    def _load() -> tuple[dict[str, Any], str, str] | None:
+        store = SupabaseStore(db)
+        attempt = store.get_payment_attempt_by_id(attempt_id)
+        if attempt is None:
+            return None
+        if (attempt.payment_method or "").strip().lower() != "fib":
+            return None
+        if (attempt.status or "").strip().lower() != "paid":
+            return None
+        meta = attempt.metadata_payload or {}
+        # Already used — for a top-up (claim set by the client or a previous
+        # run) or for an order. Re-applying would spend provider credit twice.
+        if meta.get("topupClaim") or meta.get("orderClaim"):
+            return None
+        if attempt.customer_order_id is not None or attempt.order_item_id is not None:
+            return None
+        intent = _topup_intent_from_attempt(attempt)
+        if intent is None:
+            return None
+        provider_payment_id = (attempt.provider_payment_id or "").strip()
+        if not provider_payment_id:
+            return None
+        paid_at = attempt.paid_at
+        if grace_seconds > 0 and paid_at is not None:
+            reference = paid_at if paid_at.tzinfo is not None else paid_at.replace(tzinfo=timezone.utc)
+            if utcnow() - reference < timedelta(seconds=grace_seconds):
+                return None
+        if not attempt.user_id:
+            return None
+        # Ownership: the topped-up profile must belong to the payer. Mirrors
+        # _require_topup_profile_access on the client endpoint.
+        iccid = str(intent.get("iccid") or "").strip()
+        esim_tran_no = str(intent.get("esimTranNo") or "").strip()
+        profile = None
+        if iccid:
+            profile = db.scalar(select(ESimProfile).where(ESimProfile.iccid == iccid))
+        elif esim_tran_no:
+            profile = db.scalar(select(ESimProfile).where(ESimProfile.esim_tran_no == esim_tran_no))
+        if profile is None or profile.user_id != attempt.user_id:
+            return None
+        auth_user_id = attempt.user_id
+        db.close()
+        return intent, auth_user_id, provider_payment_id
+
+    loaded = await asyncio.to_thread(_load)
+    if loaded is None:
+        return None
+    intent, auth_user_id, provider_payment_id = loaded
+    package_code = str(intent["packageCode"]).strip()
+    topup_transaction_id = str(intent["transactionId"]).strip()
+    topup_request = TopUpRequest.model_validate(
+        {
+            "iccid": str(intent.get("iccid") or "").strip() or None,
+            "esimTranNo": str(intent.get("esimTranNo") or "").strip() or None,
+            "packageCode": package_code,
+            "transactionId": topup_transaction_id,
+        }
+    )
+
+    # Re-quote the authoritative IQD total from the provider's own TOPUP catalog,
+    # exactly as the client endpoint does — never from a client-supplied number.
+    catalog = await esim_provider.get_packages(
+        PackageQueryRequest(type="TOPUP", iccid=topup_request.iccid, package_code=package_code)
+    )
+    catalog_payload = catalog.model_dump(by_alias=True, exclude_none=True)
+    package_list = (catalog_payload.get("obj") or {}).get("packageList") or []
+    match = next(
+        (it for it in package_list if isinstance(it, dict) and it.get("packageCode") == package_code),
+        None,
+    )
+    provider_minor = (match or {}).get("price")
+    if not provider_minor or provider_minor <= 0:
+        LOGGER.warning(
+            "topup.finalize_unpriceable attempt=%s package=%s", attempt_id, package_code
+        )
+        return None
+
+    def _quote_expected_total() -> int | None:
+        return SupabaseStore(db).quote_esim_sale_prices(
+            [
+                {
+                    "packageCode": package_code,
+                    "countryCode": _single_country_code(match),
+                    "providerPriceMinor": provider_minor,
+                }
+            ],
+            currency_code="IQD",
+        ).get(package_code)
+
+    expected_total_minor = await asyncio.to_thread(_quote_expected_total)
+    if expected_total_minor is None:
+        LOGGER.warning("topup.finalize_unquotable attempt=%s package=%s", attempt_id, package_code)
+        return None
+
+    # The same gate the client path uses: re-verify against FIB at the
+    # server-recomputed total, confirm ownership, then claim the payment.
+    verified_attempt_id = await _verify_fib_payment_for_managed_topup(
+        fib_provider=fib_provider,
+        db=db,
+        provider_payment_id=provider_payment_id,
+        auth_user_id=auth_user_id,
+        expected_total_minor=expected_total_minor,
+        topup_transaction_id=topup_transaction_id,
+    )
+
+    try:
+        provider_response = await esim_provider.top_up(topup_request)
+    except Exception:
+        await asyncio.to_thread(
+            _release_topup_claim, db, verified_attempt_id, topup_transaction_id
+        )
+        raise
+    if not bool(getattr(provider_response, "success", True)):
+        await asyncio.to_thread(
+            _release_topup_claim, db, verified_attempt_id, topup_transaction_id
+        )
+        soft_error_code = getattr(provider_response, "error_code", None)
+        soft_error_msg = getattr(provider_response, "error_msg", None)
+        raise ESimAccessAPIError(
+            error_code=(
+                str(soft_error_code)
+                if soft_error_code not in (None, "")
+                else "ESIM_TOPUP_PROVIDER_REJECTED"
+            ),
+            error_message=soft_error_msg,
+            status_code=None,
+            provider_message=soft_error_msg,
+            request_id=None,
+        )
+
+    def _mark_applied() -> None:
+        """Record completion alongside the claim. The claim alone already blocks
+        a second run; this is the human-readable 'recovered' marker for ops."""
+        store = SupabaseStore(db)
+        attempt = store.get_payment_attempt_by_id(verified_attempt_id, for_update=True)
+        if attempt is None:
+            return
+        meta = dict(attempt.metadata_payload or {})
+        meta["topupApplied"] = {
+            "transactionId": topup_transaction_id,
+            "appliedAt": utcnow().isoformat(),
+            "source": "finalizer",
+        }
+        attempt.metadata_payload = meta
+        db.commit()
+
+    await asyncio.to_thread(_mark_applied)
+    LOGGER.info(
+        "topup.finalized_unapplied attempt=%s transaction=%s package=%s",
+        verified_attempt_id,
+        topup_transaction_id,
+        package_code,
+    )
+    return topup_transaction_id
+
+
+async def sweep_unprovisioned_fib_orders(
+    *,
+    esim_provider: Any,
+    fib_provider: Any,
+    db: Session,
+    grace_seconds: int = DEFAULT_ORDER_FINALIZE_GRACE_SECONDS,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Recover every paid-but-undelivered FIB purchase past the grace window —
+    both eSIM orders and top-ups (a top-up is "buying again", and abandons the
+    same way).
+
+    Each candidate is offered to the order finalizer first and then the top-up
+    finalizer; each one self-selects on the intent the app persisted, so a
+    payment is only ever delivered once and never as the wrong kind.
+
+    The time filter is applied per-attempt in the finalizers rather than in SQL,
+    so the query stays free of timezone-awareness mismatches between the DB
+    column and utcnow(). One bad payment never aborts the sweep."""
+
+    def _candidates() -> list[str]:
+        rows = db.scalars(
+            select(PaymentAttempt.id)
+            .where(
+                PaymentAttempt.payment_method == "fib",
+                PaymentAttempt.status == "paid",
+                PaymentAttempt.customer_order_id.is_(None),
+                PaymentAttempt.order_item_id.is_(None),
+            )
+            .order_by(PaymentAttempt.paid_at.asc())
+            .limit(max(1, limit))
+        ).all()
+        ids = [str(row) for row in rows]
+        db.close()
+        return ids
+
+    candidate_ids = await asyncio.to_thread(_candidates)
+    finalized: list[dict[str, str | None]] = []
+    failed: list[dict[str, str]] = []
+    for candidate_id in candidate_ids:
+        try:
+            provider_order_no = await finalize_paid_fib_order(
+                attempt_id=candidate_id,
+                esim_provider=esim_provider,
+                fib_provider=fib_provider,
+                db=db,
+                grace_seconds=grace_seconds,
+            )
+            if provider_order_no is not None:
+                finalized.append(
+                    {
+                        "paymentAttemptId": candidate_id,
+                        "kind": "order",
+                        "providerOrderNo": provider_order_no,
+                    }
+                )
+                continue
+            # Not an order — try the top-up intent before giving up.
+            topup_transaction_id = await finalize_paid_fib_topup(
+                attempt_id=candidate_id,
+                esim_provider=esim_provider,
+                fib_provider=fib_provider,
+                db=db,
+                grace_seconds=grace_seconds,
+            )
+            if topup_transaction_id is not None:
+                finalized.append(
+                    {
+                        "paymentAttemptId": candidate_id,
+                        "kind": "topup",
+                        "transactionId": topup_transaction_id,
+                    }
+                )
+        except Exception as exc:  # one stuck payment must not stop the rest
+            LOGGER.warning(
+                "purchase.finalize_undelivered_failed attempt=%s", candidate_id, exc_info=True
+            )
+            failed.append({"paymentAttemptId": candidate_id, "error": str(exc)})
+            try:
+                db.rollback()
+            except Exception:
+                LOGGER.warning("purchase.finalize_rollback_failed attempt=%s", candidate_id)
+            continue
+    return {
+        "scanned": len(candidate_ids),
+        "finalized": finalized,
+        "failed": failed,
+    }
+
+
 def _ensure_attempt_free_for_topup(attempt: Any, topup_transaction_id: str) -> None:
     """Replay guard for top-up payments: a FIB payment may fund exactly ONE
     top-up (idempotent re-submits of the same top-up transaction are allowed),
@@ -2259,6 +2812,37 @@ def register_esim_access_routes(
         _: AdminUser = Depends(_require_permission("can_manage_orders")),
     ) -> ESimAccessResponse[OrderResult]:
         return await provider.order_profiles(payload)
+
+    @app.post("/api/v1/esim-access/orders/finalize-unprovisioned")
+    async def finalize_unprovisioned_orders(
+        request: Request,
+        limit: int = Query(default=50, ge=1, le=500),
+        grace_seconds: int = Query(
+            default=DEFAULT_ORDER_FINALIZE_GRACE_SECONDS, ge=0, alias="graceSeconds"
+        ),
+        provider: ESimAccessAPI = Depends(get_provider),
+        db: Session = Depends(get_db),
+        _: AdminUser = Depends(_require_permission("can_manage_orders")),
+    ) -> dict[str, Any]:
+        """Recover eSIMs for FIB payments confirmed paid whose app never placed
+        the order (charged, nothing delivered — and we do not refund).
+
+        Safe to run on a schedule: every payment is re-verified against FIB and
+        single-use claimed, so repeated runs cannot double-provision or spend
+        provider credit for an unpaid payment."""
+        fib_provider = getattr(request.app.state, "fib_payment_api", None)
+        if fib_provider is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="FIB payments are not configured on this deployment.",
+            )
+        return await sweep_unprovisioned_fib_orders(
+            esim_provider=provider,
+            fib_provider=fib_provider,
+            db=db,
+            grace_seconds=grace_seconds,
+            limit=limit,
+        )
 
     @app.post("/api/v1/esim-access/orders/managed")
     async def create_managed_order(

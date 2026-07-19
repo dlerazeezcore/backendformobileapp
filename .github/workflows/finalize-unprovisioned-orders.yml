@@ -1,0 +1,59 @@
+name: Finalize undelivered purchases (cron)
+
+# Calls the backend's POST /api/v1/internal/cron/finalize-unprovisioned-orders
+# every 15 minutes. It finds FIB payments that FIB confirmed as PAID but that
+# were never delivered — an eSIM order that never reached /orders/managed, or a
+# top-up that never reached /topups/managed, because the app was killed /
+# backgrounded / timed out after paying — and delivers them server-side.
+#
+# Why this matters: without it those customers are charged and receive nothing,
+# and we do not issue refunds.
+#
+# Safety: the job re-verifies every payment against FIB and takes a single-use
+# claim before any provider spend, so running it repeatedly can never
+# double-provision or spend provider credit for an unpaid payment. Payments
+# newer than the grace window are skipped so a live checkout is never raced.
+#
+# Required secret:
+#   CRON_TOKEN   — random string. Must match the CRON_TOKEN env var set on
+#                  the Koyeb service `backendformobileapp`. Generate with:
+#                    openssl rand -hex 32
+
+on:
+  schedule:
+    # Every 15 minutes. Recovery should be quick — the customer is already
+    # charged and waiting for an eSIM.
+    - cron: "*/15 * * * *"
+  # Manual trigger for smoke-testing without waiting for the next slot.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Call cron endpoint
+        env:
+          CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
+        run: |
+          if [ -z "$CRON_TOKEN" ]; then
+            echo "::error::CRON_TOKEN secret is not set on this repo."
+            echo "Add it in Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          # -f-style behavior: capture the code so the workflow turns red on >=400.
+          HTTP_CODE=$(curl -sS -o /tmp/resp.json -w '%{http_code}' \
+            -X POST 'https://mean-lettie-corevia-0bd7cc91.koyeb.app/api/v1/internal/cron/finalize-unprovisioned-orders' \
+            -H "X-Cron-Token: $CRON_TOKEN" \
+            -H 'Content-Type: application/json')
+          echo "HTTP $HTTP_CODE"
+          echo "--- response ---"
+          cat /tmp/resp.json | python3 -m json.tool || cat /tmp/resp.json
+          echo
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Cron call failed with HTTP $HTTP_CODE"
+            exit 1
+          fi
