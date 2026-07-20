@@ -24,7 +24,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from auth import get_token_claims, require_active_subject
 from config import get_settings, read_bool_env as _read_bool_env, read_float_env, read_int_env
-from supabase_store import AdminUser, AppUser, CustomerOrder, ESimProfile, OrderItem, PaymentAttempt, ProfileInventoryRow, SupabaseStore, utcnow
+from supabase_store import APP_TIMEZONE, AdminUser, AppUser, CustomerOrder, ESimProfile, OrderItem, PaymentAttempt, ProfileInventoryRow, SupabaseStore, utcnow
 from users import UserPayload
 
 LOGGER = logging.getLogger("uvicorn.error")
@@ -1883,7 +1883,11 @@ async def finalize_paid_fib_order(
         # Grace: let a live app finish its own checkout before stepping in.
         paid_at = attempt.paid_at
         if grace_seconds > 0 and paid_at is not None:
-            reference = paid_at if paid_at.tzinfo is not None else paid_at.replace(tzinfo=timezone.utc)
+            # paid_at is timestamptz in Postgres (aware). A naive value only turns
+            # up on SQLite, which drops the offset — and what was written there is
+            # APP_TIMEZONE (utcnow() is datetime.now(APP_TIMEZONE), not UTC), so
+            # tagging it UTC would skew the grace check by the offset.
+            reference = paid_at if paid_at.tzinfo is not None else paid_at.replace(tzinfo=APP_TIMEZONE)
             if utcnow() - reference < timedelta(seconds=grace_seconds):
                 return None
         if not attempt.user_id:
@@ -2083,7 +2087,11 @@ async def finalize_paid_fib_topup(
             return None
         paid_at = attempt.paid_at
         if grace_seconds > 0 and paid_at is not None:
-            reference = paid_at if paid_at.tzinfo is not None else paid_at.replace(tzinfo=timezone.utc)
+            # paid_at is timestamptz in Postgres (aware). A naive value only turns
+            # up on SQLite, which drops the offset — and what was written there is
+            # APP_TIMEZONE (utcnow() is datetime.now(APP_TIMEZONE), not UTC), so
+            # tagging it UTC would skew the grace check by the offset.
+            reference = paid_at if paid_at.tzinfo is not None else paid_at.replace(tzinfo=APP_TIMEZONE)
             if utcnow() - reference < timedelta(seconds=grace_seconds):
                 return None
         if not attempt.user_id:
