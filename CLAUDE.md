@@ -54,3 +54,29 @@ These GitHub Actions are the release pipeline. Any change or edit must keep them
 A separate check workflow runs typecheck on PRs: `tulip-booking/.github/workflows/check.yml` (`tsc --noEmit`). Add any new checks (typecheck / tests) as SEPARATE jobs or workflows like it. Never modify the release workflows in a way that alters or breaks their build/deploy behavior.
 
 Version bumps: `app.json` `expo.version` is the marketing version (compared against the backend's `latestVersion` for the mandatory-update gate). The iOS build number and the Android `versionCode` are auto-set to a fresh unix timestamp in CI, so they are always unique/increasing — you only bump `expo.version` per release.
+
+## Platform API floors — a RECURRING deadline (check every January)
+Google Play requires the Android **target API level** to stay within **one year of the latest
+Android release**, and enforces it every year around **Aug 31**. Miss it and you can no longer
+ship UPDATES — the listing stays live and installed users are unaffected, but every release
+workflow above is dead until you comply. This is not a one-time migration; it comes back annually.
+
+Current state (raised 2026-07): **Expo SDK 56** (RN 0.85, React 19.2) → **`targetSdkVersion` 36**
+(Android 16), pinned via `expo-build-properties` in `app.json`. iOS minimum is 16.4.
+
+**Raising the target API is never a one-line change.** It also raises the AGP / Gradle / Kotlin
+floors, and those are set by the Expo SDK — e.g. `compileSdk 36` needs AGP 8.9.1+, but SDK 51
+shipped AGP 8.2.1, so the bump was impossible without upgrading. The real task is therefore an
+**Expo SDK upgrade**, which moves BOTH platforms (one codebase, one SDK version — iOS comes along
+whether or not it had a problem) and is test-worthy on a real device. Budget days, not hours.
+Always validate on the Play **internal** track before production.
+
+Do NOT reintroduce `android:windowOptOutEdgeToEdgeEnforcement` — it is **ignored at targetSdk 36**.
+Edge-to-edge is permanent, so safe-area insets (`ScreenSafeArea`, `useSafeAreaInsets`) are the only
+thing keeping content clear of the status and nav bars.
+
+Check Play Console → Policy status each **January** so this is scheduled work, not a scramble.
+See `tulip-booking/RELEASING.md` for the full history and the current patch/plugin rationale.
+
+**Backend tie-in:** when a release ships, the backend's `latestVersion` drives the mandatory-update
+gate. Bump it in step with `app.json` `expo.version`, never ahead of a released build.
